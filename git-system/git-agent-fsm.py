@@ -48,8 +48,9 @@ from utils.tla_verifier import (   # noqa: E402
 from utils.session import (        # noqa: E402
     make_session,
     make_planning_node,
+    make_planning_tree,
     make_verification,
-    make_execution_step,
+    annotate_node_executed,
     save_session as _save_session_util,
 )
 
@@ -1034,6 +1035,7 @@ def handle_query(goal: str, model: str,
     _llm_log_reset()
     config = config or default_config_from_env()
 
+    planning_mode = _planning_mode_name(config)
     turn = make_session(
         agent="git-agent-fsm",
         model=model,
@@ -1041,16 +1043,22 @@ def handle_query(goal: str, model: str,
         request=goal,
         work_dir=str(WORK_DIR),
         properties=PROPERTIES,
+        planning_config={
+            "planning_mode":        planning_mode,
+            "planning_granularity": config.planning_granularity,
+            "violation_policy":     config.violation_policy,
+            "max_plan_steps":       config.max_plan_steps,
+            "max_retries":          config.max_retries,
+        },
     )
-    turn["planning_config"] = {
-        "planning_granularity": config.planning_granularity,
-        "violation_policy": config.violation_policy,
-        "max_plan_steps": config.max_plan_steps,
-        "max_retries": config.max_retries,
-    }
-    turn["planning_tree"]["mode"] = _planning_mode_name(config)
-    turn["planning_tree"]["max_steps"] = config.max_plan_steps
-    turn["planning_tree"]["max_retries"] = config.max_retries
+    turn["planning_tree"] = make_planning_tree(
+        mode=planning_mode,
+        max_steps=config.max_plan_steps,
+        max_retries=config.max_retries,
+        planning_granularity=config.planning_granularity,
+        violation_policy=config.violation_policy,
+        properties=PROPERTIES,
+    )
 
     # Prompt 6: guard
     in_scope, reason = prompt6_guard(goal, model)
@@ -1078,16 +1086,15 @@ def handle_query(goal: str, model: str,
     # Phase 5: execute
     executed_trace = trace if feasible else []
     exec_results = phase5_execute(executed_trace) if feasible else []
-    turn["execution"]["steps"] = [
-        make_execution_step(
-            step_index=i,
-            action_label=s["action_label"],
-            tool=s["tool"],
-            args=s["args"],
-            result=exec_results[i] if i < len(exec_results) else "(no result)",
+    # Annotate each accepted planning node with its execution outcome.
+    accepted_nodes = [n for n in planning_nodes if n.get("result") in ("accepted", "accepted_with_ignored_violations")]
+    accepted_nodes.sort(key=lambda n: n["depth"])
+    for i, node in enumerate(accepted_nodes):
+        annotate_node_executed(
+            node,
+            execution_step=i,
+            execution_result=exec_results[i] if i < len(exec_results) else "(no result)",
         )
-        for i, s in enumerate(executed_trace)
-    ]
 
     # Response
     if feasible:

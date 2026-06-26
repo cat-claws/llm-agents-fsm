@@ -11,7 +11,22 @@ from typing import Dict, List, Optional
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-from utils.session import SCHEMA_VERSION  # noqa: E402
+from utils.session import (  # noqa: E402
+    SCHEMA_VERSION,
+    make_session,
+    make_planning_tree,
+    make_planning_node,
+    set_node_outcome,
+    add_child,
+    annotate_node_executed,
+    make_verification,
+    make_skipped_verification,
+    save_session as _save_session,
+)
+from utils.tla_verifier import (  # noqa: E402
+    load_properties,
+    verify_ap_trace as _verify_tla_ap_trace,
+)
 
 from shrdlu_agents.shrdlu_agent_basic import (
     DEFAULT_MAX_STEPS,
@@ -23,12 +38,18 @@ from shrdlu_agents.shrdlu_agent_basic import (
     PLAN_SCHEMA,
 )
 from shrdlu_agents.simulator_api import ALLOWED_SIMULATOR_ACTION_NAMES, SimulatorAPI
-from shrdlu_agents.property_verifier import TransitionPropertyVerifier
+from shrdlu_agents.property_verifier import ACTIVE_PROPERTY_IDS, TransitionPropertyVerifier
 from shrdlu_blocks.simulator.state_pred import predict_world_state_after_actions
-from shrdlu_agents.tla_verifier import verify_ap_trace
 
 _AP_CANDIDATES: List[Dict[str, str]] = TransitionPropertyVerifier.from_file().aps
 _AP_NAMES: List[str] = [ap['name'] for ap in _AP_CANDIDATES]
+_TLA_PROPERTIES_FILE = Path(__file__).resolve().parent / 'resources' / 'SHRDLU_PROPERTIES_AST.json'
+_ACTIVE_TLA_PROPERTY_IDS = set(ACTIVE_PROPERTY_IDS)
+_TLA_PROPERTIES = [
+    prop
+    for prop in load_properties(_TLA_PROPERTIES_FILE)
+    if prop.get('id') in _ACTIVE_TLA_PROPERTY_IDS
+]
 
 __all__ = [
     'FsmOpenAICompatibleShrdluAgent',
@@ -38,6 +59,24 @@ PLANNING_STEP = 'step'
 PLANNING_BATCH = 'batch'
 VIOLATION_RETRY = 'retry'
 VIOLATION_IGNORE = 'ignore'
+
+
+def _verify_ap_trace(
+    ap_trace: List[Dict[str, bool]],
+    ap_names: List[str],
+    *,
+    module_name: str = 'ShrdluTrace',
+    timeout: int = 60,
+    is_complete_trace: bool = True,
+) -> Dict:
+    return _verify_tla_ap_trace(
+        ap_trace,
+        ap_names,
+        _TLA_PROPERTIES,
+        module_name=module_name,
+        timeout=timeout,
+        is_complete_trace=is_complete_trace,
+    )
 
 
 def _normalise_planning_granularity(value: Optional[str]) -> str:
@@ -599,49 +638,35 @@ class _FsmShrdluAgentMixin:
     def _run_agent_loop(self, request: str) -> str:
         initial_world_state = self._env.snapshot()
         initial_state = self._build_initial_ap_state(initial_world_state)
-        trace = {
-            'schema_version': SCHEMA_VERSION,
-            'timestamp_utc': datetime.now(timezone.utc).isoformat(),
-            'agent': 'shrdlu-agent-fsm',
-            'domain': 'shrdlu',
-            'model': self._model,
-            'host': self._host,
-            'max_steps': self._max_steps,
-            'request': request,
-            'planning_mode': 'fsm_%s_%s' % (
-                self._planning_granularity,
-                self._violation_policy,
-            ),
-            'planning_granularity': self._planning_granularity,
-            'violation_policy': self._violation_policy,
-            'max_branch_retries': self._max_branch_retries,
-            'property_monitoring': self._property_monitoring_metadata(),
-            'planning_tree': {
-                'mode': 'fsm_%s_%s' % (
-                    self._planning_granularity,
-                    self._violation_policy,
-                ),
+        planning_mode = 'fsm_%s_%s' % (self._planning_granularity, self._violation_policy)
+        action_help = self._env.action_help()
+        trace = make_session(
+            agent='shrdlu-agent-fsm',
+            model=self._model,
+            domain='shrdlu',
+            request=request,
+            properties=self._property_verifier.properties,
+            planning_config={
+                'host': self._host,
+                'planning_mode': planning_mode,
                 'planning_granularity': self._planning_granularity,
                 'violation_policy': self._violation_policy,
                 'max_steps': self._max_steps,
                 'max_branch_retries': self._max_branch_retries,
-                'properties': [
-                    {
-                        'id': item.get('id'),
-                        'natural_language': item.get('natural_language'),
-                    }
-                    for item in self._property_verifier.properties
-                ],
-                'nodes': [],
-                'feasible': False,
-                'accepted_plan': [],
+                'property_monitoring': self._property_monitoring_metadata(),
             },
-            'steps': [],
-        }
-        action_help = self._env.action_help()
-        trace['planning_tree']['initial_ap_state'] = initial_state
-        trace['planning_tree']['initial_world_state'] = initial_world_state
-        trace['planning_tree']['action_help'] = action_help
+        )
+        trace['planning_tree'] = make_planning_tree(
+            mode=planning_mode,
+            max_steps=self._max_steps,
+            max_branch_retries=self._max_branch_retries,
+            planning_granularity=self._planning_granularity,
+            violation_policy=self._violation_policy,
+            properties=self._property_verifier.properties,
+            initial_state=initial_state,
+            initial_world_state=initial_world_state,
+            action_help=action_help,
+        )
         trace['status'] = 'planning'
         trace_path = self._start_trace_session(trace)
 
@@ -707,12 +732,14 @@ class _FsmShrdluAgentMixin:
 
         executed_ap_trace = [initial_state]
         trace['status'] = 'executing'
+        # Index accepted nodes by depth so each execution step can annotate its node.
+        accepted_nodes_by_depth = {
+            node['depth']: node
+            for node in trace['planning_tree']['nodes']
+            if node.get('result') in ('accepted', 'finish')
+        }
         self._checkpoint_trace(trace, trace_path)
         for step_index, action in enumerate(plan):
-            step_trace = {
-                'step_index': step_index,
-                'planned_action': action,
-            }
             try:
                 result_text = self._env.execute_action(action)
             except Exception as exc:
@@ -720,15 +747,18 @@ class _FsmShrdluAgentMixin:
             post_state = self._env.snapshot()
             ap_state = self._build_initial_ap_state(post_state)
             executed_ap_trace.append(ap_state)
-            tla_result = verify_ap_trace(executed_ap_trace, _AP_NAMES)
-            step_trace.update({
-                'action_result': result_text,
-                'ap_state': ap_state,
-                'ap_changes': self._diff_ap_states(executed_ap_trace[-2], ap_state),
-                'tla_verification': tla_result,
-                'observation_after': self._env.snapshot_text(),
-            })
-            trace['steps'].append(step_trace)
+            tla_result = _verify_ap_trace(executed_ap_trace, _AP_NAMES)
+            node = accepted_nodes_by_depth.get(step_index)
+            if node is not None:
+                annotate_node_executed(
+                    node,
+                    execution_step=step_index,
+                    execution_result=result_text,
+                    ap_state=ap_state,
+                    ap_changes=self._diff_ap_states(executed_ap_trace[-2], ap_state),
+                    tla_verification=tla_result,
+                    observation_after=self._env.snapshot_text(),
+                )
             self._checkpoint_trace(trace, trace_path)
             if isinstance(result_text, str) and result_text.startswith('ERROR:'):
                 final_message = self._format_reply(
@@ -807,16 +837,13 @@ class _FsmShrdluAgentMixin:
             }
 
         node_id = len(planning_tree['nodes'])
-        node = {
-            'node_id': node_id,
-            'parent_node_id': parent_node_id,
-            'depth': depth,
-            'accepted_steps': self._zip_accepted_steps(accepted_trace, preceding_ap_trace),
-            'current_ap_state': copy.deepcopy(current_state),
-            'attempts': [],
-            'children': [],
-            'result': 'searching',
-        }
+        node = make_planning_node(
+            node_id=node_id,
+            parent_node_id=parent_node_id,
+            depth=depth,
+            state_before=copy.deepcopy(current_state),
+            state_path=self._zip_accepted_steps(accepted_trace, preceding_ap_trace),
+        )
         planning_tree['nodes'].append(node)
         self._checkpoint_trace(trace, trace_path)
 
@@ -902,8 +929,7 @@ class _FsmShrdluAgentMixin:
                 attempt_trace['accepted'] = True
                 attempt_trace['finish'] = True
                 node['attempts'].append(attempt_trace)
-                node['result'] = 'finish'
-                node['finish_response'] = finish_response
+                set_node_outcome(node, result='finish', finish_response=finish_response)
                 self._checkpoint_trace(trace, trace_path)
                 return {
                     'success': True,
@@ -959,10 +985,22 @@ class _FsmShrdluAgentMixin:
             if not tail and self._planning_granularity == PLANNING_BATCH:
                 attempt_trace['accepted'] = True
                 node['attempts'].append(attempt_trace)
-                node['result'] = 'accepted'
-                node['accepted_action'] = action
-                node['accepted_predicted_ap_state'] = predicted_ap_state
-                node['finish_response'] = finish_response
+                tlc = step_verification.get('prediction_detail', {}).get('tla_verification', {})
+                verif = make_verification(
+                    passed=step_verification['passed'],
+                    properties_checked=tlc.get('properties_checked', []),
+                    violations=tlc.get('tlc_result', {}).get('violations', []),
+                )
+                set_node_outcome(
+                    node,
+                    result='accepted',
+                    action_label=action.get('name', 'unknown'),
+                    tool='simulator_action',
+                    args=action.get('args', {}),
+                    state_after=predicted_ap_state,
+                    verification=verif,
+                    finish_response=finish_response,
+                )
                 self._checkpoint_trace(trace, trace_path)
                 return {
                     'success': True,
@@ -989,15 +1027,27 @@ class _FsmShrdluAgentMixin:
             )
             attempt_trace['child_node_id'] = child_result.get('node_id')
             if child_result.get('node_id') is not None:
-                node['children'].append(child_result['node_id'])
+                add_child(node, child_result['node_id'])
             node['attempts'].append(attempt_trace)
             self._checkpoint_trace(trace, trace_path)
 
             if child_result.get('success'):
                 attempt_trace['accepted'] = True
-                node['result'] = 'accepted'
-                node['accepted_action'] = action
-                node['accepted_predicted_ap_state'] = predicted_ap_state
+                tlc = step_verification.get('prediction_detail', {}).get('tla_verification', {})
+                verif = make_verification(
+                    passed=step_verification['passed'],
+                    properties_checked=tlc.get('properties_checked', []),
+                    violations=tlc.get('tlc_result', {}).get('violations', []),
+                )
+                set_node_outcome(
+                    node,
+                    result='accepted',
+                    action_label=action.get('name', 'unknown'),
+                    tool='simulator_action',
+                    args=action.get('args', {}),
+                    state_after=predicted_ap_state,
+                    verification=verif,
+                )
                 return {
                     'success': True,
                     'plan': [action] + child_result.get('plan', []),
@@ -1021,7 +1071,6 @@ class _FsmShrdluAgentMixin:
             current_hint = []
             continue
 
-        node['result'] = 'backtracked'
         exhaustion_failure = {
             'type': 'branch_exhausted',
             'depth': depth,
@@ -1029,7 +1078,7 @@ class _FsmShrdluAgentMixin:
             'failed_attempts': failed_attempts,
             'message': 'All %d action attempts at this node were exhausted.' % self._max_branch_retries,
         }
-        node['failure'] = exhaustion_failure
+        set_node_outcome(node, result='backtracked', failure=exhaustion_failure)
         self._checkpoint_trace(trace, trace_path)
         return {
             'success': False,
@@ -1075,7 +1124,7 @@ class _FsmShrdluAgentMixin:
 
         predicted_ap_state = self._build_initial_ap_state(predicted_world_state)
         full_ap_trace = preceding_ap_trace + [predicted_ap_state]
-        tlc_result = verify_ap_trace(full_ap_trace, _AP_NAMES, is_complete_trace=is_last_step)
+        tlc_result = _verify_ap_trace(full_ap_trace, _AP_NAMES, is_complete_trace=is_last_step)
         passed = tlc_result['tlc_result'].get('success') or tlc_result['tlc_result'].get('skipped')
 
         detail = {

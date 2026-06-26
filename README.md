@@ -10,8 +10,9 @@ agent domains:
 - `utils/`: shared session serialization, planning-tree helpers, and TLA+/TLC
   verification utilities.
 
-The code is source-only at the moment: there is no package metadata and no
-pinned requirements file in this checkout.
+The Git scripts can be run directly from source. The unified launcher and
+SHRDLU entry points are intended to run from an editable install, which maps the
+`shrdlu_agents` import name to the `shrdlu-block/` source directory.
 
 ## Requirements
 
@@ -31,7 +32,25 @@ cd /home/robot/llm-agents-fsm
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install openai
+python3 -m pip install -e . --no-deps
 ```
+
+Drop `--no-deps` if you want pip to resolve and install dependencies itself.
+No local `shrdlu_agents` symlink is needed; the mapping lives in
+`pyproject.toml`.
+
+## Package Naming
+
+The SHRDLU source directory is named `shrdlu-block/` to match the simulator
+domain, but Python imports use the valid package name `shrdlu_agents`. The
+editable install provides that mapping:
+
+```toml
+[tool.setuptools.package-dir]
+shrdlu_agents = "shrdlu-block"
+```
+
+Do not create a local `shrdlu_agents` directory or symlink in the checkout.
 
 Common model settings:
 
@@ -46,14 +65,38 @@ For TLC-backed runs:
 export TLA2TOOLS_JAR=/path/to/tla2tools.jar
 ```
 
+## Unified Launcher
+
+After `pip install -e`, `run-agents` covers the four canonical agents:
+
+```bash
+run-agents git-basic
+run-agents git-fsm
+run-agents shrdlu-reactive -- --trace-dir "$PWD/agent_traces"
+run-agents shrdlu-fsm -- --trace-dir "$PWD/agent_traces"
+```
+
+Equivalent option form:
+
+```bash
+run-agents --domain git --agent basic
+run-agents --domain git --agent fsm
+run-agents --domain shrdlu --agent reactive -- --trace-dir "$PWD/agent_traces"
+run-agents --domain shrdlu --agent fsm -- --trace-dir "$PWD/agent_traces"
+```
+
+Use `run-agents --list` to print the supported targets. Arguments after `--`
+are passed through to the selected agent. `run_agents` with an underscore is
+installed as the same command for shells/scripts that prefer that spelling.
+
 ## Git Agents
 
 Run these from the Git repository you want the agent to operate on:
 
 ```bash
 cd /path/to/target/git/repo
-python3 /home/robot/llm-agents-fsm/git-system/git-agent-basic.py
-python3 /home/robot/llm-agents-fsm/git-system/git-agent-fsm.py
+run-agents git-basic
+run-agents git-fsm
 ```
 
 Variants:
@@ -89,15 +132,9 @@ cd /path/to/shrdlu-block-world
 python3 -m shrdlu_blocks.simulator --headless
 ```
 
-This checkout stores the SHRDLU source in `shrdlu-block/`, while the code
-imports it as `shrdlu_agents`. Until the project is packaged or the directory is
-renamed, create a local import shim before running the agents:
-
-```bash
-cd /home/robot/llm-agents-fsm
-ln -sfn shrdlu-block shrdlu_agents
-export PYTHONPATH="$PWD:/path/to/shrdlu-block-world:${PYTHONPATH}"
-```
+This checkout stores the SHRDLU source in `shrdlu-block/`. The editable install
+exposes that directory as the `shrdlu_agents` Python package. If the sibling
+simulator package is not installed, keep its checkout on `PYTHONPATH`.
 
 Then run one of the canonical agent strategies:
 
@@ -107,33 +144,36 @@ export SHRDLU_OPENAI_BASE_URL=http://127.0.0.1:30000/v1
 export SHRDLU_OPENAI_API_KEY=EMPTY
 export SHRDLU_OPENAI_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507
 
-python3 -m shrdlu_agents.run_agent --agent reactive
-python3 -m shrdlu_agents.run_agent --agent fsm
+run-agents shrdlu-reactive -- --trace-dir "$PWD/agent_traces"
+run-agents shrdlu-fsm -- --trace-dir "$PWD/agent_traces"
 ```
 
 The merged FSM exposes the old plan/FSM distinction as parameters:
 
 ```bash
 # FSM-style: plan a suffix and retry/backtrack on property violations.
-python3 -m shrdlu_agents.run_agent --agent fsm \
+run-agents shrdlu-fsm -- \
   --planning-granularity batch \
   --violation-policy retry \
   --max-branch-retries 3
 
 # Plan-style: plan a suffix, record property violations, and continue.
-python3 -m shrdlu_agents.run_agent --agent fsm \
+run-agents shrdlu-fsm -- \
   --planning-granularity batch \
   --violation-policy ignore \
   --max-branch-retries 1
 
 # Stepwise planning with FSM retry behavior.
-python3 -m shrdlu_agents.run_agent --agent fsm \
+run-agents shrdlu-fsm -- \
   --planning-granularity step \
   --violation-policy retry
 ```
 
 Legacy `--agent preplanned`, `--agent predictive`, and `--agent suffix` names
-are accepted as aliases for `--agent fsm` with matching parameter presets.
+are accepted by the SHRDLU launcher as aliases for `--agent fsm` with matching
+parameter presets. The unified launcher also exposes these as
+`run-agents shrdlu-preplanned`, `run-agents shrdlu-predictive`, and
+`run-agents shrdlu-suffix`.
 
 Runtime controls:
 
@@ -164,14 +204,14 @@ git-system/
   git-agent-fsm.py          Merged plan/FSM Git agent
   resources/                Git atomic-proposition and property catalogs
 
-shrdlu-block/
-  run_agent.py              SHRDLU launcher
+shrdlu-block/                 Installed as the shrdlu_agents package
   shrdlu_agent_basic.py     Reactive/basic agent
   shrdlu_agent_fsm.py       Merged predictive plan/FSM agent
   property_verifier.py      SHRDLU property checks
   resources/                SHRDLU atomic-proposition and property catalogs
 
 utils/
+  run_agents.py             Unified launcher for Git and SHRDLU agents
   session.py                Shared JSON session schema
   planning_tree.py          Planning-tree helpers
   tla_verifier.py           TLA+/TLC spec generation and runner
@@ -180,5 +220,4 @@ utils/
 ## Generated Files
 
 Do not commit local environments, Python caches, LLM trace output, saved
-`.git-agent-sessions/`, secrets, or local import shims. These are covered by
-`.gitignore`.
+`.git-agent-sessions/`, or secrets. These are covered by `.gitignore`.

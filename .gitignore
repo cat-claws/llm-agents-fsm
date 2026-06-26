@@ -54,9 +54,6 @@ tmp/
 # Local TLA+/TLC downloads
 tla2tools.jar
 
-# Local import shim for the historical shrdlu-block/ source directory name.
-shrdlu_agents
-
 # Editor and OS noise
 .DS_Store
 Thumbs.db

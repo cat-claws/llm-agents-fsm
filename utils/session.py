@@ -17,20 +17,19 @@ Schema (version "1.0"):
   "properties": [                            # properties active for this session
     {"id": "prop.git.01", "natural_language": "..."}
   ],
-  "planning_tree": {                         # see utils/planning_tree.py
-    "nodes": [ ... ],
+  "planning_config": { ... },               # agent-specific planning parameters
+  "planning_tree": {                        # see utils/planning_tree.py
+    "mode":          "...",
+    "nodes":         [ ... ],               # all nodes in creation order
     "feasible":      true,
-    "accepted_plan": [{"label": "...", "tool": "...", "args": {}}]
-  },
-  "execution": {
-    "steps": [
-      {
-        "step_index":          0,
-        "action": {"label": "...", "tool": "...", "args": {}},
-        "result":              "...",    # stdout/stderr or simulator result
-        "property_verification": {}      # per-step verification (shrdlu style)
-      }
-    ]
+    "accepted_plan": [{"label": "...", "tool": "...", "args": {}}],
+    # Each accepted node carries execution_step once executed:
+    # nodes[i].execution_step = {
+    #   "execution_step":   0,
+    #   "execution_result": "...",
+    #   # domain extras (shrdlu): ap_state, ap_changes,
+    #   #   tla_verification, observation_after
+    # }
   },
   "llm_log": []   # optional: raw LLM call log for debugging
 }
@@ -42,13 +41,19 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# Re-export planning-tree helpers so callers can do:
-#   from utils.session import make_session, make_planning_node, make_verification
+# Re-export planning-tree helpers so callers only need to import from utils.session
 from utils.planning_tree import (  # noqa: F401
-    make_node        as make_planning_node,
+    make_node             as make_planning_node,
     make_verification,
     make_skipped_verification,
-    make_tree        as make_planning_tree,
+    make_tree             as make_planning_tree,
+    set_node_outcome,
+    add_child,
+    annotate_node_executed,
+    append_node,
+    mark_feasible,
+    accepted_plan_from_nodes,
+    make_attempt,
     NodeCounter,
 )
 
@@ -63,9 +68,20 @@ def make_session(
     request: str,
     work_dir: Optional[str] = None,
     properties: Optional[List[Dict]] = None,
+    planning_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Create a fresh session dict with required top-level fields."""
-    return {
+    """Create a fresh session dict with required top-level fields.
+
+    Args:
+        agent:           Agent identifier string.
+        model:           LLM model name.
+        domain:          'git' | 'shrdlu' | …
+        request:         User query / goal.
+        work_dir:        Working directory (git agents).
+        properties:      Active LTL properties [{id, natural_language}, …].
+        planning_config: Agent-specific planning parameters stored verbatim.
+    """
+    session: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "timestamp_utc":  datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "agent":          agent,
@@ -84,35 +100,11 @@ def make_session(
             "feasible":      False,
             "accepted_plan": [],
         },
-        "execution": {
-            "steps": [],
-        },
         "llm_log": [],
     }
-
-
-def make_execution_step(
-    *,
-    step_index: int,
-    action_label: str,
-    tool: str,
-    args: Dict,
-    result: str,
-    property_verification: Optional[Dict] = None,
-) -> Dict[str, Any]:
-    """Create an execution-step dict."""
-    step: Dict[str, Any] = {
-        "step_index": step_index,
-        "action": {
-            "label": action_label,
-            "tool":  tool,
-            "args":  args,
-        },
-        "result": result,
-    }
-    if property_verification is not None:
-        step["property_verification"] = property_verification
-    return step
+    if planning_config is not None:
+        session["planning_config"] = planning_config
+    return session
 
 
 def save_session(

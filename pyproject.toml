@@ -13,12 +13,15 @@ dependencies = [
 ]
 
 [project.scripts]
-shrdlu-agent = "shrdlu_agents.run_agent:main"
+run-agents = "utils.run_agents:main"
+run_agents = "utils.run_agents:main"
 
 [tool.setuptools]
 packages = ["shrdlu_agents", "utils"]
 
 [tool.setuptools.package-dir]
+# Keep the source directory's domain name while exposing a valid Python package
+# name; do not create a local shrdlu_agents symlink.
 shrdlu_agents = "shrdlu-block"
 utils = "utils"
 
