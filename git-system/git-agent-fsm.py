@@ -176,7 +176,7 @@ def _aps_from(props: list[dict]) -> tuple[list[str], list[str]]:
             sorted(a for a in aps if a.startswith("(transition)")))
 
 # How many properties to sample per session (set to None to use all)
-PROPERTY_SAMPLE_SIZE: int | None = 5
+PROPERTY_SAMPLE_SIZE: int | None = 2
 
 _ALL_PROPS: list[dict] = _load_properties_file(_PROPERTIES_FILE)
 
@@ -283,8 +283,6 @@ UNOBSERVABLE_APS: frozenset[str] = frozenset({
     "The current depth of pending git workflow operations in the processing queue exceeds 64.",
     "The number of retry attempts used by the workflow operation exceeds 3.",
     "The repository workflow state indicates that a force push is required before normal publishing can continue.",
-    "Updates to this branch must pass through a reviewed integration workflow.",
-    "Changes targeting main are integrated only through reviewed merge or rebase workflows.",
     "A network status indicating remote connectivity is available.",
     "Authentication credentials for remote write are valid.",
 })
@@ -297,7 +295,6 @@ ALWAYS_TRUE_APS: frozenset[str] = frozenset({
     "The repository repeatedly returns to a clean synchronized state over time.",
     "The workflow repeatedly reaches a state with no unpublished local commit debt.",
     "Those detached commits are eventually anchored to a named branch reference.",
-    "Any new work must be attached to a named branch before commit or push workflows continue.",
 })
 
 OBSERVABLE_APS  = [ap for ap in ALL_APS

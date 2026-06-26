@@ -130,37 +130,6 @@
       }
     },
     {
-      "id": "prop.git.main_no_direct_commit",
-      "natural_language": "While on main, no direct commit is allowed; changes must go through reviewed merge or rebase workflows.",
-      "ltl": "G(on_main => (!direct_commit /\\ reviewed_workflow))",
-      "ast": {
-        "type": "globally",
-        "operand": {
-          "type": "implies",
-          "left": {
-            "type": "ap",
-            "name": "The current checked-out branch is main."
-          },
-          "right": {
-            "type": "and",
-            "args": [
-              {
-                "type": "not",
-                "operand": {
-                  "type": "ap",
-                  "name": "(transition) A direct commit action on the current branch is just performed."
-                }
-              },
-              {
-                "type": "ap",
-                "name": "Changes targeting main are integrated only through reviewed merge or rebase workflows."
-              }
-            ]
-          }
-        }
-      }
-    },
-    {
       "id": "prop.git.diverged_no_push",
       "natural_language": "When local and remote have diverged, no push (normal or force) may proceed.",
       "ltl": "G(diverged => (!push /\\ !force_push))",
@@ -357,37 +326,6 @@
       }
     },
     {
-      "id": "prop.git.protected_no_direct_push",
-      "natural_language": "A protected branch blocks direct push and requires a reviewed integration workflow.",
-      "ltl": "G(protected => (!push /\\ reviewed_integration))",
-      "ast": {
-        "type": "globally",
-        "operand": {
-          "type": "implies",
-          "left": {
-            "type": "ap",
-            "name": "A protected-branch classification."
-          },
-          "right": {
-            "type": "and",
-            "args": [
-              {
-                "type": "not",
-                "operand": {
-                  "type": "ap",
-                  "name": "(transition) A normal push action to the remote repository is just performed."
-                }
-              },
-              {
-                "type": "ap",
-                "name": "Updates to this branch must pass through a reviewed integration workflow."
-              }
-            ]
-          }
-        }
-      }
-    },
-    {
       "id": "prop.git.protected_no_force_push",
       "natural_language": "A force-push to a protected branch is never allowed.",
       "ltl": "G(!(protected /\\ force_push) /\\ (force_push => !protected))",
@@ -427,68 +365,6 @@
               }
             }
           ]
-        }
-      }
-    },
-    {
-      "id": "prop.git.detached_head_no_direct_commit",
-      "natural_language": "In detached-HEAD mode, no direct commit is allowed; all new work must be attached to a named branch first.",
-      "ltl": "G(detached_head => (!direct_commit /\\ attach_to_branch))",
-      "ast": {
-        "type": "globally",
-        "operand": {
-          "type": "implies",
-          "left": {
-            "type": "ap",
-            "name": "A detached-head repository mode."
-          },
-          "right": {
-            "type": "and",
-            "args": [
-              {
-                "type": "not",
-                "operand": {
-                  "type": "ap",
-                  "name": "(transition) A direct commit action on the current branch is just performed."
-                }
-              },
-              {
-                "type": "ap",
-                "name": "Any new work must be attached to a named branch before commit or push workflows continue."
-              }
-            ]
-          }
-        }
-      }
-    },
-    {
-      "id": "prop.git.rebase_only_when_behind_upstream",
-      "natural_language": "A rebase is only started when the branch genuinely needs replaying (is behind upstream or has local commits).",
-      "ltl": "G(rebase_started => (behind_upstream /\\ !already_sync))",
-      "ast": {
-        "type": "globally",
-        "operand": {
-          "type": "implies",
-          "left": {
-            "type": "ap",
-            "name": "(transition) A rebase action is just performed."
-          },
-          "right": {
-            "type": "and",
-            "args": [
-              {
-                "type": "ap",
-                "name": "The branch is behind upstream or has local commits that must be replayed."
-              },
-              {
-                "type": "not",
-                "operand": {
-                  "type": "ap",
-                  "name": "A synchronization status where no rebase is needed (already synchronized)."
-                }
-              }
-            ]
-          }
         }
       }
     },

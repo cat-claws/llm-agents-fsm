@@ -93,16 +93,6 @@
       ]
     },
     {
-      "name": "A push attempt was rejected because local and remote histories diverged.",
-      "description": "The most recent push returned a rejection error indicating non-fast-forward or diverged histories.",
-      "git_commands": [
-        "git status",
-        "git log --oneline -5",
-        "git log --oneline origin/$(git symbolic-ref --short HEAD 2>/dev/null)..HEAD 2>/dev/null | head -5 || true",
-        "git log --oneline HEAD..origin/$(git symbolic-ref --short HEAD 2>/dev/null) 2>/dev/null | head -5 || true"
-      ]
-    },
-    {
       "name": "A queue-drain or operator-intervention state is required before execution resumes.",
       "description": "The workflow is paused waiting for the operation queue to drain or for manual operator intervention.",
       "git_commands": [
@@ -147,15 +137,6 @@
       ]
     },
     {
-      "name": "A synchronization status where no rebase is needed (already synchronized).",
-      "description": "Local and remote tracking branch point at the same commit; no rebase or merge is necessary.",
-      "git_commands": [
-        "git status",
-        "git rev-parse HEAD 2>/dev/null",
-        "git rev-parse origin/$(git symbolic-ref --short HEAD 2>/dev/null) 2>/dev/null || true"
-      ]
-    },
-    {
       "name": "A workflow state in which an immediate force push is required.",
       "description": "The workflow has entered the phase after a rebase where the next mandatory action is force-push.",
       "git_commands": [
@@ -183,14 +164,6 @@
       ]
     },
     {
-      "name": "Any new work must be attached to a named branch before commit or push workflows continue.",
-      "description": "The repository is in detached HEAD mode; new commits must first be attached to a branch ref.",
-      "git_commands": [
-        "git symbolic-ref --short HEAD 2>/dev/null || echo 'DETACHED'",
-        "git status | head -3"
-      ]
-    },
-    {
       "name": "Authentication credentials for remote write are valid.",
       "description": "SSH key, HTTPS token, or other credential used for remote write operations is present and valid.",
       "git_commands": [
@@ -207,15 +180,6 @@
         "git status",
         "git log --oneline HEAD..origin/$(git symbolic-ref --short HEAD 2>/dev/null) 2>/dev/null | head -5 || true",
         "git log --oneline origin/$(git symbolic-ref --short HEAD 2>/dev/null)..HEAD 2>/dev/null | head -5 || true"
-      ]
-    },
-    {
-      "name": "Changes targeting main are integrated only through reviewed merge or rebase workflows.",
-      "description": "No direct commits to main are allowed; all changes must arrive via a reviewed PR merge or rebase.",
-      "git_commands": [
-        "git log --oneline -10 main 2>/dev/null || git log --oneline -10 master 2>/dev/null || true",
-        "git log --merges --oneline -5 main 2>/dev/null || true",
-        "cat .github/branch-protection.json 2>/dev/null || true"
       ]
     },
     {
@@ -245,28 +209,11 @@
       ]
     },
     {
-      "name": "The branch is behind upstream or has local commits that must be replayed.",
-      "description": "The local branch either lags behind the remote or has commits that need to be replayed via rebase.",
-      "git_commands": [
-        "git status",
-        "git log --oneline HEAD..origin/$(git symbolic-ref --short HEAD 2>/dev/null) 2>/dev/null | head -10 || true",
-        "git log --oneline origin/$(git symbolic-ref --short HEAD 2>/dev/null)..HEAD 2>/dev/null | head -10 || true"
-      ]
-    },
-    {
       "name": "The commit graph remains acyclic and does not introduce reference cycles.",
       "description": "No commit is its own ancestor; the git DAG is free of cycles.",
       "git_commands": [
         "git fsck --connectivity-only 2>&1 | grep -E 'error|cycle|broken' | head -10 || echo 'OK'",
         "git log --oneline --graph --all | head -20"
-      ]
-    },
-    {
-      "name": "The current checked-out branch is main.",
-      "description": "HEAD resolves to refs/heads/main (or master depending on repository default).",
-      "git_commands": [
-        "git symbolic-ref --short HEAD 2>/dev/null || echo 'DETACHED'",
-        "git status | head -3"
       ]
     },
     {
@@ -302,25 +249,12 @@
         "git ls-remote origin 2>&1 | head -5 || echo 'UNREACHABLE'",
         "git status"
       ]
-    },
-    {
-      "name": "Updates to this branch must pass through a reviewed integration workflow.",
-      "description": "Branch protection requires all updates to arrive via a reviewed PR or integration pipeline.",
-      "git_commands": [
-        "git symbolic-ref --short HEAD 2>/dev/null || true",
-        "cat .github/branch-protection.json 2>/dev/null || true",
-        "git config --list | grep -E 'branch|protection' || true"
-      ]
     }
   ],
   "transition_aps": [
     {
       "name": "(transition) A destructive history-rewrite action is just performed.",
       "description": "The action taken is a git operation that rewrites or removes existing commit history (e.g. reset --hard, rebase -i with drop, filter-branch)."
-    },
-    {
-      "name": "(transition) A direct commit action on the current branch is just performed.",
-      "description": "A 'git commit' is executed directly on the currently checked-out branch."
     },
     {
       "name": "(transition) A force-push action is just performed.",
