@@ -6,7 +6,7 @@
       "Transition APs have names prefixed with '(transition)' and are set by matching the action_label of each step.",
       "Use natural-language names that are unambiguous given the git workflow context.",
       "Do not invent APs not grounded in observable git state or explicit action types.",
-      "Each AP name is used verbatim in property ASTs \u2014 changes here require updating GIT_PROPERTIES_AST.json."
+      "Each AP name is used verbatim in property ASTs — changes here require updating GIT_PROPERTIES_AST.json."
     ],
     "source_context": [
       "git-agent-fsm.py phase 3 (observation)",
@@ -16,163 +16,301 @@
   "current_state_aps": [
     {
       "name": "A backup reference or recovery tag exists for the pre-rewrite commit range.",
-      "description": "A git ref (backup tag, ORIG_HEAD, or reflog entry) still points at commits that were rewritten or removed."
+      "description": "A git ref (backup tag, ORIG_HEAD, or reflog entry) still points at commits that were rewritten or removed.",
+      "git_commands": [
+        "git show-ref | grep -E 'backup|pre-rewrite|ORIG_HEAD'",
+        "git rev-parse --verify ORIG_HEAD 2>/dev/null || true",
+        "git tag | grep -E 'backup|pre-rewrite' || true"
+      ]
     },
     {
       "name": "A branch reference moves backward to exclude commits that were previously reachable by policy.",
-      "description": "The branch tip has been moved to an ancestor, making previously reachable commits unreachable through the ref."
+      "description": "The branch tip has been moved to an ancestor, making previously reachable commits unreachable through the ref.",
+      "git_commands": [
+        "git reflog show HEAD --format='%H %gs' | head -20",
+        "git log --oneline -5"
+      ]
     },
     {
       "name": "A commit object that previously existed in reachable local history becomes irrecoverably unreachable.",
-      "description": "A commit is no longer reachable from any ref and is eligible for garbage collection with no backup."
+      "description": "A commit is no longer reachable from any ref and is eligible for garbage collection with no backup.",
+      "git_commands": [
+        "git fsck --unreachable --no-reflogs 2>&1 | grep 'unreachable commit' | head -10",
+        "git reflog show --all --format='%H' | sort -u | head -20",
+        "git show-ref --heads --tags | awk '{print $1}' | head -20"
+      ]
     },
     {
       "name": "A detached-head repository mode.",
-      "description": "HEAD points to a commit SHA rather than a branch name (git status shows 'HEAD detached at ...')."
+      "description": "HEAD points to a commit SHA rather than a branch name (git status shows 'HEAD detached at ...').",
+      "git_commands": [
+        "git symbolic-ref --short HEAD 2>/dev/null || echo 'DETACHED'",
+        "git status | head -3"
+      ]
     },
     {
       "name": "A maintainer-level role.",
-      "description": "The acting user has maintainer or admin privileges on the target repository."
+      "description": "The acting user has maintainer or admin privileges on the target repository.",
+      "git_commands": [
+        "git config user.name",
+        "git config user.email",
+        "git remote -v",
+        "git config --list | grep -E 'credential|user|role' || true"
+      ]
     },
     {
       "name": "A network status indicating remote connectivity is available.",
-      "description": "The remote host is reachable and git network operations (fetch/push/pull) can proceed."
+      "description": "The remote host is reachable and git network operations (fetch/push/pull) can proceed.",
+      "git_commands": [
+        "git remote -v",
+        "git ls-remote --exit-code origin HEAD 2>&1 | head -5 || echo 'UNREACHABLE'"
+      ]
     },
     {
       "name": "A non-fast-forward update approval token is present for this action.",
-      "description": "An explicit --force, --force-with-lease, or equivalent flag/config that authorises a non-fast-forward update."
+      "description": "An explicit --force, --force-with-lease, or equivalent flag/config that authorises a non-fast-forward update.",
+      "git_commands": [
+        "git config --get push.default || true",
+        "git config --get remote.origin.push || true"
+      ]
     },
     {
       "name": "A protected branch requires linear history.",
-      "description": "The branch protection rule mandates linear history (no merge commits), i.e. rebases are required over merges."
+      "description": "The branch protection rule mandates linear history (no merge commits), i.e. rebases are required over merges.",
+      "git_commands": [
+        "git config --get branch.$(git symbolic-ref --short HEAD 2>/dev/null).mergeOptions || true",
+        "git config --get merge.ff || true",
+        "cat .github/branch-protection.json 2>/dev/null || true"
+      ]
     },
     {
       "name": "A protected-branch classification.",
-      "description": "The target branch is classified as protected in the repository settings (e.g. main, release/*)."
+      "description": "The target branch is classified as protected in the repository settings (e.g. main, release/*).",
+      "git_commands": [
+        "git symbolic-ref --short HEAD 2>/dev/null || true",
+        "git branch -r | grep -E 'main|master|release/' | head -10 || true",
+        "cat .github/branch-protection.json 2>/dev/null || true"
+      ]
     },
     {
       "name": "A push attempt was rejected because local and remote histories diverged.",
-      "description": "The most recent push returned a rejection error indicating non-fast-forward or diverged histories."
+      "description": "The most recent push returned a rejection error indicating non-fast-forward or diverged histories.",
+      "git_commands": [
+        "git status",
+        "git log --oneline -5",
+        "git log --oneline origin/$(git symbolic-ref --short HEAD 2>/dev/null)..HEAD 2>/dev/null | head -5 || true",
+        "git log --oneline HEAD..origin/$(git symbolic-ref --short HEAD 2>/dev/null) 2>/dev/null | head -5 || true"
+      ]
     },
     {
       "name": "A queue-drain or operator-intervention state is required before execution resumes.",
-      "description": "The workflow is paused waiting for the operation queue to drain or for manual operator intervention."
+      "description": "The workflow is paused waiting for the operation queue to drain or for manual operator intervention.",
+      "git_commands": [
+        "git status",
+        "ls -la .git/rebase-merge/ 2>/dev/null || true",
+        "ls -la .git/MERGE_HEAD 2>/dev/null || true",
+        "ls -la .git/CHERRY_PICK_HEAD 2>/dev/null || true"
+      ]
     },
     {
       "name": "A remote write-protection or permission-denied status is active.",
-      "description": "The remote returned a permission-denied error; write access to the remote ref is blocked."
+      "description": "The remote returned a permission-denied error; write access to the remote ref is blocked.",
+      "git_commands": [
+        "git remote -v",
+        "git ls-remote origin 2>&1 | head -5 || echo 'REMOTE_ERROR'"
+      ]
     },
     {
       "name": "A required immediate force push was missed.",
-      "description": "The workflow reached a state where an immediate force-push was required but a different action was taken first."
+      "description": "The workflow reached a state where an immediate force-push was required but a different action was taken first.",
+      "git_commands": [
+        "git reflog show HEAD --format='%H %gs' | head -10",
+        "git log --oneline -5"
+      ]
     },
     {
       "name": "A synchronization status where local and remote histories have diverged.",
-      "description": "Both local and remote have commits the other does not; a simple fast-forward in either direction is impossible."
+      "description": "Both local and remote have commits the other does not; a simple fast-forward in either direction is impossible.",
+      "git_commands": [
+        "git fetch --dry-run 2>&1 | head -5 || true",
+        "git status",
+        "git log --oneline HEAD..origin/$(git symbolic-ref --short HEAD 2>/dev/null) 2>/dev/null | head -5 || true",
+        "git log --oneline origin/$(git symbolic-ref --short HEAD 2>/dev/null)..HEAD 2>/dev/null | head -5 || true"
+      ]
     },
     {
       "name": "A synchronization status where local history is ahead of remote history.",
-      "description": "Local branch has commits not yet on the remote; a fast-forward push is possible."
+      "description": "Local branch has commits not yet on the remote; a fast-forward push is possible.",
+      "git_commands": [
+        "git status",
+        "git log --oneline origin/$(git symbolic-ref --short HEAD 2>/dev/null)..HEAD 2>/dev/null | head -10 || true"
+      ]
     },
     {
       "name": "A synchronization status where no rebase is needed (already synchronized).",
-      "description": "Local and remote tracking branch point at the same commit; no rebase or merge is necessary."
+      "description": "Local and remote tracking branch point at the same commit; no rebase or merge is necessary.",
+      "git_commands": [
+        "git status",
+        "git rev-parse HEAD 2>/dev/null",
+        "git rev-parse origin/$(git symbolic-ref --short HEAD 2>/dev/null) 2>/dev/null || true"
+      ]
     },
     {
       "name": "A workflow state in which an immediate force push is required.",
-      "description": "The workflow has entered the phase after a rebase where the next mandatory action is force-push."
+      "description": "The workflow has entered the phase after a rebase where the next mandatory action is force-push.",
+      "git_commands": [
+        "git status",
+        "git reflog show HEAD --format='%H %gs' | head -5",
+        "git log --oneline origin/$(git symbolic-ref --short HEAD 2>/dev/null)..HEAD 2>/dev/null | head -5 || true"
+      ]
     },
     {
       "name": "All commits selected for rebase are local-only and unpublished.",
-      "description": "Every commit in the rebase range exists only in the local repository and has never been pushed."
+      "description": "Every commit in the rebase range exists only in the local repository and has never been pushed.",
+      "git_commands": [
+        "git log --oneline origin/$(git symbolic-ref --short HEAD 2>/dev/null)..HEAD 2>/dev/null | head -20 || true",
+        "git branch -r | head -10"
+      ]
     },
     {
       "name": "An authorized/authenticated status allowing the guarded action.",
-      "description": "The current operation has passed authentication and authorisation checks for the guarded action."
+      "description": "The current operation has passed authentication and authorisation checks for the guarded action.",
+      "git_commands": [
+        "git config user.name",
+        "git config user.email",
+        "git remote -v",
+        "git config --list | grep credential || true"
+      ]
     },
     {
       "name": "Any new work must be attached to a named branch before commit or push workflows continue.",
-      "description": "The repository is in detached HEAD mode; new commits must first be attached to a branch ref."
+      "description": "The repository is in detached HEAD mode; new commits must first be attached to a branch ref.",
+      "git_commands": [
+        "git symbolic-ref --short HEAD 2>/dev/null || echo 'DETACHED'",
+        "git status | head -3"
+      ]
     },
     {
       "name": "Authentication credentials for remote write are valid.",
-      "description": "SSH key, HTTPS token, or other credential used for remote write operations is present and valid."
+      "description": "SSH key, HTTPS token, or other credential used for remote write operations is present and valid.",
+      "git_commands": [
+        "git remote -v",
+        "git config --list | grep credential || true",
+        "ssh -T git@github.com 2>&1 | head -3 || true",
+        "git ls-remote origin 2>&1 | head -3 || true"
+      ]
     },
     {
       "name": "Branch histories are diverged and require reconciliation.",
-      "description": "Local and upstream have conflicting histories; a rebase or merge reconciliation step is required."
+      "description": "Local and upstream have conflicting histories; a rebase or merge reconciliation step is required.",
+      "git_commands": [
+        "git status",
+        "git log --oneline HEAD..origin/$(git symbolic-ref --short HEAD 2>/dev/null) 2>/dev/null | head -5 || true",
+        "git log --oneline origin/$(git symbolic-ref --short HEAD 2>/dev/null)..HEAD 2>/dev/null | head -5 || true"
+      ]
     },
     {
       "name": "Changes targeting main are integrated only through reviewed merge or rebase workflows.",
-      "description": "No direct commits to main are allowed; all changes must arrive via a reviewed PR merge or rebase."
-    },
-    {
-      "name": "Detached HEAD contains commits that are not attached to any named branch.",
-      "description": "HEAD is detached and the detached commits are not reachable from any branch ref."
+      "description": "No direct commits to main are allowed; all changes must arrive via a reviewed PR merge or rebase.",
+      "git_commands": [
+        "git log --oneline -10 main 2>/dev/null || git log --oneline -10 master 2>/dev/null || true",
+        "git log --merges --oneline -5 main 2>/dev/null || true",
+        "cat .github/branch-protection.json 2>/dev/null || true"
+      ]
     },
     {
       "name": "Local branch contains commits that are ahead of the remote tracking branch.",
-      "description": "git status reports 'ahead of origin/branch by N commits'; a push would add new commits to the remote."
-    },
-    {
-      "name": "Local history is ahead of the remote branch and has unpublished commits.",
-      "description": "There are commits in the local branch that have not been pushed to the remote tracking branch."
+      "description": "git status reports 'ahead of origin/branch by N commits'; a push would add new commits to the remote.",
+      "git_commands": [
+        "git status",
+        "git log --oneline origin/$(git symbolic-ref --short HEAD 2>/dev/null)..HEAD 2>/dev/null | head -10 || true"
+      ]
     },
     {
       "name": "The action is executed under an approved protected-branch override policy.",
-      "description": "An explicit override policy (e.g. bypass allowlist) has been approved for the current action on a protected branch."
+      "description": "An explicit override policy (e.g. bypass allowlist) has been approved for the current action on a protected branch.",
+      "git_commands": [
+        "git config --list | grep -E 'override|bypass|policy' || true",
+        "cat .github/branch-protection.json 2>/dev/null || true"
+      ]
     },
     {
       "name": "The actor is authenticated and authorized for force-push on the target branch.",
-      "description": "The actor has the required credentials and explicit authorisation to perform a force-push on this specific branch."
+      "description": "The actor has the required credentials and explicit authorisation to perform a force-push on this specific branch.",
+      "git_commands": [
+        "git config user.name",
+        "git config user.email",
+        "git remote -v",
+        "cat .github/branch-protection.json 2>/dev/null || true"
+      ]
     },
     {
       "name": "The branch is behind upstream or has local commits that must be replayed.",
-      "description": "The local branch either lags behind the remote or has commits that need to be replayed via rebase."
-    },
-    {
-      "name": "The branch returns to a clean synchronized state with no unpublished commit debt.",
-      "description": "After publishing, the local branch and remote tracking branch are identical with no pending commits."
+      "description": "The local branch either lags behind the remote or has commits that need to be replayed via rebase.",
+      "git_commands": [
+        "git status",
+        "git log --oneline HEAD..origin/$(git symbolic-ref --short HEAD 2>/dev/null) 2>/dev/null | head -10 || true",
+        "git log --oneline origin/$(git symbolic-ref --short HEAD 2>/dev/null)..HEAD 2>/dev/null | head -10 || true"
+      ]
     },
     {
       "name": "The commit graph remains acyclic and does not introduce reference cycles.",
-      "description": "No commit is its own ancestor; the git DAG is free of cycles."
+      "description": "No commit is its own ancestor; the git DAG is free of cycles.",
+      "git_commands": [
+        "git fsck --connectivity-only 2>&1 | grep -E 'error|cycle|broken' | head -10 || echo 'OK'",
+        "git log --oneline --graph --all | head -20"
+      ]
     },
     {
       "name": "The current checked-out branch is main.",
-      "description": "HEAD resolves to refs/heads/main (or master depending on repository default)."
+      "description": "HEAD resolves to refs/heads/main (or master depending on repository default).",
+      "git_commands": [
+        "git symbolic-ref --short HEAD 2>/dev/null || echo 'DETACHED'",
+        "git status | head -3"
+      ]
     },
     {
       "name": "The current depth of pending git workflow operations in the processing queue exceeds 64.",
-      "description": "The internal workflow queue has accumulated more than 64 pending operations."
+      "description": "The internal workflow queue has accumulated more than 64 pending operations.",
+      "git_commands": [
+        "git status",
+        "ls .git/ | head -20"
+      ]
     },
     {
       "name": "The number of retry attempts used by the workflow operation exceeds 3.",
-      "description": "The current operation has been retried more than 3 times without success."
-    },
-    {
-      "name": "The repository repeatedly returns to a clean synchronized state over time.",
-      "description": "Over the course of the workflow, the repository reaches a clean sync state multiple times."
+      "description": "The current operation has been retried more than 3 times without success.",
+      "git_commands": [
+        "git reflog show HEAD --format='%H %gs' | head -20",
+        "git status"
+      ]
     },
     {
       "name": "The repository workflow state indicates that a force push is required before normal publishing can continue.",
-      "description": "The workflow flag for 'force-push required' is set; normal push is blocked until force-push completes."
+      "description": "The workflow flag for 'force-push required' is set; normal push is blocked until force-push completes.",
+      "git_commands": [
+        "git status",
+        "git reflog show HEAD --format='%H %gs' | head -5",
+        "git log --oneline origin/$(git symbolic-ref --short HEAD 2>/dev/null)..HEAD 2>/dev/null | head -5 || true"
+      ]
     },
     {
       "name": "The target remote reference is reachable and satisfies push preconditions.",
-      "description": "The remote ref exists, is reachable, and all push preconditions (credentials, permissions, fast-forward) are met."
-    },
-    {
-      "name": "The workflow repeatedly reaches a state with no unpublished local commit debt.",
-      "description": "The workflow repeatedly passes through states where the local branch has no unpublished commits."
-    },
-    {
-      "name": "Those detached commits are eventually anchored to a named branch reference.",
-      "description": "Commits made while in detached HEAD mode are eventually reachable from a named branch."
+      "description": "The remote ref exists, is reachable, and all push preconditions (credentials, permissions, fast-forward) are met.",
+      "git_commands": [
+        "git remote -v",
+        "git ls-remote origin 2>&1 | head -5 || echo 'UNREACHABLE'",
+        "git status"
+      ]
     },
     {
       "name": "Updates to this branch must pass through a reviewed integration workflow.",
-      "description": "Branch protection requires all updates to arrive via a reviewed PR or integration pipeline."
+      "description": "Branch protection requires all updates to arrive via a reviewed PR or integration pipeline.",
+      "git_commands": [
+        "git symbolic-ref --short HEAD 2>/dev/null || true",
+        "cat .github/branch-protection.json 2>/dev/null || true",
+        "git config --list | grep -E 'branch|protection' || true"
+      ]
     }
   ],
   "transition_aps": [
@@ -213,10 +351,6 @@
       "description": "A 'git rebase' command is initiated (may or may not complete successfully)."
     },
     {
-      "name": "(transition) A rebase action that successfully resolves divergence is just performed.",
-      "description": "A 'git rebase' completes without conflict and resolves the divergence between local and remote."
-    },
-    {
       "name": "(transition) A rebase action that rewrites published commits is just performed.",
       "description": "The rebase replays commits that were previously pushed; this constitutes a public history rewrite."
     },
@@ -227,10 +361,6 @@
     {
       "name": "(transition) An immediate force-push action to publish rewritten history is just performed.",
       "description": "After a rebase or reset, a force-push is executed immediately as the mandatory follow-up to publish the rewritten history."
-    },
-    {
-      "name": "(transition) Any push action to the remote repository is just performed.",
-      "description": "Any push action (force or normal) to the remote is executed in this step."
     }
   ]
 }
