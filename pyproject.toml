@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-agents-fsm"
+version = "0.1.0"
+description = "LLM planning agents with FSM/property checks for Git and SHRDLU."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "openai>=1.0",
+]
+
+[project.scripts]
+shrdlu-agent = "shrdlu_agents.run_agent:main"
+
+[tool.setuptools]
+packages = ["shrdlu_agents", "utils"]
+
+[tool.setuptools.package-dir]
+shrdlu_agents = "shrdlu-block"
+utils = "utils"
+
+[tool.setuptools.package-data]
+shrdlu_agents = ["resources/*.json"]
