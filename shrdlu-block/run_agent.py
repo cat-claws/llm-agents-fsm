@@ -19,27 +19,43 @@ from shrdlu_agents.shrdlu_agent_basic import (
     DEFAULT_OPENAI_MODEL,
     DEFAULT_TRACE_DIR,
     OpenAICompatibleShrdluAgent,
-    PreplannedOpenAICompatibleShrdluAgent,
-)
-from shrdlu_agents.shrdlu_agent_plan import (
-    PredictivePreplannedOpenAICompatibleShrdluAgent,
 )
 from shrdlu_agents.simulator_api import DEFAULT_SIMULATOR_URL, HttpSimulatorClient
-from shrdlu_agents.shrdlu_agent_fsm import (
-    SuffixPredictivePreplannedOpenAICompatibleShrdluAgent,
-)
+from shrdlu_agents.shrdlu_agent_fsm import FsmOpenAICompatibleShrdluAgent
 from shrdlu_agents.terminal import run_agent_against_simulator
 
 AGENT_TYPES: Dict[str, Type[OpenAICompatibleShrdluAgent]] = {
     'reactive': OpenAICompatibleShrdluAgent,
-    'preplanned': PreplannedOpenAICompatibleShrdluAgent,
-    'predictive': PredictivePreplannedOpenAICompatibleShrdluAgent,
-    'suffix': SuffixPredictivePreplannedOpenAICompatibleShrdluAgent,
+    'fsm': FsmOpenAICompatibleShrdluAgent,
+}
+
+AGENT_ALIASES = {
+    'preplanned': 'fsm',
+    'predictive': 'fsm',
+    'suffix': 'fsm',
+}
+
+ALIAS_PRESETS = {
+    'preplanned': {
+        'planning_granularity': 'batch',
+        'violation_policy': 'ignore',
+        'max_branch_retries': 1,
+    },
+    'predictive': {
+        'planning_granularity': 'step',
+        'violation_policy': 'retry',
+    },
+    'suffix': {
+        'planning_granularity': 'batch',
+        'violation_policy': 'retry',
+    },
 }
 
 
 def build_agent(args):
     simulator = HttpSimulatorClient(args.simulator_url)
+    original_agent = getattr(args, 'agent_alias', args.agent)
+    default_branch_retries = int(os.environ.get('SHRDLU_AGENT_MAX_BRANCH_RETRIES', '3'))
     kwargs = {
         'model': args.model,
         'base_url': args.base_url,
@@ -49,8 +65,23 @@ def build_agent(args):
         'temperature': args.temperature,
         'max_tokens': args.max_tokens,
     }
-    if args.agent in {'predictive', 'suffix'}:
-        kwargs['max_branch_retries'] = args.max_branch_retries
+    if args.agent == 'fsm':
+        preset = ALIAS_PRESETS.get(original_agent, {})
+        kwargs['max_branch_retries'] = (
+            args.max_branch_retries
+            if args.max_branch_retries is not None
+            else preset.get('max_branch_retries', default_branch_retries)
+        )
+        kwargs['planning_granularity'] = (
+            args.planning_granularity
+            or preset.get('planning_granularity')
+            or 'batch'
+        )
+        kwargs['violation_policy'] = (
+            args.violation_policy
+            or preset.get('violation_policy')
+            or 'retry'
+        )
     agent = AGENT_TYPES[args.agent](simulator, **kwargs)
     return agent, simulator
 
@@ -61,9 +92,8 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         '--agent',
-        choices=sorted(AGENT_TYPES),
-        default=os.environ.get('SHRDLU_AGENT_TYPE', 'preplanned'),
-        help='agent strategy to run',
+        default=os.environ.get('SHRDLU_AGENT_TYPE', 'fsm'),
+        help='agent strategy to run: reactive or fsm; legacy aliases preplanned, predictive, suffix are accepted',
     )
     parser.add_argument(
         '--simulator-url',
@@ -106,8 +136,26 @@ def parse_args(argv=None):
     parser.add_argument(
         '--max-branch-retries',
         type=int,
-        default=int(os.environ.get('SHRDLU_AGENT_MAX_BRANCH_RETRIES', '3')),
+        default=None,
         help='planning retries per predictive branch',
+    )
+    parser.add_argument(
+        '--planning-granularity',
+        choices=['step', 'batch'],
+        default=(
+            os.environ.get('SHRDLU_AGENT_FSM_PLANNING_GRANULARITY')
+            or os.environ.get('SHRDLU_AGENT_FSM_PLANNING')
+        ),
+        help='FSM planning granularity: step plans one action at a time; batch plans a remaining suffix',
+    )
+    parser.add_argument(
+        '--violation-policy',
+        choices=['retry', 'ignore'],
+        default=(
+            os.environ.get('SHRDLU_AGENT_FSM_VIOLATION_POLICY')
+            or os.environ.get('SHRDLU_AGENT_FSM_VIOLATIONS')
+        ),
+        help='FSM property behavior: retry blocks/replans on violations; ignore records and continues',
     )
     parser.add_argument(
         '--trace-dir',
@@ -115,10 +163,12 @@ def parse_args(argv=None):
         help='directory for saved agent traces; use an empty string to disable',
     )
     args = parser.parse_args(argv)
+    args.agent_alias = args.agent
+    args.agent = AGENT_ALIASES.get(args.agent, args.agent)
     if args.agent not in AGENT_TYPES:
         parser.error(
             '--agent must be one of %s; got %r'
-            % (', '.join(sorted(AGENT_TYPES)), args.agent)
+            % (', '.join(sorted(AGENT_TYPES)), args.agent_alias)
         )
     if args.trace_dir == '':
         args.trace_dir = None
@@ -129,7 +179,24 @@ def main(argv=None):
     logging.basicConfig(stream=sys.stdout, level=logging.INFO)
     args = parse_args(argv)
     agent, simulator = build_agent(args)
-    print('Agent type: %s' % args.agent)
+    label = args.agent if args.agent_alias == args.agent else '%s (alias for %s)' % (args.agent_alias, args.agent)
+    print('Agent type: %s' % label)
+    if args.agent == 'fsm':
+        print(
+            'FSM config: planning=%s violations=%s retries=%d'
+            % (
+                args.planning_granularity or ALIAS_PRESETS.get(args.agent_alias, {}).get('planning_granularity') or 'batch',
+                args.violation_policy or ALIAS_PRESETS.get(args.agent_alias, {}).get('violation_policy') or 'retry',
+                (
+                    args.max_branch_retries
+                    if args.max_branch_retries is not None
+                    else ALIAS_PRESETS.get(args.agent_alias, {}).get(
+                        'max_branch_retries',
+                        int(os.environ.get('SHRDLU_AGENT_MAX_BRANCH_RETRIES', '3')),
+                    )
+                ),
+            )
+        )
     run_agent_against_simulator(agent, simulator)
 
 

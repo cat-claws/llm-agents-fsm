@@ -1,4 +1,4 @@
-"""OpenAI-compatible suffix-replanning predictive agents for the SHRDLU blocks environment."""
+"""OpenAI-compatible merged FSM/planning agents for the SHRDLU blocks environment."""
 
 import copy
 import json
@@ -23,9 +23,6 @@ from shrdlu_agents.shrdlu_agent_basic import (
     PLAN_SCHEMA,
 )
 from shrdlu_agents.simulator_api import ALLOWED_SIMULATOR_ACTION_NAMES, SimulatorAPI
-from shrdlu_agents.shrdlu_agent_plan import (
-    _PredictivePreplannedShrdluAgentMixin,
-)
 from shrdlu_agents.property_verifier import TransitionPropertyVerifier
 from shrdlu_blocks.simulator.state_pred import predict_world_state_after_actions
 from shrdlu_agents.tla_verifier import verify_ap_trace
@@ -34,11 +31,36 @@ _AP_CANDIDATES: List[Dict[str, str]] = TransitionPropertyVerifier.from_file().ap
 _AP_NAMES: List[str] = [ap['name'] for ap in _AP_CANDIDATES]
 
 __all__ = [
-    'SuffixPredictivePreplannedOpenAICompatibleShrdluAgent',
+    'FsmOpenAICompatibleShrdluAgent',
 ]
 
+PLANNING_STEP = 'step'
+PLANNING_BATCH = 'batch'
+VIOLATION_RETRY = 'retry'
+VIOLATION_IGNORE = 'ignore'
 
-SUFFIX_PREDICTIVE_PLAN_SYSTEM_PROMPT = """You are planning a SHRDLU blocks-world task before execution.
+
+def _normalise_planning_granularity(value: Optional[str]) -> str:
+    raw = (value or PLANNING_BATCH).strip().lower()
+    if raw in {'step', 'single', 'one', 'one_step', 'predictive'}:
+        return PLANNING_STEP
+    if raw in {'batch', 'suffix', 'multi', 'multiple', 'full', 'plan', 'fsm'}:
+        return PLANNING_BATCH
+    raise ValueError(
+        "planning_granularity must be 'step' or 'batch', got %r" % value
+    )
+
+
+def _normalise_violation_policy(value: Optional[str]) -> str:
+    raw = (value or VIOLATION_RETRY).strip().lower()
+    if raw in {'retry', 'stop', 'fsm'}:
+        return VIOLATION_RETRY
+    if raw in {'ignore', 'monitor', 'continue', 'plan'}:
+        return VIOLATION_IGNORE
+    raise ValueError("violation_policy must be 'retry' or 'ignore', got %r" % value)
+
+
+BATCH_PLAN_SYSTEM_PROMPT = """You are planning a SHRDLU blocks-world task before execution.
 
 Rules:
 - Think through the full remaining task first, then return the complete remaining action suffix.
@@ -57,7 +79,21 @@ Rules:
 Return strict JSON only.
 """
 
-SUFFIX_PLAN_USER_PROMPT_TEMPLATE = """\
+STEP_PREDICTIVE_PLAN_SYSTEM_PROMPT = """You are planning a SHRDLU blocks-world task before execution.
+
+Rules:
+- Plan exactly one primitive action for the current predicted state.
+- Treat the action as a dry-run primitive simulator call that will be checked before execution.
+- Use only one allowed primitive action name and exactly the matching JSON args listed in the allowed actions schema.
+- Never invent argument names not listed in the schema. Never use null or descriptive strings where a concrete numeric argument is required.
+- Ground every action argument from the initial world state, accepted action trace, or structured planning state summary.
+- If the goal is already satisfied in the current predicted state, return an empty plan.
+- Do not explain alternatives or reasoning. Keep the response short and factual.
+
+Return strict JSON only.
+"""
+
+PLAN_USER_PROMPT_TEMPLATE = """\
 Goal:
 {request}
 
@@ -72,23 +108,26 @@ Structured planning state summary:
 Accepted action trace so far:
 {accepted_trace_json}
 
-Properties to satisfy:
+Property policy:
+{property_policy}
+
+Properties:
 {property_text}
 
 Allowed primitive actions:
 {action_help}
 
-Failed suffix attempts and backtrack feedback:
+Failed plan attempts and backtrack feedback:
 {failed_attempts_json}
 
 Banned first actions at this node (do NOT start your plan with any of these — they were already tried here):
 {banned_first_actions_json}
 
-Return the complete remaining action sequence from the current state to goal completion.
+{plan_instruction}
 JSON schema: {{"response": "...", "plan": [{{"name": "...", "args": {{...}}}}], "finish_response": "..."}}
 Return strict JSON only."""
 
-SUFFIX_PLAN_REPAIR_PROMPT_TEMPLATE = """\
+PLAN_REPAIR_PROMPT_TEMPLATE = """\
 Your previous reply was invalid: {error}
 Rewrite it as strict JSON only using this schema:
 {{"response": "...", "plan": [{{"name": "...", "args": {{...}}}}], "finish_response": "..."}}
@@ -202,8 +241,360 @@ AP_STATE_SCHEMA = {
 }
 
 
-class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAgentMixin):
-    """Plan a full remaining suffix, verify along it, then replan from the first failure point."""
+class _FsmShrdluAgentMixin:
+    """Plan before execution with configurable granularity and property policy."""
+
+    def _init_predictive_preplanned(self, max_branch_retries: int = 3):
+        self._max_branch_retries = int(max_branch_retries)
+        self._property_text = self._build_property_text()
+
+    @staticmethod
+    def _snapshot_json(snapshot) -> str:
+        return json.dumps(snapshot, indent=2, sort_keys=True)
+
+    @staticmethod
+    def _json_or_none(value) -> str:
+        if value in (None, [], {}):
+            return 'None'
+        return json.dumps(value, indent=2, sort_keys=True)
+
+    @staticmethod
+    def _recent_actions(accepted_trace: List[Dict[str, object]], limit: int = 6) -> List[str]:
+        names = []
+        for action in accepted_trace[-limit:]:
+            if isinstance(action, dict):
+                names.append(str(action.get('name', '')))
+        return names
+
+    @staticmethod
+    def _action_signature(action: Dict[str, object]) -> str:
+        return json.dumps({
+            'name': action.get('name'),
+            'args': action.get('args', {}),
+        }, sort_keys=True)
+
+    @classmethod
+    def _recent_action_signatures(
+        cls,
+        accepted_trace: List[Dict[str, object]],
+        limit: int = 6,
+    ) -> List[str]:
+        signatures = []
+        for action in accepted_trace[-limit:]:
+            if isinstance(action, dict):
+                signatures.append(cls._action_signature(action))
+        return signatures
+
+    @classmethod
+    def _identical_repeat_warning(cls, accepted_trace: List[Dict[str, object]]) -> str:
+        signatures = cls._recent_action_signatures(accepted_trace, limit=3)
+        if len(signatures) >= 2 and signatures[-1] == signatures[-2]:
+            return 'identical repeated action detected: %s' % signatures[-1]
+        return 'none'
+
+    @classmethod
+    def _alternating_warning(cls, accepted_trace: List[Dict[str, object]]) -> str:
+        names = cls._recent_actions(accepted_trace, limit=6)
+        if len(names) < 4:
+            return 'none'
+        if (
+            len(set(names[-4:])) == 2
+            and names[-4] == names[-2]
+            and names[-3] == names[-1]
+            and names[-4] != names[-3]
+        ):
+            return 'recent alternating loop detected: %s' % ' -> '.join(names[-4:])
+        return 'none'
+
+    @classmethod
+    def _planning_state_summary(
+        cls,
+        current_state: Dict[str, object],
+        accepted_trace: List[Dict[str, object]],
+        request: str = '',
+    ) -> str:
+        grounding = cls._grounding_summary(current_state, request)
+        highlighted_objects = grounding['goal_relevant']['highlighted_objects']
+        object_catalog = grounding['object_catalog']
+        source_candidates = grounding['source_candidates']
+        destination_candidates = grounding['destination_candidates']
+        request_focus = grounding['request_focus']
+        exact_source_matches = grounding['exact_source_matches']
+        exact_destination_matches = grounding['exact_destination_matches']
+        object_count = grounding['object_count']
+        goal_relevant = grounding['goal_relevant']
+        summary = {
+            'request_focus': request_focus,
+            'goal_relevant': {
+                'default_grasper': goal_relevant.get('default_grasper'),
+                'grasper_lowered': goal_relevant.get('grasper_lowered'),
+                'grasper_closed': goal_relevant.get('grasper_closed'),
+                'grasped_object': goal_relevant.get('grasped_object'),
+                'highlighted_objects': highlighted_objects,
+                'highlighted_count': len(highlighted_objects),
+            },
+            'recent_actions': cls._recent_actions(accepted_trace),
+            'recent_action_signatures': cls._recent_action_signatures(accepted_trace),
+            'alternating_warning': cls._alternating_warning(accepted_trace),
+            'identical_repeat_warning': cls._identical_repeat_warning(accepted_trace),
+            'object_count': object_count,
+            'object_catalog': object_catalog,
+            'argument_grounding_rules': {
+                'highlight_object': 'Use obj_id from object_catalog.',
+                'unhighlight_object': 'Use obj_id from object_catalog.',
+                'move_grasper': 'Use numeric x and y copied from object_catalog positions or explicit numeric state value.',
+                'all_goals': 'For all/each/every goals, choose one concrete object id per step.',
+                'pick_place_goals': (
+                    'Choose one concrete source object from source_candidates and one concrete '
+                    'destination object from destination_candidates.'
+                ),
+            },
+            'candidate_source_objects': exact_source_matches,
+            'candidate_destination_objects': exact_destination_matches,
+            'binding_warning': (
+                'Never satisfy a phrase like "green small block" by combining attributes from multiple objects.'
+            ),
+            'source_candidates': source_candidates,
+            'destination_candidates': destination_candidates,
+        }
+        return json.dumps(summary, indent=2, sort_keys=True)
+
+    @classmethod
+    def _grounding_summary(cls, current_state: Dict[str, object], request: str) -> Dict[str, object]:
+        highlighted_objects = []
+        object_catalog = []
+        for obj in current_state.get('objects', []):
+            if not isinstance(obj, dict):
+                continue
+            tags = obj.get('tags', {}) if isinstance(obj.get('tags', {}), dict) else {}
+            if bool(tags.get('highlight', False)):
+                highlighted_objects.append(obj.get('obj_id'))
+            pos = obj.get('position', {}) if isinstance(obj.get('position', {}), dict) else {}
+            object_catalog.append({
+                'obj_id': obj.get('obj_id'),
+                'kind': obj.get('kind'),
+                'color': obj.get('color'),
+                'graspable': bool(obj.get('graspable', False)),
+                'can_support': bool(obj.get('can_support', False)),
+                'size': tags.get('size'),
+                'height': tags.get('height'),
+                'width': tags.get('width'),
+                'highlighted': bool(tags.get('highlight', False)),
+                'resting_on': obj.get('resting_on'),
+                'position': {
+                    'x': pos.get('x'),
+                    'y': pos.get('y'),
+                    'z': pos.get('z'),
+                },
+            })
+        source_candidates = [
+            {
+                'obj_id': item['obj_id'],
+                'kind': item['kind'],
+                'color': item['color'],
+                'size': item.get('size'),
+                'height': item.get('height'),
+                'width': item.get('width'),
+                'position': item['position'],
+            }
+            for item in object_catalog
+            if item.get('obj_id') is not None and item.get('graspable')
+        ]
+        destination_candidates = [
+            {
+                'obj_id': item['obj_id'],
+                'kind': item['kind'],
+                'color': item['color'],
+                'size': item.get('size'),
+                'height': item.get('height'),
+                'width': item.get('width'),
+                'can_support': item.get('can_support'),
+                'position': item['position'],
+            }
+            for item in object_catalog
+            if item.get('obj_id') is not None and item.get('can_support')
+        ]
+        request_focus = cls._request_focus(request)
+        return {
+            'request_focus': request_focus,
+            'goal_relevant': {
+                'default_grasper': current_state.get('default_grasper'),
+                'grasper_lowered': current_state.get('grasper_lowered'),
+                'grasper_closed': current_state.get('grasper_closed'),
+                'grasped_object': current_state.get('grasped_object'),
+                'highlighted_objects': highlighted_objects,
+                'highlighted_count': len(highlighted_objects),
+            },
+            'object_count': len(current_state.get('objects', [])),
+            'object_catalog': object_catalog,
+            'exact_source_matches': cls._exact_matches(
+                request_focus.get('source', {}),
+                source_candidates,
+            ),
+            'exact_destination_matches': cls._exact_matches(
+                request_focus.get('destination', {}),
+                destination_candidates,
+            ),
+            'source_candidates': source_candidates,
+            'destination_candidates': destination_candidates,
+        }
+
+    @classmethod
+    def _grounding_verdict_text(cls, current_state: Dict[str, object], request: str) -> str:
+        grounding = cls._grounding_summary(current_state, request)
+        request_focus = grounding['request_focus']
+        source_phrase = request_focus.get('source_phrase') or '(none)'
+        destination_phrase = request_focus.get('destination_phrase') or '(none)'
+
+        def labels(items: List[Dict[str, object]]) -> str:
+            if not items:
+                return 'none'
+            parts = []
+            for item in items:
+                parts.append(
+                    'obj_id={obj_id} color={color} kind={kind} size={size} height={height} width={width}'.format(
+                        obj_id=item.get('obj_id'),
+                        color=item.get('color'),
+                        kind=item.get('kind'),
+                        size=item.get('size'),
+                        height=item.get('height'),
+                        width=item.get('width'),
+                    )
+                )
+            return '; '.join(parts)
+
+        return '\n'.join([
+            'Grounding context:',
+            'Source phrase: %s' % source_phrase,
+            'Destination phrase: %s' % destination_phrase,
+            'Relevant source objects: %s' % labels(grounding['exact_source_matches']),
+            'Relevant destination objects: %s' % labels(grounding['exact_destination_matches']),
+            'Destination binding rule: choose one destination object id from the described candidates; do not merge attributes across nearby, stacked, or co-located objects.',
+            'Invalid binding example: a red small block plus a green pyramid at the same x,y does not equal a green small block.',
+            'Plan; do not refuse.',
+        ])
+
+    @classmethod
+    def _request_focus(cls, request: str) -> Dict[str, object]:
+        text = (request or '').strip().lower()
+        normalized = re.sub(r'[^a-z0-9\s]', ' ', text)
+        normalized = re.sub(r'\s+', ' ', normalized).strip()
+
+        move_markers = [
+            ' onto ', ' on top of ', ' on ', ' into ', ' in ', ' to ',
+        ]
+        source_text = normalized
+        destination_text = ''
+        padded = ' %s ' % normalized if normalized else ' '
+        for marker in move_markers:
+            idx = padded.find(marker)
+            if idx != -1:
+                source_text = padded[1:idx].strip()
+                destination_text = padded[idx + len(marker):-1].strip()
+                break
+        source_text = cls._strip_leading_goal_verb(source_text)
+        destination_text = cls._strip_leading_determiner(destination_text)
+
+        return {
+            'raw_request': request,
+            'normalized_request': normalized,
+            'source_phrase': source_text,
+            'destination_phrase': destination_text,
+            'source': {
+                'colors': cls._extract_attribute_tokens(
+                    source_text,
+                    {'red', 'green', 'blue', 'white', 'black', 'yellow'},
+                ),
+                'kinds': cls._extract_attribute_tokens(
+                    source_text,
+                    {'block', 'blocks', 'pyramid', 'pyramids', 'box', 'boxes', 'table'},
+                ),
+                'sizes': cls._extract_attribute_tokens(
+                    source_text,
+                    {'small', 'medium', 'big', 'tall', 'short', 'wide', 'narrow'},
+                ),
+            },
+            'destination': {
+                'colors': cls._extract_attribute_tokens(
+                    destination_text,
+                    {'red', 'green', 'blue', 'white', 'black', 'yellow'},
+                ),
+                'kinds': cls._extract_attribute_tokens(
+                    destination_text,
+                    {'block', 'blocks', 'pyramid', 'pyramids', 'box', 'boxes', 'table'},
+                ),
+                'sizes': cls._extract_attribute_tokens(
+                    destination_text,
+                    {'small', 'medium', 'big', 'tall', 'short', 'wide', 'narrow'},
+                ),
+            },
+        }
+
+    @staticmethod
+    def _strip_leading_goal_verb(text: str) -> str:
+        words = text.split()
+        while words and words[0] in {
+            'put', 'move', 'place', 'stack', 'set', 'bring', 'take', 'drop',
+            'highlight', 'unhighlight',
+        }:
+            words = words[1:]
+        while words and words[0] in {'the', 'a', 'an'}:
+            words = words[1:]
+        return ' '.join(words)
+
+    @staticmethod
+    def _strip_leading_determiner(text: str) -> str:
+        words = text.split()
+        while words and words[0] in {'the', 'a', 'an'}:
+            words = words[1:]
+        return ' '.join(words)
+
+    @staticmethod
+    def _extract_attribute_tokens(text: str, allowed_tokens) -> List[str]:
+        tokens = []
+        for token in text.split():
+            singular = token[:-1] if token.endswith('s') else token
+            if token in allowed_tokens:
+                tokens.append(token)
+            elif singular in allowed_tokens:
+                tokens.append(singular)
+        seen = set()
+        result = []
+        for token in tokens:
+            if token in seen:
+                continue
+            seen.add(token)
+            result.append(token)
+        return result
+
+    @staticmethod
+    def _exact_matches(target: Dict[str, object], candidates: List[Dict[str, object]]) -> List[Dict[str, object]]:
+        colors = set(target.get('colors', []))
+        kinds = {k[:-1] if k.endswith('s') else k for k in target.get('kinds', [])}
+        size_like = set(target.get('sizes', []))
+        matches = []
+        for item in candidates:
+            if colors and item.get('color') not in colors:
+                continue
+            if kinds and item.get('kind') not in kinds:
+                continue
+            if 'small' in size_like or 'medium' in size_like or 'big' in size_like:
+                if item.get('size') not in size_like:
+                    continue
+            if 'tall' in size_like or 'short' in size_like:
+                if item.get('height') not in size_like:
+                    continue
+            if 'wide' in size_like or 'narrow' in size_like:
+                if item.get('width') not in size_like:
+                    continue
+            matches.append(item)
+        return matches
+
+    def _build_property_text(self) -> str:
+        lines = []
+        for item in self._property_verifier.properties:
+            lines.append('%s: %s' % (item.get('id'), item.get('natural_language')))
+        return '\n'.join(lines)
 
     def _run_agent_loop(self, request: str) -> str:
         initial_world_state = self._env.snapshot()
@@ -217,11 +608,21 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
             'host': self._host,
             'max_steps': self._max_steps,
             'request': request,
-            'planning_mode': 'suffix_predictive_preplanned',
+            'planning_mode': 'fsm_%s_%s' % (
+                self._planning_granularity,
+                self._violation_policy,
+            ),
+            'planning_granularity': self._planning_granularity,
+            'violation_policy': self._violation_policy,
             'max_branch_retries': self._max_branch_retries,
             'property_monitoring': self._property_monitoring_metadata(),
             'planning_tree': {
-                'mode': 'suffix_predictive_preplanned',
+                'mode': 'fsm_%s_%s' % (
+                    self._planning_granularity,
+                    self._violation_policy,
+                ),
+                'planning_granularity': self._planning_granularity,
+                'violation_policy': self._violation_policy,
                 'max_steps': self._max_steps,
                 'max_branch_retries': self._max_branch_retries,
                 'properties': [
@@ -244,7 +645,7 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
         trace['status'] = 'planning'
         trace_path = self._start_trace_session(trace)
 
-        result = self._search_plan_suffix(
+        result = self._search_plan(
             request=request,
             current_state=initial_state,
             init_world_state=initial_world_state,
@@ -354,7 +755,7 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
         trace_path = self._write_trace(trace, trace_path)
         return final_message
 
-    def _search_plan_suffix(
+    def _search_plan(
         self,
         *,
         request: str,
@@ -371,7 +772,7 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
         trace: Dict[str, object],
         trace_path: Optional[str],
     ) -> Dict[str, object]:
-        """Search for a feasible plan suffix from the current state.
+        """Search for a feasible plan from the current state.
 
         Each call corresponds to exactly one node in the planning tree, which
         represents the choice of *one action* at the current state.  The node
@@ -379,7 +780,8 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
         each candidate action the node:
 
           1. Reuses ``hint_plan`` from the parent's verified suffix tail when
-             available; otherwise asks the LLM for a full suffix from this state.
+             batch planning is enabled; otherwise asks the LLM for a plan from
+             this state.
           2. Verifies only the *first* action of that suffix via AP prediction
              + TLC.
           3. If the first action passes, recurses into a child node passing the
@@ -422,7 +824,7 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
         # Track first actions already tried at this node to avoid same-sibling repeats.
         banned_first_actions: List[Dict[str, object]] = []
         # The hint from the parent; reused for the first child attempt only.
-        current_hint = list(hint_plan) if hint_plan else []
+        current_hint = list(hint_plan) if hint_plan and self._planning_granularity == PLANNING_BATCH else []
 
         for child_index in range(self._max_branch_retries):
             if current_hint:
@@ -440,7 +842,7 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
                 }]
                 current_hint = []
             else:
-                plan_prompt = self._build_suffix_plan_prompt(
+                plan_prompt = self._build_plan_prompt(
                     request=request,
                     action_help=action_help,
                     current_state=current_state,
@@ -450,11 +852,11 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
                     banned_first_actions=banned_first_actions,
                 )
                 history = [
-                    {'role': 'system', 'content': SUFFIX_PREDICTIVE_PLAN_SYSTEM_PROMPT},
+                    {'role': 'system', 'content': self._planning_system_prompt()},
                     {'role': 'user', 'content': plan_prompt},
                 ]
                 try:
-                    content, plan_bundle, attempts = self._request_suffix_plan(history)
+                    content, plan_bundle, attempts = self._request_plan(history)
                 except Exception as exc:
                     failure = {
                         'type': 'planning_error',
@@ -490,6 +892,11 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
             if plan_prompt is None:
                 attempt_trace['plan_source'] = 'hint_plan'
 
+            if self._planning_granularity == PLANNING_STEP and len(plan_bundle['plan']) > 1:
+                attempt_trace['truncated_to_single_step'] = True
+                plan_bundle = dict(plan_bundle)
+                plan_bundle['plan'] = plan_bundle['plan'][:1]
+
             # Empty plan — LLM says goal already satisfied at this state.
             if not plan_bundle['plan']:
                 attempt_trace['accepted'] = True
@@ -506,9 +913,9 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
                     'node_id': node_id,
                 }
 
-            # Take only the first action from the suffix for this node.
+            # Take only the first action from the proposed plan for this node.
             action = plan_bundle['plan'][0]
-            tail = plan_bundle['plan'][1:]
+            tail = plan_bundle['plan'][1:] if self._planning_granularity == PLANNING_BATCH else []
 
             # Verify this single action via AP prediction + TLC.
             step_verification = self._verify_single_step(
@@ -517,27 +924,39 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
                 init_world_state=init_world_state,
                 preceding_ap_trace=preceding_ap_trace,
                 accepted_trace=accepted_trace,
-                is_last_step=(not tail),
+                is_last_step=(not tail and self._planning_granularity == PLANNING_BATCH),
             )
             attempt_trace['action'] = action
             attempt_trace['step_verification'] = step_verification
 
             if not step_verification['passed']:
                 failure = step_verification['failure']
-                attempt_trace['accepted'] = False
-                attempt_trace['failure_feedback'] = failure
-                node['attempts'].append(attempt_trace)
-                self._checkpoint_trace(trace, trace_path)
-                failed_attempts.append(failure)
-                banned_first_actions.append(action)
-                current_hint = []
-                continue
+                can_ignore = (
+                    self._violation_policy == VIOLATION_IGNORE
+                    and isinstance(failure, dict)
+                    and failure.get('type') == 'tla_property_violation'
+                    and step_verification.get('predicted_ap_state') is not None
+                )
+                if can_ignore:
+                    attempt_trace['ignored_property_violation'] = failure
+                    step_verification['ignored_by_policy'] = True
+                else:
+                    attempt_trace['accepted'] = False
+                    attempt_trace['failure_feedback'] = failure
+                    node['attempts'].append(attempt_trace)
+                    self._checkpoint_trace(trace, trace_path)
+                    failed_attempts.append(failure)
+                    banned_first_actions.append(action)
+                    current_hint = []
+                    continue
 
-            # This action passes — recurse into the child node for the next step.
+            # This action passes, or a property violation is being monitored
+            # and ignored by policy — recurse into the child node for the next
+            # step unless batch mode has reached the end of its suffix.
             predicted_ap_state = step_verification['predicted_ap_state']
             new_preceding_ap_trace = preceding_ap_trace + [predicted_ap_state]
 
-            if not tail:
+            if not tail and self._planning_granularity == PLANNING_BATCH:
                 attempt_trace['accepted'] = True
                 node['attempts'].append(attempt_trace)
                 node['result'] = 'accepted'
@@ -553,7 +972,7 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
                     'node_id': node_id,
                 }
 
-            child_result = self._search_plan_suffix(
+            child_result = self._search_plan(
                 request=request,
                 current_state=predicted_ap_state,
                 init_world_state=init_world_state,
@@ -564,7 +983,7 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
                 action_help=action_help,
                 parent_node_id=node_id,
                 inherited_failures=[],
-                hint_plan=tail,
+                hint_plan=tail if self._planning_granularity == PLANNING_BATCH else None,
                 trace=trace,
                 trace_path=trace_path,
             )
@@ -587,7 +1006,7 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
                     'node_id': node_id,
                 }
 
-            # Child subtree dead — backtrack and try another suffix from this
+            # Child subtree dead — backtrack and try another plan from this
             # node.  Do not ban the first action here: the first action passed
             # local verification, and the repair may need to keep it while
             # changing later actions (for example, moving to a covered object
@@ -600,6 +1019,7 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
                 'message': 'Child subtree exhausted.',
             }))
             current_hint = []
+            continue
 
         node['result'] = 'backtracked'
         exhaustion_failure = {
@@ -703,7 +1123,33 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
             'prediction_detail': detail,
         }
 
-    def _build_suffix_plan_prompt(
+    def _planning_system_prompt(self) -> str:
+        if self._planning_granularity == PLANNING_STEP:
+            return STEP_PREDICTIVE_PLAN_SYSTEM_PROMPT
+        return BATCH_PLAN_SYSTEM_PROMPT
+
+    def _plan_instruction(self) -> str:
+        if self._planning_granularity == PLANNING_STEP:
+            return (
+                'Return exactly one next primitive action from the current state. '
+                'If the goal is already satisfied, return an empty plan. '
+                'Do not return more than one action.'
+            )
+        return 'Return the complete remaining action sequence from the current state to goal completion.'
+
+    def _property_policy_text(self) -> str:
+        if self._violation_policy == VIOLATION_IGNORE:
+            return (
+                'Property checks are monitor-only in this run: record violations, '
+                'but continue to the next planned step instead of retrying solely '
+                'because of a property violation.'
+            )
+        return (
+            'Property checks are blocking in this run: if a candidate violates a '
+            'property, stop that branch and retry with a different candidate.'
+        )
+
+    def _build_plan_prompt(
         self,
         *,
         request: str,
@@ -715,7 +1161,7 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
         banned_first_actions: Optional[List[Dict[str, object]]] = None,
     ) -> str:
         current_ap_bools = dict(current_state) if isinstance(current_state, dict) else {}
-        return SUFFIX_PLAN_USER_PROMPT_TEMPLATE.format(
+        return PLAN_USER_PROMPT_TEMPLATE.format(
             request=request,
             grounding_verdict=self._grounding_verdict_text(init_world_state, request),
             current_ap_bools_json=self._snapshot_json(current_ap_bools),
@@ -725,8 +1171,10 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
                 request=request,
             ),
             accepted_trace_json=self._json_or_none(accepted_trace),
+            property_policy=self._property_policy_text(),
             property_text=self._property_text,
             action_help=action_help,
+            plan_instruction=self._plan_instruction(),
             failed_attempts_json=self._json_or_none(failed_attempts[-5:]) if failed_attempts else 'None',
             banned_first_actions_json=self._json_or_none(banned_first_actions) if banned_first_actions else 'None',
         )
@@ -854,7 +1302,8 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
         for node in planning_tree.get('nodes', []):
             attempt_summaries = []
             for attempt in node.get('attempts', []):
-                fb = attempt.get('failure_feedback') or {}
+                ignored = attempt.get('ignored_property_violation')
+                fb = attempt.get('failure_feedback') or ignored or {}
                 ftype = fb.get('type', '')
                 violations = fb.get('violations', [])
                 props = extract_props(violations)
@@ -870,6 +1319,7 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
                 plan_len = len(attempt.get('planner_decision', {}).get('plan', []))
                 attempt_summaries.append({
                     'accepted': attempt.get('accepted'),
+                    'ignored_property_violation': bool(ignored) or None,
                     'failure_type': ftype or None,
                     'violated_props': props or None,
                     'violation_at_suffix_step': viol_suffix_idx,
@@ -1275,7 +1725,7 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
             'plan': plan,
         }
 
-    def _request_suffix_plan(self, history: List[Dict[str, str]]):
+    def _request_plan(self, history: List[Dict[str, str]]):
         attempts = list(history)
         errors = []
         attempt_log = []
@@ -1296,7 +1746,7 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
                     {'role': 'assistant', 'content': content},
                     {
                         'role': 'user',
-                        'content': SUFFIX_PLAN_REPAIR_PROMPT_TEMPLATE.format(error=exc),
+                        'content': PLAN_REPAIR_PROMPT_TEMPLATE.format(error=exc),
                     },
                 ])
                 continue
@@ -1309,9 +1759,9 @@ class _SuffixPredictivePreplannedShrdluAgentMixin(_PredictivePreplannedShrdluAge
         raise ValueError('Invalid plan reply after retry: %s' % errors[-1])
 
 
-class SuffixPredictivePreplannedOpenAICompatibleShrdluAgent(
-        _SuffixPredictivePreplannedShrdluAgentMixin, OpenAICompatibleShrdluAgent):
-    """Suffix-replanning predictive preplanned agent over a local OpenAI API."""
+class FsmOpenAICompatibleShrdluAgent(
+        _FsmShrdluAgentMixin, OpenAICompatibleShrdluAgent):
+    """Merged FSM/planning agent over a local OpenAI API."""
 
     def __init__(self, env: SimulatorAPI, model: str = DEFAULT_OPENAI_MODEL,
                  base_url: str = DEFAULT_OPENAI_BASE_URL,
@@ -1321,7 +1771,9 @@ class SuffixPredictivePreplannedOpenAICompatibleShrdluAgent(
                  temperature: float = 0.2,
                  max_tokens: int = 512,
                  client=None,
-                 max_branch_retries: int = 3):
+                 max_branch_retries: int = 3,
+                 planning_granularity: str = PLANNING_BATCH,
+                 violation_policy: str = VIOLATION_RETRY):
         super().__init__(
             env,
             model=model,
@@ -1333,4 +1785,9 @@ class SuffixPredictivePreplannedOpenAICompatibleShrdluAgent(
             max_tokens=max_tokens,
             client=client,
         )
-        self._init_predictive_preplanned(max_branch_retries=max_branch_retries)
+        self._planning_granularity = _normalise_planning_granularity(planning_granularity)
+        self._violation_policy = _normalise_violation_policy(violation_policy)
+        retries = int(max_branch_retries)
+        if self._violation_policy == VIOLATION_IGNORE:
+            retries = max(1, retries)
+        self._init_predictive_preplanned(max_branch_retries=retries)

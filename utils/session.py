@@ -1,13 +1,13 @@
 """Shared session/trace serialisation for all llm-agents-fsm agents.
 
-Every agent (git-agent, git-agent-plan, git-agent-fsm, shrdlu-*) writes
+Every agent (git-agent, git-agent-fsm, shrdlu-*) writes
 sessions in the same JSON schema so they can be analysed uniformly.
 
 Schema (version "1.0"):
 {
   "schema_version": "1.0",
   "timestamp_utc":  "2026-06-26T...",
-  "agent":          "git-agent-fsm | git-agent | git-agent-plan | shrdlu-reactive | ...",
+  "agent":          "git-agent-fsm | git-agent | shrdlu-agent-fsm | shrdlu-reactive | ...",
   "model":          "gpt-4o-mini",
   "domain":         "git | shrdlu",
   "work_dir":       "/path/to/cwd",          # git agents only

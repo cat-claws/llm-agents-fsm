@@ -8,10 +8,8 @@ __all__ = [
     'DEFAULT_OPENAI_BASE_URL',
     'DEFAULT_OPENAI_MODEL',
     'DEFAULT_TRACE_DIR',
+    'FsmOpenAICompatibleShrdluAgent',
     'OpenAICompatibleShrdluAgent',
-    'PredictivePreplannedOpenAICompatibleShrdluAgent',
-    'PreplannedOpenAICompatibleShrdluAgent',
-    'SuffixPredictivePreplannedOpenAICompatibleShrdluAgent',
 ]
 
 _EXPORT_MODULES = {
@@ -20,10 +18,8 @@ _EXPORT_MODULES = {
     'DEFAULT_OPENAI_BASE_URL': 'shrdlu_agents.shrdlu_agent_basic',
     'DEFAULT_OPENAI_MODEL': 'shrdlu_agents.shrdlu_agent_basic',
     'DEFAULT_TRACE_DIR': 'shrdlu_agents.shrdlu_agent_basic',
+    'FsmOpenAICompatibleShrdluAgent': 'shrdlu_agents.shrdlu_agent_fsm',
     'OpenAICompatibleShrdluAgent': 'shrdlu_agents.shrdlu_agent_basic',
-    'PreplannedOpenAICompatibleShrdluAgent': 'shrdlu_agents.shrdlu_agent_basic',
-    'PredictivePreplannedOpenAICompatibleShrdluAgent': 'shrdlu_agents.shrdlu_agent_plan',
-    'SuffixPredictivePreplannedOpenAICompatibleShrdluAgent': 'shrdlu_agents.shrdlu_agent_fsm',
 }
 
 
