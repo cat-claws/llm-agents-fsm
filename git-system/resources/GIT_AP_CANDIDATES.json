@@ -6,7 +6,7 @@
       "Transition APs have names prefixed with '(transition)' and are set by matching the action_label of each step.",
       "Use natural-language names that are unambiguous given the git workflow context.",
       "Do not invent APs not grounded in observable git state or explicit action types.",
-      "Each AP name is used verbatim in property ASTs — changes here require updating GIT_PROPERTIES_AST.json."
+      "Each AP name is used verbatim in property ASTs \u2014 changes here require updating GIT_PROPERTIES_AST.json."
     ],
     "source_context": [
       "git-agent-fsm.py phase 3 (observation)",
@@ -177,67 +177,59 @@
   ],
   "transition_aps": [
     {
-      "name": "(transition) A destructive history-rewrite action is executed.",
+      "name": "(transition) A destructive history-rewrite action is just performed.",
       "description": "The action taken is a git operation that rewrites or removes existing commit history (e.g. reset --hard, rebase -i with drop, filter-branch)."
     },
     {
-      "name": "(transition) A direct commit action on the current branch (as modeled in this workflow).",
+      "name": "(transition) A direct commit action on the current branch is just performed.",
       "description": "A 'git commit' is executed directly on the currently checked-out branch."
     },
     {
-      "name": "(transition) A force-push action is executed.",
+      "name": "(transition) A force-push action is just performed.",
       "description": "A 'git push --force' or 'git push --force-with-lease' is executed (distinct from the bare label variant)."
     },
     {
-      "name": "(transition) A force-push action.",
-      "description": "The action label indicates a force-push step in the planned workflow trace."
-    },
-    {
-      "name": "(transition) A merge action.",
+      "name": "(transition) A merge action is just performed.",
       "description": "A 'git merge' is executed to combine two branch histories."
     },
     {
-      "name": "(transition) A mutating git action is dequeued for execution.",
+      "name": "(transition) A mutating git action is just performed.",
       "description": "A pending mutating operation (write/modify) is dequeued from the workflow operation queue."
     },
     {
-      "name": "(transition) A normal push action to the remote repository is executed.",
+      "name": "(transition) A normal push action to the remote repository is just performed.",
       "description": "A 'git push' without force flags is executed (distinct from the bare label variant)."
     },
     {
-      "name": "(transition) A normal push action to the remote repository.",
-      "description": "The action label indicates a normal (non-force) push step in the planned workflow trace."
-    },
-    {
-      "name": "(transition) A public-history rewrite operation is executed.",
+      "name": "(transition) A public-history rewrite operation is just performed.",
       "description": "A rewrite of already-published (remote) commit history is executed, e.g. amending a pushed commit."
     },
     {
-      "name": "(transition) A rebase action fails due to branch divergence.",
+      "name": "(transition) A rebase action that fails due to branch divergence is just performed.",
       "description": "A 'git rebase' invocation exits with a conflict or rejection error caused by branch divergence."
     },
     {
-      "name": "(transition) A rebase action is requested/started.",
+      "name": "(transition) A rebase action is just performed.",
       "description": "A 'git rebase' command is initiated (may or may not complete successfully)."
     },
     {
-      "name": "(transition) A rebase action is successfully completed to resolve divergence.",
+      "name": "(transition) A rebase action that successfully resolves divergence is just performed.",
       "description": "A 'git rebase' completes without conflict and resolves the divergence between local and remote."
     },
     {
-      "name": "(transition) A rebase action that rewrites commits already published to a remote repository.",
+      "name": "(transition) A rebase action that rewrites published commits is just performed.",
       "description": "The rebase replays commits that were previously pushed; this constitutes a public history rewrite."
     },
     {
-      "name": "(transition) A rebase operation fails and leaves divergence unresolved.",
+      "name": "(transition) A rebase operation that fails and leaves divergence unresolved is just performed.",
       "description": "A rebase exits in a failed state (conflict, abort) and the branch remains diverged."
     },
     {
-      "name": "(transition) An immediate force-push action is executed to publish the rewritten history.",
+      "name": "(transition) An immediate force-push action to publish rewritten history is just performed.",
       "description": "After a rebase or reset, a force-push is executed immediately as the mandatory follow-up to publish the rewritten history."
     },
     {
-      "name": "(transition) Any push action to the remote repository is executed.",
+      "name": "(transition) Any push action to the remote repository is just performed.",
       "description": "Any push action (force or normal) to the remote is executed in this step."
     }
   ]
