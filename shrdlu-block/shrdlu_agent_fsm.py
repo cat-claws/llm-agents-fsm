@@ -33,7 +33,7 @@ from shrdlu_agents.shrdlu_agent_basic import (
     DEFAULT_OPENAI_API_KEY,
     DEFAULT_OPENAI_BASE_URL,
     DEFAULT_OPENAI_MODEL,
-    DEFAULT_TRACE_DIR,
+    DEFAULT_RESULT_DIR,
     OpenAICompatibleShrdluAgent,
     PLAN_SCHEMA,
 )
@@ -668,7 +668,7 @@ class _FsmShrdluAgentMixin:
             action_help=action_help,
         )
         trace['status'] = 'planning'
-        trace_path = self._start_trace_session(trace)
+        result_path = self._start_result_session(trace)
 
         result = self._search_plan(
             request=request,
@@ -683,7 +683,7 @@ class _FsmShrdluAgentMixin:
             inherited_failures=[],
             hint_plan=None,
             trace=trace,
-            trace_path=trace_path,
+            result_path=result_path,
         )
 
         trace['planning_tree']['feasible'] = bool(result.get('success'))
@@ -707,8 +707,8 @@ class _FsmShrdluAgentMixin:
             trace['status'] = 'infeasible'
             trace['final_message'] = final_message
             trace['planning_tree']['tree_summary'] = self._build_tree_summary(trace['planning_tree'])
-            trace_path = self._write_trace(trace, trace_path)
-            return self._append_trace_notice(final_message, trace_path)
+            result_path = self._write_result(trace, result_path)
+            return self._append_result_notice(final_message, result_path)
 
         plan = result['plan']
         response_text = self._normalize_response_text(
@@ -724,7 +724,7 @@ class _FsmShrdluAgentMixin:
             trace['status'] = 'finished'
             trace['final_message'] = finish_response
             trace['planning_tree']['tree_summary'] = self._build_tree_summary(trace['planning_tree'])
-            trace_path = self._write_trace(trace, trace_path)
+            result_path = self._write_result(trace, result_path)
             return finish_response if response_text == finish_response else self._format_reply(
                 response_text,
                 finish_response,
@@ -738,7 +738,7 @@ class _FsmShrdluAgentMixin:
             for node in trace['planning_tree']['nodes']
             if node.get('result') in ('accepted', 'finish')
         }
-        self._checkpoint_trace(trace, trace_path)
+        self._checkpoint_result(trace, result_path)
         for step_index, action in enumerate(plan):
             try:
                 result_text = self._env.execute_action(action)
@@ -759,7 +759,7 @@ class _FsmShrdluAgentMixin:
                     tla_verification=tla_result,
                     observation_after=self._env.snapshot_text(),
                 )
-            self._checkpoint_trace(trace, trace_path)
+            self._checkpoint_result(trace, result_path)
             if isinstance(result_text, str) and result_text.startswith('ERROR:'):
                 final_message = self._format_reply(
                     response_text + "\n\nPlan execution failed.",
@@ -768,8 +768,8 @@ class _FsmShrdluAgentMixin:
                 trace['status'] = 'error'
                 trace['final_message'] = final_message
                 trace['planning_tree']['tree_summary'] = self._build_tree_summary(trace['planning_tree'])
-                trace_path = self._write_trace(trace, trace_path)
-                return self._append_trace_notice(final_message, trace_path)
+                result_path = self._write_result(trace, result_path)
+                return self._append_result_notice(final_message, result_path)
 
         # Post-execution grasper cleanup: if the grasper is not already raised and
         # open, bring it to a clean state. The LLM is not asked to plan this — we
@@ -782,7 +782,7 @@ class _FsmShrdluAgentMixin:
         trace['status'] = 'finished'
         trace['final_message'] = final_message
         trace['planning_tree']['tree_summary'] = self._build_tree_summary(trace['planning_tree'])
-        trace_path = self._write_trace(trace, trace_path)
+        result_path = self._write_result(trace, result_path)
         return final_message
 
     def _search_plan(
@@ -800,7 +800,7 @@ class _FsmShrdluAgentMixin:
         inherited_failures: List[Dict[str, object]],
         hint_plan: Optional[List[Dict[str, object]]],
         trace: Dict[str, object],
-        trace_path: Optional[str],
+        result_path: Optional[str],
     ) -> Dict[str, object]:
         """Search for a feasible plan from the current state.
 
@@ -845,7 +845,7 @@ class _FsmShrdluAgentMixin:
             state_path=self._zip_accepted_steps(accepted_trace, preceding_ap_trace),
         )
         planning_tree['nodes'].append(node)
-        self._checkpoint_trace(trace, trace_path)
+        self._checkpoint_result(trace, result_path)
 
         failed_attempts = list(inherited_failures)
         # Track first actions already tried at this node to avoid same-sibling repeats.
@@ -896,7 +896,7 @@ class _FsmShrdluAgentMixin:
                         'planner_prompt': plan_prompt,
                         'error': str(exc),
                     })
-                    self._checkpoint_trace(trace, trace_path)
+                    self._checkpoint_result(trace, result_path)
                     failed_attempts.append(failure)
                     current_hint = []
                     continue
@@ -930,7 +930,7 @@ class _FsmShrdluAgentMixin:
                 attempt_trace['finish'] = True
                 node['attempts'].append(attempt_trace)
                 set_node_outcome(node, result='finish', finish_response=finish_response)
-                self._checkpoint_trace(trace, trace_path)
+                self._checkpoint_result(trace, result_path)
                 return {
                     'success': True,
                     'plan': [],
@@ -970,7 +970,7 @@ class _FsmShrdluAgentMixin:
                     attempt_trace['accepted'] = False
                     attempt_trace['failure_feedback'] = failure
                     node['attempts'].append(attempt_trace)
-                    self._checkpoint_trace(trace, trace_path)
+                    self._checkpoint_result(trace, result_path)
                     failed_attempts.append(failure)
                     banned_first_actions.append(action)
                     current_hint = []
@@ -1001,7 +1001,7 @@ class _FsmShrdluAgentMixin:
                     verification=verif,
                     finish_response=finish_response,
                 )
-                self._checkpoint_trace(trace, trace_path)
+                self._checkpoint_result(trace, result_path)
                 return {
                     'success': True,
                     'plan': [action],
@@ -1023,13 +1023,13 @@ class _FsmShrdluAgentMixin:
                 inherited_failures=[],
                 hint_plan=tail if self._planning_granularity == PLANNING_BATCH else None,
                 trace=trace,
-                trace_path=trace_path,
+                result_path=result_path,
             )
             attempt_trace['child_node_id'] = child_result.get('node_id')
             if child_result.get('node_id') is not None:
                 add_child(node, child_result['node_id'])
             node['attempts'].append(attempt_trace)
-            self._checkpoint_trace(trace, trace_path)
+            self._checkpoint_result(trace, result_path)
 
             if child_result.get('success'):
                 attempt_trace['accepted'] = True
@@ -1079,7 +1079,7 @@ class _FsmShrdluAgentMixin:
             'message': 'All %d action attempts at this node were exhausted.' % self._max_branch_retries,
         }
         set_node_outcome(node, result='backtracked', failure=exhaustion_failure)
-        self._checkpoint_trace(trace, trace_path)
+        self._checkpoint_result(trace, result_path)
         return {
             'success': False,
             'failure': exhaustion_failure,
@@ -1816,19 +1816,21 @@ class FsmOpenAICompatibleShrdluAgent(
                  base_url: str = DEFAULT_OPENAI_BASE_URL,
                  api_key: str = DEFAULT_OPENAI_API_KEY,
                  max_steps: int = DEFAULT_MAX_STEPS,
-                 trace_dir: Optional[str] = DEFAULT_TRACE_DIR,
+                 trace_dir: Optional[str] = None,
                  temperature: float = 0.2,
                  max_tokens: int = 512,
                  client=None,
                  max_branch_retries: int = 3,
                  planning_granularity: str = PLANNING_BATCH,
-                 violation_policy: str = VIOLATION_RETRY):
+                 violation_policy: str = VIOLATION_RETRY,
+                 result_dir: Optional[str] = DEFAULT_RESULT_DIR):
         super().__init__(
             env,
             model=model,
             base_url=base_url,
             api_key=api_key,
             max_steps=max_steps,
+            result_dir=result_dir,
             trace_dir=trace_dir,
             temperature=temperature,
             max_tokens=max_tokens,

@@ -75,8 +75,8 @@ run-agents git-basic
 run-agents git-fsm
 
 # Run these with SHRDLU_SIMULATOR_URL pointing at a running simulator.
-run-agents shrdlu-reactive -- --trace-dir "$PWD/agent_traces"
-run-agents shrdlu-fsm -- --trace-dir "$PWD/agent_traces"
+run-agents shrdlu-reactive -- --result-dir "$PWD/results"
+run-agents shrdlu-fsm -- --result-dir "$PWD/results"
 ```
 
 The same four targets are available through option form:
@@ -84,8 +84,8 @@ The same four targets are available through option form:
 ```bash
 run-agents --domain git --agent basic
 run-agents --domain git --agent fsm
-run-agents --domain shrdlu --agent reactive -- --trace-dir "$PWD/agent_traces"
-run-agents --domain shrdlu --agent fsm -- --trace-dir "$PWD/agent_traces"
+run-agents --domain shrdlu --agent reactive -- --result-dir "$PWD/results"
+run-agents --domain shrdlu --agent fsm -- --result-dir "$PWD/results"
 ```
 
 Use `run-agents --list` to print the supported targets. Arguments after `--`
@@ -148,8 +148,8 @@ export SHRDLU_OPENAI_BASE_URL=http://127.0.0.1:30000/v1
 export SHRDLU_OPENAI_API_KEY=EMPTY
 export SHRDLU_OPENAI_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507
 
-run-agents shrdlu-reactive -- --trace-dir "$PWD/agent_traces"
-run-agents shrdlu-fsm -- --trace-dir "$PWD/agent_traces"
+run-agents shrdlu-reactive -- --result-dir "$PWD/results"
+run-agents shrdlu-fsm -- --result-dir "$PWD/results"
 ```
 
 The merged FSM exposes the old plan/FSM distinction as parameters:
@@ -195,10 +195,10 @@ export SHRDLU_AGENT_MAX_STEPS=50
 export SHRDLU_AGENT_MAX_BRANCH_RETRIES=3
 export SHRDLU_AGENT_FSM_PLANNING_GRANULARITY=batch
 export SHRDLU_AGENT_FSM_VIOLATION_POLICY=retry
-export SHRDLU_AGENT_TRACE_DIR=/path/to/agent_traces
+export SHRDLU_AGENT_RESULT_DIR=/path/to/results
 ```
 
-Set `SHRDLU_AGENT_TRACE_DIR=` to disable trace writing.
+Set `SHRDLU_AGENT_RESULT_DIR=` to disable result writing.
 
 ## Source Layout
 

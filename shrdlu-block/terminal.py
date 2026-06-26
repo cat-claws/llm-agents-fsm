@@ -8,7 +8,7 @@ from pathlib import Path
 __all__ = [
     'run_agent_against_simulator',
     'run_agent_terminal',
-    'print_trace_conditions',
+    'print_result_conditions',
 ]
 
 
@@ -66,29 +66,37 @@ def run_agent_terminal(agent, env, prompt: str = 'goal> ') -> None:
         result = agent.handle_user_input(request)
         print('')
         print(result)
-        trace_path = getattr(agent, 'last_trace_path', None)
-        if trace_path:
+        result_path = (
+            getattr(agent, 'last_result_path', None)
+            or getattr(agent, 'last_trace_path', None)
+        )
+        if result_path:
             print('')
-            print_trace_conditions(trace_path)
+            print_result_conditions(result_path)
         print('')
 
 
-def print_trace_conditions(trace_path: str, max_nodes: int = 12) -> None:
-    """Print a compact summary of the latest trace's planning conditions."""
-    path = Path(trace_path)
+def print_result_conditions(result_path: str, max_nodes: int = 12) -> None:
+    """Print a compact summary of the latest saved result's planning tree."""
+    path = Path(result_path)
     try:
-        trace = json.loads(path.read_text(encoding='utf-8'))
+        record = json.loads(path.read_text(encoding='utf-8'))
     except Exception as exc:
-        print('Trace summary unavailable: %s' % exc)
+        print('Result summary unavailable: %s' % exc)
         return
 
-    print('Trace: %s' % path)
-    print('Status: %s' % trace.get('status', 'unknown'))
-    planning_tree = trace.get('planning_tree')
+    print('Result: %s' % path)
+    print('Status: %s' % record.get('status', 'unknown'))
+    planning_tree = record.get('planning_tree')
     if isinstance(planning_tree, dict):
         _print_planning_tree(planning_tree, max_nodes=max_nodes)
         return
-    _print_step_verification(trace)
+    _print_step_verification(record)
+
+
+def print_trace_conditions(trace_path: str, max_nodes: int = 12) -> None:
+    """Backward-compatible alias for older callers."""
+    print_result_conditions(trace_path, max_nodes=max_nodes)
 
 
 def _print_planning_tree(tree, max_nodes: int) -> None:
@@ -140,8 +148,8 @@ def _print_attempt(attempt) -> None:
         print('      feedback=%s' % _short_json(feedback))
 
 
-def _print_step_verification(trace) -> None:
-    steps = trace.get('steps') or []
+def _print_step_verification(record) -> None:
+    steps = record.get('steps') or []
     print('Executed steps: %d' % len(steps))
     for step in steps:
         action = step.get('executed_action') or step.get('planned_action')

@@ -25,7 +25,9 @@ __all__ = [
 ]
 
 DEFAULT_MAX_STEPS = 50
-DEFAULT_TRACE_DIR = str(Path(__file__).resolve().parents[2] / 'shrdlu-block-agents-playground' / 'agent_traces')
+DEFAULT_RESULT_DIR = str(Path(__file__).resolve().parents[2] / 'playground-llm-agents-fsm' / 'results')
+# Backward-compatible alias for older callers; new CLI/docs use result_dir.
+DEFAULT_TRACE_DIR = DEFAULT_RESULT_DIR
 DEFAULT_OPENAI_BASE_URL = 'http://127.0.0.1:30000/v1/'
 DEFAULT_OPENAI_API_KEY = 'EMPTY'
 DEFAULT_OPENAI_MODEL = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
@@ -108,22 +110,30 @@ class _ShrdluAgentBase:
 
     def __init__(self, env: SimulatorAPI, model: str, host: str,
                  max_steps: int = DEFAULT_MAX_STEPS,
-                 trace_dir: Optional[str] = DEFAULT_TRACE_DIR):
+                 result_dir: Optional[str] = DEFAULT_RESULT_DIR,
+                 trace_dir: Optional[str] = None):
+        if trace_dir is not None:
+            result_dir = trace_dir
         self._env = env
         self._model = model
         self._host = host.rstrip('/')
         self._max_steps = max_steps
-        self._trace_dir = Path(trace_dir) if trace_dir else None
+        self._result_dir = Path(result_dir) if result_dir else None
         self._property_verifier = TransitionPropertyVerifier.from_file()
-        self._last_trace_path: Optional[str] = None
+        self._last_result_path: Optional[str] = None
 
     @property
     def env(self) -> SimulatorAPI:
         return self._env
 
     @property
+    def last_result_path(self) -> Optional[str]:
+        return self._last_result_path
+
+    @property
     def last_trace_path(self) -> Optional[str]:
-        return self._last_trace_path
+        """Backward-compatible alias for older terminal helpers."""
+        return self._last_result_path
 
     def handle_user_input(self, text: str) -> str:
         """Handle a natural-language request against the live environment."""
@@ -173,10 +183,10 @@ class _ShrdluAgentBase:
                 })
                 trace['status'] = 'error'
                 trace['final_message'] = "Agent error: %s" % exc
-                trace_path = self._write_trace(trace)
-                return self._append_trace_notice(
+                result_path = self._write_result(trace)
+                return self._append_result_notice(
                     "Agent error: %s" % exc,
-                    trace_path,
+                    result_path,
                 )
             history.append({'role': 'assistant', 'content': content})
             action = decision.get('action', {})
@@ -194,7 +204,7 @@ class _ShrdluAgentBase:
                 trace['steps'].append(step_trace)
                 trace['status'] = 'finished'
                 trace['final_message'] = response_text
-                self._write_trace(trace)
+                self._write_result(trace)
                 return self._format_reply(response_text, None)
 
             pre_state = self._env.snapshot()
@@ -229,12 +239,12 @@ class _ShrdluAgentBase:
                 )
                 trace['status'] = 'max_steps'
                 trace['final_message'] = final_message
-                trace_path = self._write_trace(trace)
-                return self._append_trace_notice(final_message, trace_path)
+                result_path = self._write_result(trace)
+                return self._append_result_notice(final_message, result_path)
         trace['status'] = 'stopped'
         trace['final_message'] = 'Agent stopped without producing a result.'
-        trace_path = self._write_trace(trace)
-        return self._append_trace_notice('Agent stopped without producing a result.', trace_path)
+        result_path = self._write_result(trace)
+        return self._append_result_notice('Agent stopped without producing a result.', result_path)
 
     @staticmethod
     def _build_user_prompt(request: str, action_help: str, observation: str,
@@ -388,41 +398,55 @@ class _ShrdluAgentBase:
                     return value
         return {}
 
-    def _start_trace_session(self, trace: Dict[str, object]) -> Optional[str]:
-        if self._trace_dir is None:
+    def _start_result_session(self, record: Dict[str, object]) -> Optional[str]:
+        if self._result_dir is None:
             return None
-        self._trace_dir.mkdir(parents=True, exist_ok=True)
+        self._result_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
-        trace_path = self._trace_dir / ('trace_%s.json' % timestamp)
-        trace['_live'] = True
-        trace_path.write_text(json.dumps(trace, indent=2), encoding='utf-8')
-        self._last_trace_path = str(trace_path)
-        return self._last_trace_path
+        result_path = self._result_dir / ('result_%s.json' % timestamp)
+        record['_live'] = True
+        result_path.write_text(json.dumps(record, indent=2), encoding='utf-8')
+        self._last_result_path = str(result_path)
+        return self._last_result_path
+
+    def _checkpoint_result(self, record: Dict[str, object], result_path: Optional[str]) -> Optional[str]:
+        if not result_path:
+            return result_path
+        record['_live'] = True
+        Path(result_path).write_text(json.dumps(record, indent=2), encoding='utf-8')
+        return result_path
+
+    def _write_result(self, record: Dict[str, object], result_path: Optional[str] = None) -> Optional[str]:
+        if self._result_dir is None and not result_path:
+            return None
+        if result_path is None:
+            result_path = self._start_result_session(record)
+        if not result_path:
+            return None
+        record.pop('_live', None)
+        Path(result_path).write_text(json.dumps(record, indent=2), encoding='utf-8')
+        self._last_result_path = str(result_path)
+        return self._last_result_path
+
+    @staticmethod
+    def _append_result_notice(message: str, result_path: Optional[str]) -> str:
+        if not result_path:
+            return message
+        return message + "\n\nResult saved to %s" % result_path
+
+    # Backward-compatible aliases for older FSM code/callers.
+    def _start_trace_session(self, trace: Dict[str, object]) -> Optional[str]:
+        return self._start_result_session(trace)
 
     def _checkpoint_trace(self, trace: Dict[str, object], trace_path: Optional[str]) -> Optional[str]:
-        if not trace_path:
-            return trace_path
-        trace['_live'] = True
-        Path(trace_path).write_text(json.dumps(trace, indent=2), encoding='utf-8')
-        return trace_path
+        return self._checkpoint_result(trace, trace_path)
 
     def _write_trace(self, trace: Dict[str, object], trace_path: Optional[str] = None) -> Optional[str]:
-        if self._trace_dir is None and not trace_path:
-            return None
-        if trace_path is None:
-            trace_path = self._start_trace_session(trace)
-        if not trace_path:
-            return None
-        trace.pop('_live', None)
-        Path(trace_path).write_text(json.dumps(trace, indent=2), encoding='utf-8')
-        self._last_trace_path = str(trace_path)
-        return self._last_trace_path
+        return self._write_result(trace, trace_path)
 
     @staticmethod
     def _append_trace_notice(message: str, trace_path: Optional[str]) -> str:
-        if not trace_path:
-            return message
-        return message + "\n\nTrace saved to %s" % trace_path
+        return _ShrdluAgentBase._append_result_notice(message, trace_path)
 
     def _property_monitoring_metadata(self) -> Dict[str, object]:
         return {
@@ -479,17 +503,19 @@ class OpenAICompatibleShrdluAgent(_ShrdluAgentBase):
                  base_url: str = DEFAULT_OPENAI_BASE_URL,
                  api_key: str = DEFAULT_OPENAI_API_KEY,
                  max_steps: int = DEFAULT_MAX_STEPS,
-                 trace_dir: Optional[str] = DEFAULT_TRACE_DIR,
+                 trace_dir: Optional[str] = None,
                  temperature: float = 0.2,
                  max_tokens: int = 512,
                  enable_thinking: bool = True,
                  separate_reasoning: bool = True,
-                 client=None):
+                 client=None,
+                 result_dir: Optional[str] = DEFAULT_RESULT_DIR):
         super().__init__(
             env,
             model=model,
             host=base_url,
             max_steps=max_steps,
+            result_dir=result_dir,
             trace_dir=trace_dir,
         )
         if client is None:

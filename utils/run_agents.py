@@ -55,8 +55,8 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog="""examples:
   run-agents git-basic
   run-agents git-fsm
-  run-agents shrdlu-reactive -- --trace-dir "$PWD/agent_traces"
-  run-agents shrdlu-fsm -- --trace-dir "$PWD/agent_traces"
+  run-agents shrdlu-reactive -- --result-dir "$PWD/results"
+  run-agents shrdlu-fsm -- --result-dir "$PWD/results"
 
 Equivalent option form:
   run-agents --domain shrdlu --agent fsm -- --max-steps 20
@@ -156,7 +156,7 @@ def _build_shrdlu_parser() -> argparse.ArgumentParser:
         DEFAULT_OPENAI_API_KEY,
         DEFAULT_OPENAI_BASE_URL,
         DEFAULT_OPENAI_MODEL,
-        DEFAULT_TRACE_DIR,
+        DEFAULT_RESULT_DIR,
     )
     from shrdlu_agents.simulator_api import DEFAULT_SIMULATOR_URL
 
@@ -232,9 +232,20 @@ def _build_shrdlu_parser() -> argparse.ArgumentParser:
         help='FSM property behavior: retry blocks/replans on violations; ignore records and continues',
     )
     parser.add_argument(
+        '--result-dir',
+        dest='result_dir',
+        default=(
+            os.environ.get('SHRDLU_AGENT_RESULT_DIR')
+            or os.environ.get('SHRDLU_AGENT_TRACE_DIR')
+            or DEFAULT_RESULT_DIR
+        ),
+        help='directory for saved agent result records; use an empty string to disable',
+    )
+    parser.add_argument(
         '--trace-dir',
-        default=os.environ.get('SHRDLU_AGENT_TRACE_DIR', DEFAULT_TRACE_DIR),
-        help='directory for saved agent traces; use an empty string to disable',
+        dest='result_dir',
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     return parser
 
@@ -249,8 +260,8 @@ def _parse_shrdlu_args(argv: Sequence[str] | None) -> argparse.Namespace:
             '--agent must be one of fsm, preplanned, predictive, reactive, suffix; got %r'
             % args.agent_alias
         )
-    if args.trace_dir == '':
-        args.trace_dir = None
+    if args.result_dir == '':
+        args.result_dir = None
     return args
 
 
@@ -271,7 +282,7 @@ def _build_shrdlu_agent(args: argparse.Namespace):
         'base_url': args.base_url,
         'api_key': args.api_key,
         'max_steps': args.max_steps,
-        'trace_dir': args.trace_dir,
+        'result_dir': args.result_dir,
         'temperature': args.temperature,
         'max_tokens': args.max_tokens,
     }

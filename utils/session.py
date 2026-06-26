@@ -1,7 +1,10 @@
-"""Shared session/trace serialisation for all llm-agents-fsm agents.
+"""Shared session serialisation for all llm-agents-fsm agents.
 
 Every agent (git-agent, git-agent-fsm, shrdlu-*) writes
-sessions in the same JSON schema so they can be analysed uniformly.
+sessions in the same JSON schema so their planning trees can be analysed
+uniformly.  The session is the durable run record; `planning_tree` is the main
+planning artifact inside it, even when the tree is just a single root-to-leaf
+chain.
 
 Schema (version "1.0"):
 {
@@ -113,7 +116,7 @@ def save_session(
     *,
     filename_prefix: str = "session",
 ) -> Path:
-    """Write session to a timestamped JSON file and return the path."""
+    """Write a session record to a timestamped JSON file and return the path."""
     sessions_dir.mkdir(parents=True, exist_ok=True)
     ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     path = sessions_dir / f"{filename_prefix}_{ts}.json"

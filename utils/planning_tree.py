@@ -1,7 +1,10 @@
 """Shared planning-tree data model for all llm-agents-fsm agents.
 
-Every agent (git-agent-fsm, shrdlu-agent-fsm, …) builds the same tree so
-sessions can be analysed and compared uniformly.
+Every agent (git-agent-fsm, shrdlu-agent-fsm, …) builds the same information-rich
+planning tree so sessions can be analysed and compared uniformly.  Branching,
+retries, rejected attempts, verification results, selected actions, and execution
+outcomes all belong on the tree.  A run that never branches is still represented
+as a one-root, one-chain tree rather than collapsed into a separate linear log.
 
 Node schema (all fields always present):
   node_id         int       unique within this tree
@@ -13,8 +16,8 @@ Node schema (all fields always present):
   state_before    dict      AP → bool snapshot before this action
   state_after     dict      AP → bool snapshot predicted/observed after ({}
                             until outcome known)
-  state_path      [dict]    [{action, state_after}, …] for every accepted step
-                            leading to this node — i.e. the path from the root
+  state_path      [dict]    [{action, state_after}, …] for every selected step
+                            on the root-to-this-node path
   verification    dict      make_verification() result (skipped until known)
   attempts        [dict]    per-attempt records (LLM outputs, errors, etc.)
   result          str       'searching' | 'accepted' | 'rejected' |
@@ -37,7 +40,7 @@ Tree schema (planning_tree dict):
   action_help     str?      action catalogue text (shrdlu)
   nodes           [node]    all nodes in creation order
   feasible        bool
-  accepted_plan   [dict]    [{label, tool, args}, …] winning action sequence
+  accepted_plan   [dict]    [{label, tool, args}, …] winning root-to-leaf path
   tree_summary    [dict]?   compact per-node summary (shrdlu)
   finish_response str?      LLM finish message once plan is found
   planning_response str?    LLM planning narrative
@@ -155,8 +158,8 @@ def make_node(
         parent_node_id: Parent node's ID, or None for the root.
         depth:          Zero-based depth in the search tree.
         state_before:   AP → bool snapshot at this node before any action.
-        state_path:     [{action, state_after}, …] — accepted steps from root
-                        to this node, so the full path is always recoverable.
+        state_path:     [{action, state_after}, …] — selected steps from the
+                        root to this node, so the full path is recoverable.
         action_label:   Label of the action taken at this node.
         tool:           Tool used: 'git_cmd' | 'shell_cmd' | 'simulator_action' | 'none'.
         args:           Tool arguments dict.
@@ -318,7 +321,7 @@ def mark_feasible(
 
     Args:
         tree:          The planning tree dict.
-        accepted_plan: [{label, tool, args}, …] winning action sequence.
+        accepted_plan: [{label, tool, args}, …] winning root-to-leaf path.
     """
     tree["feasible"]      = True
     tree["accepted_plan"] = accepted_plan
