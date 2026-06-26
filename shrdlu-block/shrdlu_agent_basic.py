@@ -1,0 +1,785 @@
+"""OpenAI-compatible natural-language agents for the SHRDLU blocks world."""
+
+import copy
+from datetime import datetime, timezone
+import json
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from shrdlu_agents.property_verifier import PROPERTY_FILE, TransitionPropertyVerifier
+from shrdlu_agents.simulator_api import SimulatorAPI
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from utils.session import SCHEMA_VERSION  # noqa: E402
+
+__all__ = [
+    'OpenAICompatibleShrdluAgent',
+    'PreplannedOpenAICompatibleShrdluAgent',
+]
+
+DEFAULT_MAX_STEPS = 50
+DEFAULT_TRACE_DIR = str(Path(__file__).resolve().parents[2] / 'shrdlu-block-agents-playground' / 'agent_traces')
+DEFAULT_OPENAI_BASE_URL = 'http://127.0.0.1:30000/v1/'
+DEFAULT_OPENAI_API_KEY = 'EMPTY'
+DEFAULT_OPENAI_MODEL = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+
+
+SYSTEM_PROMPT = """You control a blocks-world simulator through a small validated action API.
+
+Rules:
+- Return exactly one action at a time.
+- Use only the allowed action names and argument types you are given.
+- Base decisions only on the current world state and latest action result.
+- If the task is complete, return the finish action instead of another simulator action.
+- If the user asks a conversational question, asks for a status summary, or explicitly says not to act, use the finish action.
+- Do not repeat an action that already succeeded unless the latest simulator result clearly shows it failed or the world state changed.
+- After a successful move, highlight, open, close, lower, or raise action that satisfies the request, return finish on the next step.
+- Keep the response short and factual.
+
+Return strict JSON only.
+
+Examples:
+{"response": "I will move the grasper over the blue block.", "action": {"name": "move_grasper", "args": {"x": -0.1, "y": 0.4}}}
+{"response": "Done.", "action": {"name": "finish", "args": {}}}
+"""
+
+PREPLANNED_SYSTEM_PROMPT = """You control a blocks-world simulator through a small validated action API.
+
+Rules:
+- Read the current scene carefully before planning.
+- Think through the full task first, then return the complete action sequence up front.
+- You will not get to replan after each action, so the plan must be self-contained.
+- Use only the allowed action names and argument types you are given.
+- Base decisions only on the current world state.
+- If the task is already complete, return an empty plan.
+- If the user asks a conversational question, asks for a status summary, or explicitly says not to act, return an empty plan.
+- Keep the response short and factual.
+
+Return strict JSON only.
+
+Examples:
+{"response": "I will pick up the blue block and place it on the green block.", "plan": [{"name": "move_grasper", "args": {"x": -0.1, "y": 0.4}}, {"name": "lower_grasper", "args": {}}, {"name": "close_grasper", "args": {}}, {"name": "raise_grasper", "args": {}}, {"name": "move_grasper", "args": {"x": 0.1, "y": -0.15}}, {"name": "lower_grasper", "args": {}}, {"name": "open_grasper", "args": {}}], "finish_response": "Done."}
+{"response": "The scene is already in the requested state.", "plan": [], "finish_response": "Done."}
+"""
+
+DECISION_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'response': {
+            'type': 'string',
+        },
+        'action': {
+            'type': 'object',
+            'properties': {
+                'name': {
+                    'type': 'string',
+                },
+                'args': {
+                    'type': 'object',
+                },
+            },
+            'required': ['name', 'args'],
+        },
+    },
+    'required': ['response', 'action'],
+}
+
+ACTION_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'name': {
+            'type': 'string',
+        },
+        'args': {
+            'type': 'object',
+        },
+    },
+    'required': ['name', 'args'],
+}
+
+PLAN_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'response': {
+            'type': 'string',
+        },
+        'plan': {
+            'type': 'array',
+            'items': ACTION_SCHEMA,
+        },
+        'finish_response': {
+            'type': 'string',
+        },
+    },
+    'required': ['response', 'plan', 'finish_response'],
+}
+
+
+class _ShrdluAgentBase:
+    """Shared tool-using agent loop for the SHRDLU blocks environment."""
+
+    def __init__(self, env: SimulatorAPI, model: str, host: str,
+                 max_steps: int = DEFAULT_MAX_STEPS,
+                 trace_dir: Optional[str] = DEFAULT_TRACE_DIR):
+        self._env = env
+        self._model = model
+        self._host = host.rstrip('/')
+        self._max_steps = max_steps
+        self._trace_dir = Path(trace_dir) if trace_dir else None
+        self._property_verifier = TransitionPropertyVerifier.from_file()
+        self._last_trace_path: Optional[str] = None
+
+    @property
+    def env(self) -> SimulatorAPI:
+        return self._env
+
+    @property
+    def last_trace_path(self) -> Optional[str]:
+        return self._last_trace_path
+
+    def handle_user_input(self, text: str) -> str:
+        """Handle a natural-language request against the live environment."""
+        request = (text or '').strip()
+        if not request:
+            return 'Please enter a command or instruction.'
+        if request.lower() in {'reset', '/reset'}:
+            self._env.reset()
+            return 'Environment reset.\n\n' + self._env.snapshot_text()
+        return self._run_agent_loop(request)
+
+    def _run_agent_loop(self, request: str) -> str:
+        trace = {
+            'schema_version': SCHEMA_VERSION,
+            'timestamp_utc': datetime.now(timezone.utc).isoformat(),
+            'agent': 'shrdlu-agent-basic',
+            'domain': 'shrdlu',
+            'model': self._model,
+            'host': self._host,
+            'max_steps': self._max_steps,
+            'request': request,
+            'property_monitoring': self._property_monitoring_metadata(),
+            'steps': [],
+        }
+        history: List[Dict[str, str]] = [{
+            'role': 'system',
+            'content': SYSTEM_PROMPT,
+        }]
+        action_help = self._env.action_help()
+        observation = self._env.snapshot_text()
+        last_result = 'No simulator command has been executed yet.'
+        previous_property_status = None
+
+        for step_index in range(self._max_steps):
+            prompt = self._build_user_prompt(request, action_help, observation, last_result)
+            history.append({
+                'role': 'user',
+                'content': prompt,
+            })
+            try:
+                content, decision, attempts = self._request_decision(history)
+            except Exception as exc:
+                trace['steps'].append({
+                    'step_index': step_index,
+                    'prompt': prompt,
+                    'error': str(exc),
+                })
+                trace['status'] = 'error'
+                trace['final_message'] = "Agent error: %s" % exc
+                trace_path = self._write_trace(trace)
+                return self._append_trace_notice(
+                    "Agent error: %s" % exc,
+                    trace_path,
+                )
+            history.append({'role': 'assistant', 'content': content})
+            action = decision.get('action', {})
+            response_text = self._normalize_response_text(
+                decision.get('response', ''),
+                action.get('name') == 'finish',
+            )
+            step_trace = {
+                'step_index': step_index,
+                'prompt': prompt,
+                'attempts': attempts,
+                'decision': decision,
+            }
+            if action.get('name') == 'finish':
+                trace['steps'].append(step_trace)
+                trace['status'] = 'finished'
+                trace['final_message'] = response_text
+                self._write_trace(trace)
+                return self._format_reply(response_text, None)
+
+            pre_state = self._env.snapshot()
+            pre_scene = copy.deepcopy(getattr(self._env, 'scene', None))
+            try:
+                result = self._env.execute_action(action)
+            except Exception as exc:
+                result = "ERROR: %s" % exc
+            post_state = self._env.snapshot()
+            property_trace, previous_property_status = self._monitor_transition_properties(
+                pre_state,
+                action,
+                post_state,
+                pre_scene=pre_scene,
+                post_scene=getattr(self._env, 'scene', None),
+                previous_property_status=previous_property_status,
+            )
+            executed_action = self._format_action(action)
+            observation = self._env.snapshot_text()
+            last_result = "Executed %s.\nResult: %s" % (executed_action, result)
+            step_trace.update({
+                'executed_action': action,
+                'action_result': result,
+                'property_verification': property_trace,
+                'observation_after': observation,
+            })
+            trace['steps'].append(step_trace)
+            if step_index == self._max_steps - 1:
+                final_message = self._format_reply(
+                    response_text + "\n\nReached max agent steps.",
+                    last_result,
+                )
+                trace['status'] = 'max_steps'
+                trace['final_message'] = final_message
+                trace_path = self._write_trace(trace)
+                return self._append_trace_notice(final_message, trace_path)
+        trace['status'] = 'stopped'
+        trace['final_message'] = 'Agent stopped without producing a result.'
+        trace_path = self._write_trace(trace)
+        return self._append_trace_notice('Agent stopped without producing a result.', trace_path)
+
+    @staticmethod
+    def _build_user_prompt(request: str, action_help: str, observation: str,
+                           last_result: str) -> str:
+        return "\n\n".join([
+            "User request:\n%s" % request,
+            action_help,
+            observation,
+            "Latest simulator result:\n%s" % last_result,
+            'JSON schema: {"response": "...", "action": {"name": "...", "args": {...}}}',
+            'Use {"response": "...", "action": {"name": "finish", "args": {}}} when done.',
+            "Return strict JSON only.",
+        ])
+
+    @staticmethod
+    def _parse_decision(content: str) -> Dict[str, str]:
+        content = _ShrdluAgentBase._extract_json_object(content)
+        try:
+            decision = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Model did not return valid JSON: %s" % content) from exc
+        if not isinstance(decision, dict):
+            raise ValueError("Model reply must be a JSON object.")
+        action = _ShrdluAgentBase._normalize_action(decision)
+        return {
+            'response': str(decision.get('response', '')),
+            'action': {
+                'name': str(action.get('name', '')).strip(),
+                'args': action.get('args', {}) if isinstance(action.get('args', {}), dict) else {},
+            },
+        }
+
+    def _request_decision(self, history: List[Dict[str, str]]):
+        attempts = list(history)
+        errors = []
+        attempt_log = []
+        for attempt_index in range(2):
+            content = self._chat(attempts).strip()
+            try:
+                decision = self._parse_decision(content)
+            except ValueError as exc:
+                errors.append(str(exc))
+                attempt_log.append({
+                    'attempt_index': attempt_index,
+                    'raw_content': content,
+                    'error': str(exc),
+                })
+                if attempt_index == 1:
+                    break
+                attempts.extend([
+                    {'role': 'assistant', 'content': content},
+                    {
+                        'role': 'user',
+                        'content': (
+                            "Your previous reply was invalid: %s\n"
+                            "Rewrite it as strict JSON only using this schema:\n"
+                            '{"response": "...", "action": {"name": "...", "args": {...}}}'
+                        ) % exc,
+                    },
+                ])
+                continue
+            action_name = decision['action']['name']
+            if not action_name:
+                errors.append('Model reply must include a non-empty action name.')
+                attempt_log.append({
+                    'attempt_index': attempt_index,
+                    'raw_content': content,
+                    'error': 'Model reply must include a non-empty action name.',
+                    'parsed_decision': decision,
+                })
+                if attempt_index == 1:
+                    break
+                attempts.extend([
+                    {'role': 'assistant', 'content': content},
+                    {
+                        'role': 'user',
+                        'content': (
+                            "Your previous reply used an empty action name.\n"
+                            "Return strict JSON only and choose a valid action name or finish."
+                        ),
+                    },
+                ])
+                continue
+            attempt_log.append({
+                'attempt_index': attempt_index,
+                'raw_content': content,
+                'parsed_decision': decision,
+            })
+            return content, decision, attempt_log
+        raise ValueError("Invalid model reply after retry: %s" % errors[-1])
+
+    @staticmethod
+    def _format_reply(response_text: str, command_result: Optional[str]) -> str:
+        if not command_result:
+            return response_text
+        return response_text + "\n\n" + command_result
+
+    @staticmethod
+    def _format_action(action: Dict[str, object]) -> str:
+        return json.dumps(action, sort_keys=True)
+
+    @staticmethod
+    def _extract_json_object(content: str) -> str:
+        content = content.strip()
+        if content.startswith('{') and content.endswith('}'):
+            return content
+        start = content.find('{')
+        end = content.rfind('}')
+        if start == -1 or end == -1 or end <= start:
+            return content
+        return content[start:end + 1]
+
+    @staticmethod
+    def _normalize_response_text(text: str, is_finish: bool) -> str:
+        text = (text or '').strip()
+        if text:
+            return text
+        if is_finish:
+            return 'Done.'
+        return 'No response provided.'
+
+    @staticmethod
+    def _normalize_action(decision: Dict[str, object]) -> Dict[str, object]:
+        raw_action = decision.get('action')
+        if isinstance(raw_action, dict):
+            return raw_action
+        if isinstance(raw_action, str):
+            return {
+                'name': raw_action,
+                'args': _ShrdluAgentBase._extract_action_args(decision),
+            }
+        action_name = decision.get('name') or decision.get('action_name')
+        if isinstance(action_name, str):
+            return {
+                'name': action_name,
+                'args': _ShrdluAgentBase._extract_action_args(decision),
+            }
+        raise ValueError("Model reply must include an action object.")
+
+    @staticmethod
+    def _extract_action_args(decision: Dict[str, object]) -> Dict[str, object]:
+        for key in ('args', 'arguments', 'parameters'):
+            value = decision.get(key)
+            if isinstance(value, dict):
+                return value
+        raw_action = decision.get('action')
+        if isinstance(raw_action, dict):
+            for key in ('args', 'arguments', 'parameters'):
+                value = raw_action.get(key)
+                if isinstance(value, dict):
+                    return value
+        return {}
+
+    def _start_trace_session(self, trace: Dict[str, object]) -> Optional[str]:
+        if self._trace_dir is None:
+            return None
+        self._trace_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+        trace_path = self._trace_dir / ('trace_%s.json' % timestamp)
+        trace['_live'] = True
+        trace_path.write_text(json.dumps(trace, indent=2), encoding='utf-8')
+        self._last_trace_path = str(trace_path)
+        return self._last_trace_path
+
+    def _checkpoint_trace(self, trace: Dict[str, object], trace_path: Optional[str]) -> Optional[str]:
+        if not trace_path:
+            return trace_path
+        trace['_live'] = True
+        Path(trace_path).write_text(json.dumps(trace, indent=2), encoding='utf-8')
+        return trace_path
+
+    def _write_trace(self, trace: Dict[str, object], trace_path: Optional[str] = None) -> Optional[str]:
+        if self._trace_dir is None and not trace_path:
+            return None
+        if trace_path is None:
+            trace_path = self._start_trace_session(trace)
+        if not trace_path:
+            return None
+        trace.pop('_live', None)
+        Path(trace_path).write_text(json.dumps(trace, indent=2), encoding='utf-8')
+        self._last_trace_path = str(trace_path)
+        return self._last_trace_path
+
+    @staticmethod
+    def _append_trace_notice(message: str, trace_path: Optional[str]) -> str:
+        if not trace_path:
+            return message
+        return message + "\n\nTrace saved to %s" % trace_path
+
+    def _property_monitoring_metadata(self) -> Dict[str, object]:
+        return {
+            'enabled': True,
+            'property_file': str(PROPERTY_FILE),
+            'property_count': len(self._property_verifier.properties),
+        }
+
+    def _monitor_transition_properties(
+        self,
+        pre_state: Dict[str, object],
+        action: Dict[str, object],
+        post_state: Dict[str, object],
+        *,
+        pre_scene,
+        post_scene,
+        previous_property_status: Optional[Dict[str, bool]],
+    ):
+        verification = self._property_verifier.verify_transition(
+            pre_state,
+            action,
+            post_state,
+            pre_scene=pre_scene,
+            post_scene=post_scene,
+        )
+        current_property_status = {
+            item['id']: bool(item['satisfied'])
+            for item in verification['property_results']
+            if item.get('id')
+        }
+        changed_properties = []
+        if previous_property_status is not None:
+            for property_id, current_value in current_property_status.items():
+                previous_value = previous_property_status.get(property_id)
+                if previous_value is None or previous_value == current_value:
+                    continue
+                changed_properties.append({
+                    'id': property_id,
+                    'before': previous_value,
+                    'after': current_value,
+                })
+        verification['changed_properties'] = changed_properties
+        return verification, current_property_status
+
+    def _chat(self, messages: List[Dict[str, str]], schema: Dict[str, object] = DECISION_SCHEMA) -> str:
+        del messages, schema
+        raise NotImplementedError('Subclasses must provide a chat backend.')
+
+
+class OpenAICompatibleShrdluAgent(_ShrdluAgentBase):
+    """OpenAI-compatible chat-completions agent for the SHRDLU blocks environment."""
+
+    def __init__(self, env: SimulatorAPI, model: str = DEFAULT_OPENAI_MODEL,
+                 base_url: str = DEFAULT_OPENAI_BASE_URL,
+                 api_key: str = DEFAULT_OPENAI_API_KEY,
+                 max_steps: int = DEFAULT_MAX_STEPS,
+                 trace_dir: Optional[str] = DEFAULT_TRACE_DIR,
+                 temperature: float = 0.2,
+                 max_tokens: int = 512,
+                 enable_thinking: bool = True,
+                 separate_reasoning: bool = True,
+                 client=None):
+        super().__init__(
+            env,
+            model=model,
+            host=base_url,
+            max_steps=max_steps,
+            trace_dir=trace_dir,
+        )
+        if client is None:
+            if OpenAI is None:
+                raise RuntimeError(
+                    'openai package is required for OpenAI-compatible demo support.'
+                )
+            client = OpenAI(base_url=base_url, api_key=api_key)
+        self._client = client
+        self._temperature = float(temperature)
+        self._max_tokens = int(max_tokens)
+        self._enable_thinking = bool(enable_thinking)
+        self._separate_reasoning = bool(separate_reasoning)
+
+    def _chat(self, messages: List[Dict[str, str]], schema: Dict[str, object] = DECISION_SCHEMA) -> str:
+        del schema
+        try:
+            response = self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+                extra_body={
+                    'chat_template_kwargs': {'enable_thinking': self._enable_thinking},
+                    'separate_reasoning': self._separate_reasoning,
+                },
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "OpenAI-compatible chat error at %s: %s" % (self._host, exc)
+            ) from exc
+        try:
+            return response.choices[0].message.content or ''
+        except (AttributeError, IndexError, TypeError) as exc:
+            raise RuntimeError("Unexpected OpenAI-compatible response: %r" % response) from exc
+
+
+class _PreplannedShrdluAgentMixin:
+    """Plan the full sequence up front, then execute without replanning."""
+
+    def _run_agent_loop(self, request: str) -> str:
+        trace = {
+            'schema_version': SCHEMA_VERSION,
+            'timestamp_utc': datetime.now(timezone.utc).isoformat(),
+            'agent': 'shrdlu-agent-plan',
+            'domain': 'shrdlu',
+            'model': self._model,
+            'host': self._host,
+            'max_steps': self._max_steps,
+            'request': request,
+            'planning_mode': 'preplanned',
+            'property_monitoring': self._property_monitoring_metadata(),
+            'steps': [],
+        }
+        action_help = self._env.action_help()
+        observation = self._env.snapshot_text()
+        history: List[Dict[str, str]] = [{
+            'role': 'system',
+            'content': PREPLANNED_SYSTEM_PROMPT,
+        }]
+        prompt = self._build_plan_prompt(request, action_help, observation)
+        history.append({
+            'role': 'user',
+            'content': prompt,
+        })
+        try:
+            content, plan_bundle, attempts = self._request_plan(history)
+        except Exception as exc:
+            trace['plan_prompt'] = prompt
+            trace['status'] = 'error'
+            trace['final_message'] = "Agent error: %s" % exc
+            trace['steps'].append({
+                'step_index': 0,
+                'prompt': prompt,
+                'error': str(exc),
+            })
+            trace_path = self._write_trace(trace)
+            return self._append_trace_notice(
+                "Agent error: %s" % exc,
+                trace_path,
+            )
+
+        trace['plan_prompt'] = prompt
+        trace['plan_attempts'] = attempts
+        trace['plan_response'] = content
+        trace['plan_summary'] = plan_bundle
+
+        response_text = self._normalize_response_text(
+            plan_bundle.get('response', ''),
+            is_finish=not plan_bundle['plan'],
+        )
+        finish_response = self._normalize_response_text(
+            plan_bundle.get('finish_response', ''),
+            is_finish=True,
+        )
+        plan = plan_bundle['plan']
+
+        if len(plan) > self._max_steps:
+            final_message = (
+                "Agent error: Planned %d actions, which exceeds the max step budget of %d."
+                % (len(plan), self._max_steps)
+            )
+            trace['status'] = 'error'
+            trace['final_message'] = final_message
+            trace_path = self._write_trace(trace)
+            return self._append_trace_notice(final_message, trace_path)
+
+        if not plan:
+            trace['status'] = 'finished'
+            trace['final_message'] = finish_response
+            self._write_trace(trace)
+            return finish_response if response_text == finish_response else self._format_reply(
+                response_text,
+                finish_response,
+            )
+
+        last_result = None
+        previous_property_status = None
+        for step_index, action in enumerate(plan):
+            step_trace = {
+                'step_index': step_index,
+                'planned_action': action,
+            }
+            pre_state = self._env.snapshot()
+            pre_scene = copy.deepcopy(getattr(self._env, 'scene', None))
+            try:
+                result = self._env.execute_action(action)
+            except Exception as exc:
+                result = "ERROR: %s" % exc
+            post_state = self._env.snapshot()
+            property_trace, previous_property_status = self._monitor_transition_properties(
+                pre_state,
+                action,
+                post_state,
+                pre_scene=pre_scene,
+                post_scene=getattr(self._env, 'scene', None),
+                previous_property_status=previous_property_status,
+            )
+            observation = self._env.snapshot_text()
+            step_trace.update({
+                'action_result': result,
+                'property_verification': property_trace,
+                'observation_after': observation,
+            })
+            trace['steps'].append(step_trace)
+            last_result = "Executed %s.\nResult: %s" % (
+                self._format_action(action),
+                result,
+            )
+            if isinstance(result, str) and result.startswith('ERROR:'):
+                final_message = self._format_reply(
+                    response_text + "\n\nPlan execution failed.",
+                    last_result,
+                )
+                trace['status'] = 'error'
+                trace['final_message'] = final_message
+                trace_path = self._write_trace(trace)
+                return self._append_trace_notice(final_message, trace_path)
+
+        final_message = finish_response
+        if response_text != finish_response:
+            final_message = self._format_reply(response_text, finish_response)
+        trace['status'] = 'finished'
+        trace['final_message'] = final_message
+        self._write_trace(trace)
+        return final_message
+
+    @staticmethod
+    def _build_plan_prompt(request: str, action_help: str, observation: str) -> str:
+        return "\n\n".join([
+            "User request:\n%s" % request,
+            action_help,
+            observation,
+            "Plan carefully before acting.",
+            "You must return the complete action sequence up front.",
+            "Do not assume you will get to revise the plan after each action.",
+            "If the request is already satisfied, return an empty plan.",
+            'JSON schema: {"response": "...", "plan": [{"name": "...", "args": {...}}], "finish_response": "..."}',
+            "Return strict JSON only.",
+        ])
+
+    @staticmethod
+    def _parse_plan(content: str) -> Dict[str, object]:
+        content = _ShrdluAgentBase._extract_json_object(content)
+        try:
+            decision = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Model did not return valid JSON: %s" % content) from exc
+        if not isinstance(decision, dict):
+            raise ValueError("Model reply must be a JSON object.")
+        if 'plan' not in decision:
+            raise ValueError("Model reply must include a plan array.")
+        raw_plan = decision.get('plan', [])
+        if not isinstance(raw_plan, list):
+            raise ValueError("Model reply must include a plan array.")
+        plan = []
+        for item in raw_plan:
+            if not isinstance(item, dict):
+                raise ValueError("Each planned action must be a JSON object.")
+            normalized = _ShrdluAgentBase._normalize_action({'action': item})
+            plan.append({
+                'name': str(normalized.get('name', '')).strip(),
+                'args': normalized.get('args', {}) if isinstance(normalized.get('args', {}), dict) else {},
+            })
+        return {
+            'response': str(decision.get('response', '')),
+            'finish_response': str(decision.get('finish_response', '')),
+            'plan': plan,
+        }
+
+    def _request_plan(self, history: List[Dict[str, str]]):
+        attempts = list(history)
+        errors = []
+        attempt_log = []
+        for attempt_index in range(2):
+            content = self._chat(attempts, schema=PLAN_SCHEMA).strip()
+            try:
+                plan_bundle = self._parse_plan(content)
+            except ValueError as exc:
+                errors.append(str(exc))
+                attempt_log.append({
+                    'attempt_index': attempt_index,
+                    'raw_content': content,
+                    'error': str(exc),
+                })
+                if attempt_index == 1:
+                    break
+                attempts.extend([
+                    {'role': 'assistant', 'content': content},
+                    {
+                        'role': 'user',
+                        'content': (
+                            "Your previous reply was invalid: %s\n"
+                            "Rewrite it as strict JSON only using this schema:\n"
+                            '{"response": "...", "plan": [{"name": "...", "args": {...}}], "finish_response": "..."}'
+                        ) % exc,
+                    },
+                ])
+                continue
+            empty_names = [index for index, action in enumerate(plan_bundle['plan']) if not action['name']]
+            if empty_names:
+                errors.append('Every planned action must include a non-empty action name.')
+                attempt_log.append({
+                    'attempt_index': attempt_index,
+                    'raw_content': content,
+                    'error': 'Every planned action must include a non-empty action name.',
+                    'parsed_plan': plan_bundle,
+                })
+                if attempt_index == 1:
+                    break
+                attempts.extend([
+                    {'role': 'assistant', 'content': content},
+                    {
+                        'role': 'user',
+                        'content': (
+                            "Your previous reply included an empty action name.\n"
+                            "Return strict JSON only and ensure every planned action has a valid action name."
+                        ),
+                    },
+                ])
+                continue
+            attempt_log.append({
+                'attempt_index': attempt_index,
+                'raw_content': content,
+                'parsed_plan': plan_bundle,
+            })
+            return content, plan_bundle, attempt_log
+        raise ValueError("Invalid model reply after retry: %s" % errors[-1])
+
+
+class PreplannedOpenAICompatibleShrdluAgent(
+        _PreplannedShrdluAgentMixin, OpenAICompatibleShrdluAgent):
+    """Plan the full action sequence up front, then execute it over a local OpenAI API."""

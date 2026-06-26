@@ -1,0 +1,176 @@
+{
+  "metadata": {
+    "purpose": "Property/specification catalog for SHRDLU using the current 10 APs",
+    "logic_style": "finite-trace LTL AST",
+    "notes": [
+      "Each property uses only the APs defined in SHRDLU_AP_CANDIDATES.json.",
+      "The AP vocabulary is state-based and grounded in simulator fields such as resting_on, grasper_closed, and grasper_lowered.",
+      "These properties are the currently selected working set."
+    ]
+  },
+  "properties": [
+    {
+      "id": "prop.object_4_on_6_stays_on_6",
+      "natural_language": "Once object 4 is resting on object 6, it stays resting on object 6 forever.",
+      "ltl": "G(object_4_resting_on_6 -> G(object_4_resting_on_6))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "object_4_resting_on_6"
+          },
+          "right": {
+            "type": "globally",
+            "operand": {
+              "type": "ap",
+              "name": "object_4_resting_on_6"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.object_4_not_on_3_and_6_simultaneously",
+      "natural_language": "Object 4 is never simultaneously resting on object 3 and object 6.",
+      "ltl": "G(!(object_4_resting_on_3 && object_4_resting_on_6))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "not",
+          "operand": {
+            "type": "and",
+            "args": [
+              {
+                "type": "ap",
+                "name": "object_4_resting_on_3"
+              },
+              {
+                "type": "ap",
+                "name": "object_4_resting_on_6"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.no_object_resting_on_4",
+      "natural_language": "No object is ever resting on object 4.",
+      "ltl": "G(!some_object_resting_on_4)",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "not",
+          "operand": {
+            "type": "ap",
+            "name": "some_object_resting_on_4"
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.no_object_resting_on_8",
+      "natural_language": "No object is ever resting on object 8.",
+      "ltl": "G(!some_object_resting_on_8)",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "not",
+          "operand": {
+            "type": "ap",
+            "name": "some_object_resting_on_8"
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.no_object_resting_on_10",
+      "natural_language": "No object is ever resting on object 10.",
+      "ltl": "G(!some_object_resting_on_10)",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "not",
+          "operand": {
+            "type": "ap",
+            "name": "some_object_resting_on_10"
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.lowered_eventually_raised",
+      "natural_language": "Whenever the grasper is lowered, it is eventually not lowered again.",
+      "ltl": "G(grasper_lowered -> F(!grasper_lowered))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "grasper_lowered"
+          },
+          "right": {
+            "type": "eventually",
+            "operand": {
+              "type": "not",
+              "operand": {
+                "type": "ap",
+                "name": "grasper_lowered"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.closed_eventually_open",
+      "natural_language": "Whenever the grasper is closed, it is eventually not closed again.",
+      "ltl": "G(grasper_closed -> F(!grasper_closed))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "grasper_closed"
+          },
+          "right": {
+            "type": "eventually",
+            "operand": {
+              "type": "not",
+              "operand": {
+                "type": "ap",
+                "name": "grasper_closed"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.object_on_10_implies_next_closed",
+      "natural_language": "Whenever something is resting on object 10, the next state has the grasper closed.",
+      "ltl": "G(some_object_resting_on_10 -> X(grasper_closed))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "some_object_resting_on_10"
+          },
+          "right": {
+            "type": "next",
+            "operand": {
+              "type": "ap",
+              "name": "grasper_closed"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,833 @@
+{
+  "metadata": {
+    "purpose": "Property/specification catalog for git-agent-fsm using LTL AST format",
+    "logic_style": "finite-trace LTL AST",
+    "ap_vocabulary": "GIT_AP_CANDIDATES.json",
+    "notes": [
+      "Each property uses only the APs defined in GIT_AP_CANDIDATES.json.",
+      "AP names prefixed with '(transition)' are transition APs matched against the action_label of each step.",
+      "All other APs are state APs evaluated from the live git repository at observation time.",
+      "Properties prop.git.20-22, 25-26 contain liveness operators (finally/until) and are skipped for finite-trace TLC checks."
+    ]
+  },
+  "properties": [
+    {
+      "id": "prop.git.01",
+      "natural_language": "No commit that was reachable is permanently lost; if a destructive rewrite runs, a backup ref must exist.",
+      "ltl": "G(!irrecoverable_loss /\\ (destructive_rewrite => backup_ref_exists))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "and",
+          "args": [
+            {
+              "type": "not",
+              "operand": {
+                "type": "ap",
+                "name": "A commit object that previously existed in reachable local history becomes irrecoverably unreachable."
+              }
+            },
+            {
+              "type": "implies",
+              "left": {
+                "type": "ap",
+                "name": "(transition) A destructive history-rewrite action is executed."
+              },
+              "right": {
+                "type": "ap",
+                "name": "A backup reference or recovery tag exists for the pre-rewrite commit range."
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "prop.git.02",
+      "natural_language": "Published commits are never rebased; a rebase may only proceed if all selected commits are local-only.",
+      "ltl": "G(!rebase_published /\\ (rebase_started => all_commits_local))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "and",
+          "args": [
+            {
+              "type": "not",
+              "operand": {
+                "type": "ap",
+                "name": "(transition) A rebase action that rewrites commits already published to a remote repository."
+              }
+            },
+            {
+              "type": "implies",
+              "left": {
+                "type": "ap",
+                "name": "(transition) A rebase action is requested/started."
+              },
+              "right": {
+                "type": "ap",
+                "name": "All commits selected for rebase are local-only and unpublished."
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "prop.git.03",
+      "natural_language": "A protected branch that requires linear history must not be merged into.",
+      "ltl": "G(protected_linear => !merge)",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "A protected branch requires linear history."
+          },
+          "right": {
+            "type": "not",
+            "operand": {
+              "type": "ap",
+              "name": "(transition) A merge action."
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.04",
+      "natural_language": "In detached-HEAD mode neither a normal push nor a force-push may be executed.",
+      "ltl": "G(detached_head => (!push /\\ !force_push))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "A detached-head repository mode."
+          },
+          "right": {
+            "type": "and",
+            "args": [
+              {
+                "type": "not",
+                "operand": {
+                  "type": "ap",
+                  "name": "(transition) A normal push action to the remote repository."
+                }
+              },
+              {
+                "type": "not",
+                "operand": {
+                  "type": "ap",
+                  "name": "(transition) A force-push action."
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.05",
+      "natural_language": "While on main, no direct commit is allowed; changes must go through reviewed merge or rebase workflows.",
+      "ltl": "G(on_main => (!direct_commit /\\ reviewed_workflow))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "The current checked-out branch is main."
+          },
+          "right": {
+            "type": "and",
+            "args": [
+              {
+                "type": "not",
+                "operand": {
+                  "type": "ap",
+                  "name": "(transition) A direct commit action on the current branch (as modeled in this workflow)."
+                }
+              },
+              {
+                "type": "ap",
+                "name": "Changes targeting main are integrated only through reviewed merge or rebase workflows."
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.06",
+      "natural_language": "When local and remote have diverged, no push (normal or force) may proceed.",
+      "ltl": "G(diverged => (!push /\\ !force_push))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "A synchronization status where local and remote histories have diverged."
+          },
+          "right": {
+            "type": "and",
+            "args": [
+              {
+                "type": "not",
+                "operand": {
+                  "type": "ap",
+                  "name": "(transition) A normal push action to the remote repository."
+                }
+              },
+              {
+                "type": "not",
+                "operand": {
+                  "type": "ap",
+                  "name": "(transition) A force-push action."
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.07",
+      "natural_language": "A normal push requires local to be strictly ahead of remote, not diverged, and the remote ref reachable.",
+      "ltl": "G(push => (ahead /\\ !diverged /\\ remote_reachable))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "(transition) A normal push action to the remote repository."
+          },
+          "right": {
+            "type": "and",
+            "args": [
+              {
+                "type": "ap",
+                "name": "A synchronization status where local history is ahead of remote history."
+              },
+              {
+                "type": "not",
+                "operand": {
+                  "type": "ap",
+                  "name": "A synchronization status where local and remote histories have diverged."
+                }
+              },
+              {
+                "type": "ap",
+                "name": "The target remote reference is reachable and satisfies push preconditions."
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.08",
+      "natural_language": "After a rebase fails due to branch divergence, the very next action must not be a push of any kind.",
+      "ltl": "G(rebase_fail_diverge => X(!push /\\ !force_push))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "(transition) A rebase action fails due to branch divergence."
+          },
+          "right": {
+            "type": "next",
+            "operand": {
+              "type": "and",
+              "args": [
+                {
+                  "type": "not",
+                  "operand": {
+                    "type": "ap",
+                    "name": "(transition) A normal push action to the remote repository."
+                  }
+                },
+                {
+                  "type": "not",
+                  "operand": {
+                    "type": "ap",
+                    "name": "(transition) A force-push action."
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.09",
+      "natural_language": "When the workflow state requires an immediate force-push, the next action must be that force-push.",
+      "ltl": "G(force_push_required => X(force_push /\\ !missed))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "A workflow state in which an immediate force push is required."
+          },
+          "right": {
+            "type": "next",
+            "operand": {
+              "type": "and",
+              "args": [
+                {
+                  "type": "ap",
+                  "name": "(transition) A force-push action."
+                },
+                {
+                  "type": "not",
+                  "operand": {
+                    "type": "ap",
+                    "name": "A required immediate force push was missed."
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.10",
+      "natural_language": "A force-push requires explicit authorization and a non-fast-forward approval token.",
+      "ltl": "G(force_push => (authorized /\\ approval_token))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "(transition) A force-push action."
+          },
+          "right": {
+            "type": "and",
+            "args": [
+              {
+                "type": "ap",
+                "name": "An authorized/authenticated status allowing the guarded action."
+              },
+              {
+                "type": "ap",
+                "name": "A non-fast-forward update approval token is present for this action."
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.11",
+      "natural_language": "A force-push requires maintainer role and an approved protected-branch override policy.",
+      "ltl": "G(force_push => (maintainer /\\ override_policy))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "(transition) A force-push action."
+          },
+          "right": {
+            "type": "and",
+            "args": [
+              {
+                "type": "ap",
+                "name": "A maintainer-level role."
+              },
+              {
+                "type": "ap",
+                "name": "The action is executed under an approved protected-branch override policy."
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.12",
+      "natural_language": "A protected branch blocks direct push and requires a reviewed integration workflow.",
+      "ltl": "G(protected => (!push /\\ reviewed_integration))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "A protected-branch classification."
+          },
+          "right": {
+            "type": "and",
+            "args": [
+              {
+                "type": "not",
+                "operand": {
+                  "type": "ap",
+                  "name": "(transition) A normal push action to the remote repository."
+                }
+              },
+              {
+                "type": "ap",
+                "name": "Updates to this branch must pass through a reviewed integration workflow."
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.13",
+      "natural_language": "A force-push to a protected branch is never allowed.",
+      "ltl": "G(!(protected /\\ force_push) /\\ (force_push => !protected))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "and",
+          "args": [
+            {
+              "type": "not",
+              "operand": {
+                "type": "and",
+                "args": [
+                  {
+                    "type": "ap",
+                    "name": "A protected-branch classification."
+                  },
+                  {
+                    "type": "ap",
+                    "name": "(transition) A force-push action."
+                  }
+                ]
+              }
+            },
+            {
+              "type": "implies",
+              "left": {
+                "type": "ap",
+                "name": "(transition) A force-push action."
+              },
+              "right": {
+                "type": "not",
+                "operand": {
+                  "type": "ap",
+                  "name": "A protected-branch classification."
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "prop.git.14",
+      "natural_language": "In detached-HEAD mode, no direct commit is allowed; all new work must be attached to a named branch first.",
+      "ltl": "G(detached_head => (!direct_commit /\\ attach_to_branch))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "A detached-head repository mode."
+          },
+          "right": {
+            "type": "and",
+            "args": [
+              {
+                "type": "not",
+                "operand": {
+                  "type": "ap",
+                  "name": "(transition) A direct commit action on the current branch (as modeled in this workflow)."
+                }
+              },
+              {
+                "type": "ap",
+                "name": "Any new work must be attached to a named branch before commit or push workflows continue."
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.15",
+      "natural_language": "A rebase is only started when the branch genuinely needs replaying (is behind upstream or has local commits).",
+      "ltl": "G(rebase_started => (behind_upstream /\\ !already_sync))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "(transition) A rebase action is requested/started."
+          },
+          "right": {
+            "type": "and",
+            "args": [
+              {
+                "type": "ap",
+                "name": "The branch is behind upstream or has local commits that must be replayed."
+              },
+              {
+                "type": "not",
+                "operand": {
+                  "type": "ap",
+                  "name": "A synchronization status where no rebase is needed (already synchronized)."
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.16",
+      "natural_language": "A normal push requires network connectivity, valid credentials, and no write-protection on the remote.",
+      "ltl": "G(push => (network /\\ auth /\\ !write_protected))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "(transition) A normal push action to the remote repository."
+          },
+          "right": {
+            "type": "and",
+            "args": [
+              {
+                "type": "ap",
+                "name": "A network status indicating remote connectivity is available."
+              },
+              {
+                "type": "ap",
+                "name": "Authentication credentials for remote write are valid."
+              },
+              {
+                "type": "not",
+                "operand": {
+                  "type": "ap",
+                  "name": "A remote write-protection or permission-denied status is active."
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.17",
+      "natural_language": "After exceeding 3 retry attempts, no push (normal or force) may execute next.",
+      "ltl": "G(retries_exceeded => X(!push /\\ !force_push))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "The number of retry attempts used by the workflow operation exceeds 3."
+          },
+          "right": {
+            "type": "next",
+            "operand": {
+              "type": "and",
+              "args": [
+                {
+                  "type": "not",
+                  "operand": {
+                    "type": "ap",
+                    "name": "(transition) A normal push action to the remote repository."
+                  }
+                },
+                {
+                  "type": "not",
+                  "operand": {
+                    "type": "ap",
+                    "name": "(transition) A force-push action."
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.18",
+      "natural_language": "When the processing queue exceeds 64 pending operations, no further mutating actions may be dequeued until an operator drains the queue.",
+      "ltl": "G(queue_overflowed => (!mutating_dequeue /\\ drain_required))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "The current depth of pending git workflow operations in the processing queue exceeds 64."
+          },
+          "right": {
+            "type": "and",
+            "args": [
+              {
+                "type": "not",
+                "operand": {
+                  "type": "ap",
+                  "name": "(transition) A mutating git action is dequeued for execution."
+                }
+              },
+              {
+                "type": "ap",
+                "name": "A queue-drain or operator-intervention state is required before execution resumes."
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.19",
+      "natural_language": "When the workflow state requires a force-push before normal publishing, a normal push must not execute.",
+      "ltl": "G(force_push_required_state => !normal_push)",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "The repository workflow state indicates that a force push is required before normal publishing can continue."
+          },
+          "right": {
+            "type": "not",
+            "operand": {
+              "type": "ap",
+              "name": "(transition) A normal push action to the remote repository is executed."
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.20",
+      "natural_language": "[liveness] Whenever local is ahead with unpublished commits, the branch eventually reaches a clean synchronized state.",
+      "ltl": "G(ahead => F(clean_sync))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "Local history is ahead of the remote branch and has unpublished commits."
+          },
+          "right": {
+            "type": "finally",
+            "operand": {
+              "type": "ap",
+              "name": "The branch returns to a clean synchronized state with no unpublished commit debt."
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.21",
+      "natural_language": "[liveness] Detached commits are eventually anchored to a named branch.",
+      "ltl": "G(detached_commits => F(anchored))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "Detached HEAD contains commits that are not attached to any named branch."
+          },
+          "right": {
+            "type": "finally",
+            "operand": {
+              "type": "ap",
+              "name": "Those detached commits are eventually anchored to a named branch reference."
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.22",
+      "natural_language": "[liveness] After a rejected push due to divergence, no push runs until a successful rebase resolves the divergence.",
+      "ltl": "G(push_rejected_diverge => (!push U rebase_resolved))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "A push attempt was rejected because local and remote histories diverged."
+          },
+          "right": {
+            "type": "until",
+            "left": {
+              "type": "not",
+              "operand": {
+                "type": "ap",
+                "name": "(transition) Any push action to the remote repository is executed."
+              }
+            },
+            "right": {
+              "type": "ap",
+              "name": "(transition) A rebase action is successfully completed to resolve divergence."
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.23",
+      "natural_language": "A normal push is only executed when the local branch is strictly ahead of the remote tracking branch.",
+      "ltl": "G(normal_push_executed => local_ahead)",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "(transition) A normal push action to the remote repository is executed."
+          },
+          "right": {
+            "type": "ap",
+            "name": "Local branch contains commits that are ahead of the remote tracking branch."
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.24",
+      "natural_language": "When branch histories are diverged, a rebase operation must not fail and leave divergence unresolved.",
+      "ltl": "G(diverged => !rebase_fail_unresolved)",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "Branch histories are diverged and require reconciliation."
+          },
+          "right": {
+            "type": "not",
+            "operand": {
+              "type": "ap",
+              "name": "(transition) A rebase operation fails and leaves divergence unresolved."
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.25",
+      "natural_language": "[liveness] The repository repeatedly returns to a clean synchronized state.",
+      "ltl": "GF(clean_sync)",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "finally",
+          "operand": {
+            "type": "ap",
+            "name": "The repository repeatedly returns to a clean synchronized state over time."
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.26",
+      "natural_language": "[liveness] The workflow repeatedly reaches a state with no unpublished local commit debt.",
+      "ltl": "GF(no_debt)",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "finally",
+          "operand": {
+            "type": "ap",
+            "name": "The workflow repeatedly reaches a state with no unpublished local commit debt."
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.27",
+      "natural_language": "The commit graph always remains acyclic.",
+      "ltl": "G(acyclic)",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "ap",
+          "name": "The commit graph remains acyclic and does not introduce reference cycles."
+        }
+      }
+    },
+    {
+      "id": "prop.git.28",
+      "natural_language": "A branch reference never moves backward to exclude previously reachable commits.",
+      "ltl": "G(!backward_ref_move)",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "not",
+          "operand": {
+            "type": "ap",
+            "name": "A branch reference moves backward to exclude commits that were previously reachable by policy."
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.29",
+      "natural_language": "A force-push may only execute when the actor is authenticated and authorized for that specific branch.",
+      "ltl": "G(force_push_executed => actor_authorized)",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "(transition) A force-push action is executed."
+          },
+          "right": {
+            "type": "ap",
+            "name": "The actor is authenticated and authorized for force-push on the target branch."
+          }
+        }
+      }
+    },
+    {
+      "id": "prop.git.30",
+      "natural_language": "After a public history rewrite, the very next action must be an immediate force-push to publish the rewritten history.",
+      "ltl": "G(public_rewrite => X(immediate_force_push))",
+      "ast": {
+        "type": "globally",
+        "operand": {
+          "type": "implies",
+          "left": {
+            "type": "ap",
+            "name": "(transition) A public-history rewrite operation is executed."
+          },
+          "right": {
+            "type": "next",
+            "operand": {
+              "type": "ap",
+              "name": "(transition) An immediate force-push action is executed to publish the rewritten history."
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,244 @@
+{
+  "metadata": {
+    "purpose": "Primitive atomic propositions for git-agent-fsm verification",
+    "design_rule": [
+      "State APs are evaluated from live git repository state at observation time.",
+      "Transition APs have names prefixed with '(transition)' and are set by matching the action_label of each step.",
+      "Use natural-language names that are unambiguous given the git workflow context.",
+      "Do not invent APs not grounded in observable git state or explicit action types.",
+      "Each AP name is used verbatim in property ASTs — changes here require updating GIT_PROPERTIES_AST.json."
+    ],
+    "source_context": [
+      "git-agent-fsm.py phase 3 (observation)",
+      "git-agent-fsm.py phase 4 (planning / state prediction)"
+    ]
+  },
+  "current_state_aps": [
+    {
+      "name": "A backup reference or recovery tag exists for the pre-rewrite commit range.",
+      "description": "A git ref (backup tag, ORIG_HEAD, or reflog entry) still points at commits that were rewritten or removed."
+    },
+    {
+      "name": "A branch reference moves backward to exclude commits that were previously reachable by policy.",
+      "description": "The branch tip has been moved to an ancestor, making previously reachable commits unreachable through the ref."
+    },
+    {
+      "name": "A commit object that previously existed in reachable local history becomes irrecoverably unreachable.",
+      "description": "A commit is no longer reachable from any ref and is eligible for garbage collection with no backup."
+    },
+    {
+      "name": "A detached-head repository mode.",
+      "description": "HEAD points to a commit SHA rather than a branch name (git status shows 'HEAD detached at ...')."
+    },
+    {
+      "name": "A maintainer-level role.",
+      "description": "The acting user has maintainer or admin privileges on the target repository."
+    },
+    {
+      "name": "A network status indicating remote connectivity is available.",
+      "description": "The remote host is reachable and git network operations (fetch/push/pull) can proceed."
+    },
+    {
+      "name": "A non-fast-forward update approval token is present for this action.",
+      "description": "An explicit --force, --force-with-lease, or equivalent flag/config that authorises a non-fast-forward update."
+    },
+    {
+      "name": "A protected branch requires linear history.",
+      "description": "The branch protection rule mandates linear history (no merge commits), i.e. rebases are required over merges."
+    },
+    {
+      "name": "A protected-branch classification.",
+      "description": "The target branch is classified as protected in the repository settings (e.g. main, release/*)."
+    },
+    {
+      "name": "A push attempt was rejected because local and remote histories diverged.",
+      "description": "The most recent push returned a rejection error indicating non-fast-forward or diverged histories."
+    },
+    {
+      "name": "A queue-drain or operator-intervention state is required before execution resumes.",
+      "description": "The workflow is paused waiting for the operation queue to drain or for manual operator intervention."
+    },
+    {
+      "name": "A remote write-protection or permission-denied status is active.",
+      "description": "The remote returned a permission-denied error; write access to the remote ref is blocked."
+    },
+    {
+      "name": "A required immediate force push was missed.",
+      "description": "The workflow reached a state where an immediate force-push was required but a different action was taken first."
+    },
+    {
+      "name": "A synchronization status where local and remote histories have diverged.",
+      "description": "Both local and remote have commits the other does not; a simple fast-forward in either direction is impossible."
+    },
+    {
+      "name": "A synchronization status where local history is ahead of remote history.",
+      "description": "Local branch has commits not yet on the remote; a fast-forward push is possible."
+    },
+    {
+      "name": "A synchronization status where no rebase is needed (already synchronized).",
+      "description": "Local and remote tracking branch point at the same commit; no rebase or merge is necessary."
+    },
+    {
+      "name": "A workflow state in which an immediate force push is required.",
+      "description": "The workflow has entered the phase after a rebase where the next mandatory action is force-push."
+    },
+    {
+      "name": "All commits selected for rebase are local-only and unpublished.",
+      "description": "Every commit in the rebase range exists only in the local repository and has never been pushed."
+    },
+    {
+      "name": "An authorized/authenticated status allowing the guarded action.",
+      "description": "The current operation has passed authentication and authorisation checks for the guarded action."
+    },
+    {
+      "name": "Any new work must be attached to a named branch before commit or push workflows continue.",
+      "description": "The repository is in detached HEAD mode; new commits must first be attached to a branch ref."
+    },
+    {
+      "name": "Authentication credentials for remote write are valid.",
+      "description": "SSH key, HTTPS token, or other credential used for remote write operations is present and valid."
+    },
+    {
+      "name": "Branch histories are diverged and require reconciliation.",
+      "description": "Local and upstream have conflicting histories; a rebase or merge reconciliation step is required."
+    },
+    {
+      "name": "Changes targeting main are integrated only through reviewed merge or rebase workflows.",
+      "description": "No direct commits to main are allowed; all changes must arrive via a reviewed PR merge or rebase."
+    },
+    {
+      "name": "Detached HEAD contains commits that are not attached to any named branch.",
+      "description": "HEAD is detached and the detached commits are not reachable from any branch ref."
+    },
+    {
+      "name": "Local branch contains commits that are ahead of the remote tracking branch.",
+      "description": "git status reports 'ahead of origin/branch by N commits'; a push would add new commits to the remote."
+    },
+    {
+      "name": "Local history is ahead of the remote branch and has unpublished commits.",
+      "description": "There are commits in the local branch that have not been pushed to the remote tracking branch."
+    },
+    {
+      "name": "The action is executed under an approved protected-branch override policy.",
+      "description": "An explicit override policy (e.g. bypass allowlist) has been approved for the current action on a protected branch."
+    },
+    {
+      "name": "The actor is authenticated and authorized for force-push on the target branch.",
+      "description": "The actor has the required credentials and explicit authorisation to perform a force-push on this specific branch."
+    },
+    {
+      "name": "The branch is behind upstream or has local commits that must be replayed.",
+      "description": "The local branch either lags behind the remote or has commits that need to be replayed via rebase."
+    },
+    {
+      "name": "The branch returns to a clean synchronized state with no unpublished commit debt.",
+      "description": "After publishing, the local branch and remote tracking branch are identical with no pending commits."
+    },
+    {
+      "name": "The commit graph remains acyclic and does not introduce reference cycles.",
+      "description": "No commit is its own ancestor; the git DAG is free of cycles."
+    },
+    {
+      "name": "The current checked-out branch is main.",
+      "description": "HEAD resolves to refs/heads/main (or master depending on repository default)."
+    },
+    {
+      "name": "The current depth of pending git workflow operations in the processing queue exceeds 64.",
+      "description": "The internal workflow queue has accumulated more than 64 pending operations."
+    },
+    {
+      "name": "The number of retry attempts used by the workflow operation exceeds 3.",
+      "description": "The current operation has been retried more than 3 times without success."
+    },
+    {
+      "name": "The repository repeatedly returns to a clean synchronized state over time.",
+      "description": "Over the course of the workflow, the repository reaches a clean sync state multiple times."
+    },
+    {
+      "name": "The repository workflow state indicates that a force push is required before normal publishing can continue.",
+      "description": "The workflow flag for 'force-push required' is set; normal push is blocked until force-push completes."
+    },
+    {
+      "name": "The target remote reference is reachable and satisfies push preconditions.",
+      "description": "The remote ref exists, is reachable, and all push preconditions (credentials, permissions, fast-forward) are met."
+    },
+    {
+      "name": "The workflow repeatedly reaches a state with no unpublished local commit debt.",
+      "description": "The workflow repeatedly passes through states where the local branch has no unpublished commits."
+    },
+    {
+      "name": "Those detached commits are eventually anchored to a named branch reference.",
+      "description": "Commits made while in detached HEAD mode are eventually reachable from a named branch."
+    },
+    {
+      "name": "Updates to this branch must pass through a reviewed integration workflow.",
+      "description": "Branch protection requires all updates to arrive via a reviewed PR or integration pipeline."
+    }
+  ],
+  "transition_aps": [
+    {
+      "name": "(transition) A destructive history-rewrite action is executed.",
+      "description": "The action taken is a git operation that rewrites or removes existing commit history (e.g. reset --hard, rebase -i with drop, filter-branch)."
+    },
+    {
+      "name": "(transition) A direct commit action on the current branch (as modeled in this workflow).",
+      "description": "A 'git commit' is executed directly on the currently checked-out branch."
+    },
+    {
+      "name": "(transition) A force-push action is executed.",
+      "description": "A 'git push --force' or 'git push --force-with-lease' is executed (distinct from the bare label variant)."
+    },
+    {
+      "name": "(transition) A force-push action.",
+      "description": "The action label indicates a force-push step in the planned workflow trace."
+    },
+    {
+      "name": "(transition) A merge action.",
+      "description": "A 'git merge' is executed to combine two branch histories."
+    },
+    {
+      "name": "(transition) A mutating git action is dequeued for execution.",
+      "description": "A pending mutating operation (write/modify) is dequeued from the workflow operation queue."
+    },
+    {
+      "name": "(transition) A normal push action to the remote repository is executed.",
+      "description": "A 'git push' without force flags is executed (distinct from the bare label variant)."
+    },
+    {
+      "name": "(transition) A normal push action to the remote repository.",
+      "description": "The action label indicates a normal (non-force) push step in the planned workflow trace."
+    },
+    {
+      "name": "(transition) A public-history rewrite operation is executed.",
+      "description": "A rewrite of already-published (remote) commit history is executed, e.g. amending a pushed commit."
+    },
+    {
+      "name": "(transition) A rebase action fails due to branch divergence.",
+      "description": "A 'git rebase' invocation exits with a conflict or rejection error caused by branch divergence."
+    },
+    {
+      "name": "(transition) A rebase action is requested/started.",
+      "description": "A 'git rebase' command is initiated (may or may not complete successfully)."
+    },
+    {
+      "name": "(transition) A rebase action is successfully completed to resolve divergence.",
+      "description": "A 'git rebase' completes without conflict and resolves the divergence between local and remote."
+    },
+    {
+      "name": "(transition) A rebase action that rewrites commits already published to a remote repository.",
+      "description": "The rebase replays commits that were previously pushed; this constitutes a public history rewrite."
+    },
+    {
+      "name": "(transition) A rebase operation fails and leaves divergence unresolved.",
+      "description": "A rebase exits in a failed state (conflict, abort) and the branch remains diverged."
+    },
+    {
+      "name": "(transition) An immediate force-push action is executed to publish the rewritten history.",
+      "description": "After a rebase or reset, a force-push is executed immediately as the mandatory follow-up to publish the rewritten history."
+    },
+    {
+      "name": "(transition) Any push action to the remote repository is executed.",
+      "description": "Any push action (force or normal) to the remote is executed in this step."
+    }
+  ]
+}

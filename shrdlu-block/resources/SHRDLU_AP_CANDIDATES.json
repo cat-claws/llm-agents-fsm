@@ -1,0 +1,59 @@
+{
+  "metadata": {
+    "purpose": "Primitive atomic propositions for SHRDLU verification",
+    "design_rule": [
+      "Only keep simple boolean state facts.",
+      "Use names that follow simulator state fields closely.",
+      "Prefer grounded object relations over generic schema-like predicates.",
+      "Do not include action-history propositions.",
+      "Do not include combined or derived properties."
+    ],
+    "source_files": [
+      "shrdlu_blocks/scenes.py",
+      "shrdlu_blocks/control.py",
+      "shrdlu_blocks/env.py"
+    ]
+  },
+  "current_state_aps": [
+    {
+      "name": "some_object_resting_on_4",
+      "description": "There exists some object whose resting_on field is 4."
+    },
+    {
+      "name": "some_object_resting_on_8",
+      "description": "There exists some object whose resting_on field is 8."
+    },
+    {
+      "name": "some_object_resting_on_10",
+      "description": "There exists some object whose resting_on field is 10."
+    },
+    {
+      "name": "object_5_resting_on_2",
+      "description": "Object 5 has resting_on == 2."
+    },
+    {
+      "name": "object_4_resting_on_3",
+      "description": "Object 4 has resting_on == 3."
+    },
+    {
+      "name": "object_8_resting_on_7",
+      "description": "Object 8 has resting_on == 7."
+    },
+    {
+      "name": "object_10_resting_on_9",
+      "description": "Object 10 has resting_on == 9."
+    },
+    {
+      "name": "grasper_closed",
+      "description": "The world-state field grasper_closed is true."
+    },
+    {
+      "name": "grasper_lowered",
+      "description": "The world-state field grasper_lowered is true."
+    },
+    {
+      "name": "object_4_resting_on_6",
+      "description": "Object 4 has resting_on == 6."
+    }
+  ]
+}
