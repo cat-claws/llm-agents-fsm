@@ -10,9 +10,9 @@ agent domains:
 - `utils/`: shared session serialization, planning-tree helpers, and TLA+/TLC
   verification utilities.
 
-The Git scripts can be run directly from source. The unified launcher and
-SHRDLU entry points are intended to run from an editable install, which maps the
-`shrdlu_agents` import name to the `shrdlu-block/` source directory.
+The Git scripts can be run directly from source. The supported launch command is
+`run-agents`, installed by the editable setup below. The editable install also
+maps the `shrdlu_agents` import name to the `shrdlu-block/` source directory.
 
 ## Requirements
 
@@ -22,8 +22,8 @@ SHRDLU entry points are intended to run from an editable install, which maps the
 - Optional: Java plus `tla2tools.jar` for TLC verification. Set
   `TLA2TOOLS_JAR` to the jar path. If it is unavailable, the TLC runner reports
   verification as skipped.
-- Optional for SHRDLU FSM modes: the sibling `shrdlu_blocks` simulator
-  package on `PYTHONPATH`.
+- For SHRDLU agents: an already-running `shrdlu_blocks` simulator. If the
+  simulator package is not installed, keep its checkout on `PYTHONPATH`.
 
 Basic local setup:
 
@@ -65,18 +65,21 @@ For TLC-backed runs:
 export TLA2TOOLS_JAR=/path/to/tla2tools.jar
 ```
 
-## Unified Launcher
+## Launching Agents
 
-After `pip install -e`, `run-agents` covers the four canonical agents:
+After `pip install -e`, use `run-agents` to launch the four canonical agents:
 
 ```bash
+# Run these from the Git repository the agent should operate on.
 run-agents git-basic
 run-agents git-fsm
+
+# Run these with SHRDLU_SIMULATOR_URL pointing at a running simulator.
 run-agents shrdlu-reactive -- --trace-dir "$PWD/agent_traces"
 run-agents shrdlu-fsm -- --trace-dir "$PWD/agent_traces"
 ```
 
-Equivalent option form:
+The same four targets are available through option form:
 
 ```bash
 run-agents --domain git --agent basic
@@ -88,6 +91,7 @@ run-agents --domain shrdlu --agent fsm -- --trace-dir "$PWD/agent_traces"
 Use `run-agents --list` to print the supported targets. Arguments after `--`
 are passed through to the selected agent. `run_agents` with an underscore is
 installed as the same command for shells/scripts that prefer that spelling.
+No separate SHRDLU launcher command is installed.
 
 ## Git Agents
 
@@ -136,7 +140,7 @@ This checkout stores the SHRDLU source in `shrdlu-block/`. The editable install
 exposes that directory as the `shrdlu_agents` Python package. If the sibling
 simulator package is not installed, keep its checkout on `PYTHONPATH`.
 
-Then run one of the canonical agent strategies:
+Then run one of the canonical agent strategies through `run-agents`:
 
 ```bash
 export SHRDLU_SIMULATOR_URL=http://127.0.0.1:8000
@@ -205,6 +209,7 @@ git-system/
   resources/                Git atomic-proposition and property catalogs
 
 shrdlu-block/                 Installed as the shrdlu_agents package
+  __main__.py               Package module entry point
   shrdlu_agent_basic.py     Reactive/basic agent
   shrdlu_agent_fsm.py       Merged predictive plan/FSM agent
   property_verifier.py      SHRDLU property checks
