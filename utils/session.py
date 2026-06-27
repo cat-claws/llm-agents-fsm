@@ -13,28 +13,25 @@ Schema (version "1.0"):
   "agent":          "git-agent-fsm | git-agent | shrdlu-agent-fsm | shrdlu-reactive | ...",
   "model":          "gpt-4o-mini",
   "domain":         "git | shrdlu",
-  "work_dir":       "/path/to/cwd",          # git agents only
+  "work_dir":       "/path/to/cwd",
   "request":        "user query / goal",
   "status":         "finished | infeasible | error | max_steps",
   "final_message":  "...",
-  "properties": [                            # properties active for this session
+  "properties": [
     {"id": "prop.git.01", "natural_language": "..."}
   ],
-  "planning_config": { ... },               # agent-specific planning parameters
-  "planning_tree": {                        # see utils/planning_tree.py
+  "planning_config": { ... },
+  "planning_tree": {
     "mode":          "...",
-    "nodes":         [ ... ],               # all nodes in creation order
+    "nodes":         [ ... ],
     "feasible":      true,
     "accepted_plan": [{"label": "...", "tool": "...", "args": {}}],
-    # Each accepted node carries execution_step once executed:
-    # nodes[i].execution_step = {
-    #   "execution_step":   0,
-    #   "execution_result": "...",
-    #   # domain extras (shrdlu): ap_state, ap_changes,
-    #   #   tla_verification, observation_after
-    # }
+    "execution_step": {
+      "execution_step":   0,
+      "execution_result": "..."
+    }
   },
-  "llm_log": []   # optional: raw LLM call log for debugging
+  "llm_log": []
 }
 """
 from __future__ import annotations
@@ -44,18 +41,25 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# Re-export planning-tree helpers so callers only need to import from utils.session
-from utils.planning_tree import (  # noqa: F401
-    make_node             as make_planning_node,
+from utils.planning_tree import (
+    make_node as make_planning_node,
     make_verification,
     make_skipped_verification,
-    make_tree             as make_planning_tree,
+    make_tree as make_planning_tree,
+    make_action,
+    make_state_path_entry,
     set_node_outcome,
     add_child,
     annotate_node_executed,
     append_node,
+    find_node,
     mark_feasible,
     accepted_plan_from_nodes,
+    accepted_nodes,
+    accepted_nodes_by_depth,
+    mark_accepted_branch_backtracked,
+    build_tree_summary,
+    extract_property_ids_from_violations,
     make_attempt,
     NodeCounter,
 )

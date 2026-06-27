@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 __all__ = ['ACTIVE_PROPERTY_IDS', 'PROPERTY_FILE', 'TransitionPropertyVerifier']
@@ -146,11 +146,23 @@ class TransitionPropertyVerifier:
             return self._object_resting_on(state, 4, 6)
         raise ValueError('Unsupported atomic proposition: %s' % name)
 
-    def _evaluate_state_aps(self, state: Dict[str, object]) -> Dict[str, bool]:
+    def observe_ap(self, name: str, state: Dict[str, object]) -> bool:
+        """Return one AP truth value from a SHRDLU world-state snapshot."""
+        return bool(self._eval_ap(name, state))
+
+    def _evaluate_state_aps(
+        self,
+        state: Dict[str, object],
+        ap_names: Optional[Iterable[str]] = None,
+    ) -> Dict[str, bool]:
         values = {}
-        for spec in self._aps:
-            name = str(spec.get('name', ''))
-            values[name] = self._eval_ap(name, state)
+        names = (
+            [str(spec.get('name', '')) for spec in self._aps]
+            if ap_names is None
+            else list(ap_names)
+        )
+        for name in names:
+            values[name] = self.observe_ap(name, state)
         return values
 
     def _eval_property(self, prop_id: str, ap_trace: List[Dict[str, bool]]) -> bool:

@@ -29,7 +29,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 __all__ = [
     'PROPERTY_FILE',
@@ -44,10 +44,6 @@ _DEFAULT_BASE_URL = 'http://localhost:30000/v1'
 _DEFAULT_API_KEY = 'none'
 
 
-# ---------------------------------------------------------------------------
-# JSON loading helpers
-# ---------------------------------------------------------------------------
-
 def _load_properties(path: Path) -> List[Dict]:
     payload = json.loads(path.read_text(encoding='utf-8'))
     return list(payload['properties'])
@@ -57,10 +53,6 @@ def _load_ap_specs(path: Path) -> Tuple[List[Dict], List[Dict]]:
     payload = json.loads(path.read_text(encoding='utf-8'))
     return payload['current_state_aps'], payload['transition_aps']
 
-
-# ---------------------------------------------------------------------------
-# Shell evidence collection
-# ---------------------------------------------------------------------------
 
 def _run_commands(commands: List[str], repo_path: str) -> str:
     """Run each shell command in ``repo_path`` and concatenate stdout+stderr."""
@@ -83,10 +75,6 @@ def _run_commands(commands: List[str], repo_path: str) -> str:
         parts.append(f'$ {cmd}\n{out}')
     return '\n\n'.join(parts)
 
-
-# ---------------------------------------------------------------------------
-# LLM-based AP evaluation
-# ---------------------------------------------------------------------------
 
 def _ask_llm(ap_name: str, ap_description: str, evidence: str, client, model: str) -> bool:
     """Call the LLM to determine whether the AP holds given the shell evidence."""
@@ -117,14 +105,9 @@ def _ask_llm(ap_name: str, ap_description: str, evidence: str, client, model: st
         messages=messages,
     )
     raw = response.choices[0].message.content or ''
-    # Strip Qwen3 chain-of-thought <think>…</think> blocks before parsing.
     answer = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip().upper()
     return answer.startswith('T')
 
-
-# ---------------------------------------------------------------------------
-# AST evaluator
-# ---------------------------------------------------------------------------
 
 def _eval_ast(node: Dict, merged_aps: Dict[str, bool]) -> bool:
     """Recursively evaluate a single-step LTL AST node against a merged AP dict."""
@@ -191,10 +174,6 @@ def _eval_ast_trace(
     raise ValueError(f'Unsupported AST node type: {t!r}')
 
 
-# ---------------------------------------------------------------------------
-# Main verifier class
-# ---------------------------------------------------------------------------
-
 class TransitionPropertyVerifier:
     """Verify git-agent FSM properties against live repository state.
 
@@ -238,10 +217,6 @@ class TransitionPropertyVerifier:
             raise RuntimeError('No models reported by the server at the given base_url.')
         return models[0].id
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     @property
     def properties(self) -> List[Dict]:
         return list(self._properties)
@@ -254,17 +229,45 @@ class TransitionPropertyVerifier:
     def transition_aps(self) -> List[Dict]:
         return list(self._transition_aps)
 
-    def evaluate_state_aps(self) -> Dict[str, bool]:
+    @staticmethod
+    def _default_commands_for_ap(ap_name: str) -> List[str]:
+        del ap_name
+        return [
+            'git status --short --branch',
+            'git branch -vv',
+            'git log --oneline --decorate -20',
+            'git remote -v',
+        ]
+
+    def observe_ap(self, name: str) -> bool:
+        """Return one AP truth value from the current repository state."""
+        if name.startswith('(transition)'):
+            return False
+        spec = self._state_ap_by_name.get(name)
+        description = spec.get('description', '') if spec else name
+        commands = (
+            spec.get('git_commands', [])
+            if spec is not None
+            else self._default_commands_for_ap(name)
+        )
+        evidence = _run_commands(commands, self._repo_path) if commands else '(no commands defined)'
+        return _ask_llm(name, description, evidence, self._client, self._model)
+
+    def evaluate_state_aps(self, ap_names: Optional[Iterable[str]] = None) -> Dict[str, bool]:
         """Run git commands and call LLM to evaluate all state APs.
 
         Returns a mapping ``{ap_name: bool}`` for every state AP.
         """
         results: Dict[str, bool] = {}
-        for spec in self._state_aps:
-            name = spec['name']
-            commands = spec.get('git_commands', [])
-            evidence = _run_commands(commands, self._repo_path) if commands else '(no commands defined)'
-            results[name] = _ask_llm(name, spec.get('description', ''), evidence, self._client, self._model)
+        names = (
+            [spec['name'] for spec in self._state_aps]
+            if ap_names is None
+            else list(ap_names)
+        )
+        for name in names:
+            if name.startswith('(transition)'):
+                continue
+            results[name] = self.observe_ap(name)
         return results
 
     def verify_transition(
@@ -290,7 +293,6 @@ class TransitionPropertyVerifier:
         """
         if state_aps is None:
             state_aps = self.evaluate_state_aps()
-        # Transition APs not supplied by caller default to False (didn't happen).
         all_transition_aps = {a['name']: False for a in self._transition_aps}
         all_transition_aps.update(transition_aps)
         merged: Dict[str, bool] = {**state_aps, **all_transition_aps}
@@ -355,10 +357,6 @@ class TransitionPropertyVerifier:
         }
 
 
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-
 def main(argv=None) -> int:
     import argparse
 
@@ -391,7 +389,6 @@ def main(argv=None) -> int:
         flag = 'TRUE ' if value else 'FALSE'
         print(f'  {flag}  {name}')
 
-    # Evaluate properties with all transition APs false (observation-only mode).
     transition_aps: Dict[str, bool] = {}
     result = verifier.verify_transition(transition_aps, state_aps=state_aps)
 

@@ -11,40 +11,36 @@ from pathlib import Path
 from typing import Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from utils.planning_modes import (
+    normalize_planning_granularity,
+    normalize_violation_policy,
+    planning_preset_config,
+)
 
 _TARGETS = {
     'git-basic': ('git', 'basic'),
     'git-fsm': ('git', 'fsm'),
     'shrdlu-reactive': ('shrdlu', 'reactive'),
     'shrdlu-fsm': ('shrdlu', 'fsm'),
-    # Compatibility names for the old SHRDLU modes. These still route through
-    # the merged FSM implementation using the presets below.
-    'shrdlu-preplanned': ('shrdlu', 'preplanned'),
-    'shrdlu-predictive': ('shrdlu', 'predictive'),
-    'shrdlu-suffix': ('shrdlu', 'suffix'),
+    'shrdlu-plan': ('shrdlu', 'plan'),
+    'shrdlu-advisory': ('shrdlu', 'advisory'),
 }
 
 _CANONICAL_TARGETS = ('git-basic', 'git-fsm', 'shrdlu-reactive', 'shrdlu-fsm')
-_SHRDLU_ALIAS_TARGETS = ('shrdlu-preplanned', 'shrdlu-predictive', 'shrdlu-suffix')
-_SHRDLU_AGENT_ALIASES = {
-    'preplanned': 'fsm',
-    'predictive': 'fsm',
-    'suffix': 'fsm',
+_SHRDLU_PRESET_TARGETS = (
+    'shrdlu-plan',
+    'shrdlu-advisory',
+)
+_SHRDLU_FSM_PRESET_AGENTS = {
+    'advisory': 'fsm',
+    'plan': 'fsm',
 }
-_SHRDLU_ALIAS_PRESETS = {
-    'preplanned': {
-        'planning_granularity': 'batch',
-        'violation_policy': 'ignore',
-        'max_branch_retries': 1,
-    },
-    'predictive': {
-        'planning_granularity': 'step',
-        'violation_policy': 'retry',
-    },
-    'suffix': {
-        'planning_granularity': 'batch',
-        'violation_policy': 'retry',
-    },
+_SHRDLU_AGENT_PRESETS = {
+    'advisory': 'advisory',
+    'plan': 'plan',
 }
 
 
@@ -75,8 +71,14 @@ Equivalent option form:
     )
     parser.add_argument(
         '--agent',
-        choices=['basic', 'reactive', 'fsm', 'preplanned', 'predictive', 'suffix'],
-        help='agent mode; basic/reactive are aliases across domains',
+        choices=[
+            'advisory',
+            'basic',
+            'fsm',
+            'plan',
+            'reactive',
+        ],
+        help='agent mode',
     )
     parser.add_argument(
         '--list',
@@ -99,8 +101,8 @@ def _print_targets() -> None:
     for target in _CANONICAL_TARGETS:
         domain, agent = _TARGETS[target]
         print('  %-17s domain=%-6s agent=%s' % (target, domain, agent))
-    print('\nSHRDLU compatibility aliases:')
-    for target in _SHRDLU_ALIAS_TARGETS:
+    print('\nSHRDLU FSM preset targets:')
+    for target in _SHRDLU_PRESET_TARGETS:
         domain, agent = _TARGETS[target]
         print('  %-17s domain=%-6s preset=%s' % (target, domain, agent))
 
@@ -124,7 +126,7 @@ def _resolve_target(args: argparse.Namespace, parser: argparse.ArgumentParser) -
 
     if agent in {'basic', 'reactive'}:
         return 'shrdlu', 'reactive'
-    if agent in {'fsm', 'preplanned', 'predictive', 'suffix'}:
+    if agent in {'advisory', 'fsm', 'plan'}:
         return 'shrdlu', agent
 
     parser.error("unsupported domain/agent combination")
@@ -167,7 +169,7 @@ def _build_shrdlu_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--agent',
         default=os.environ.get('SHRDLU_AGENT_TYPE', 'fsm'),
-        help='agent strategy to run: reactive or fsm; legacy aliases preplanned, predictive, suffix are accepted',
+        help='agent strategy to run: reactive, fsm, plan, or advisory',
     )
     parser.add_argument(
         '--simulator-url',
@@ -211,11 +213,15 @@ def _build_shrdlu_parser() -> argparse.ArgumentParser:
         '--max-branch-retries',
         type=int,
         default=None,
-        help='planning retries per predictive branch',
+        help='planning retries per branch',
+    )
+    parser.add_argument(
+        '--preset',
+        default=os.environ.get('SHRDLU_AGENT_FSM_PRESET'),
+        help='FSM planning preset: fsm, plan, or advisory',
     )
     parser.add_argument(
         '--planning-granularity',
-        choices=['step', 'batch'],
         default=(
             os.environ.get('SHRDLU_AGENT_FSM_PLANNING_GRANULARITY')
             or os.environ.get('SHRDLU_AGENT_FSM_PLANNING')
@@ -224,12 +230,11 @@ def _build_shrdlu_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--violation-policy',
-        choices=['retry', 'ignore'],
         default=(
             os.environ.get('SHRDLU_AGENT_FSM_VIOLATION_POLICY')
             or os.environ.get('SHRDLU_AGENT_FSM_VIOLATIONS')
         ),
-        help='FSM property behavior: retry blocks/replans on violations; ignore records and continues',
+        help='FSM property behavior: retry blocks/replans; ignore/advisory record and continue',
     )
     parser.add_argument(
         '--result-dir',
@@ -253,13 +258,32 @@ def _build_shrdlu_parser() -> argparse.ArgumentParser:
 def _parse_shrdlu_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = _build_shrdlu_parser()
     args = parser.parse_args(argv)
-    args.agent_alias = args.agent
-    args.agent = _SHRDLU_AGENT_ALIASES.get(args.agent, args.agent)
+    args.requested_agent = args.agent
+    args.agent = _SHRDLU_FSM_PRESET_AGENTS.get(args.agent, args.agent)
     if args.agent not in {'reactive', 'fsm'}:
         parser.error(
-            '--agent must be one of fsm, preplanned, predictive, reactive, suffix; got %r'
-            % args.agent_alias
+            '--agent must be one of advisory, fsm, plan, reactive; got %r'
+            % args.requested_agent
         )
+    try:
+        if args.planning_granularity:
+            args.planning_granularity = normalize_planning_granularity(
+                args.planning_granularity,
+                invalid='raise',
+            )
+        if args.violation_policy:
+            args.violation_policy = normalize_violation_policy(
+                args.violation_policy,
+                invalid='raise',
+            )
+        if args.preset:
+            planning_preset_config(
+                args.preset,
+                retry_default=int(os.environ.get('SHRDLU_AGENT_MAX_BRANCH_RETRIES', '3')),
+                invalid='raise',
+            )
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.result_dir == '':
         args.result_dir = None
     return args
@@ -275,7 +299,7 @@ def _build_shrdlu_agent(args: argparse.Namespace):
         'fsm': FsmOpenAICompatibleShrdluAgent,
     }
     simulator = HttpSimulatorClient(args.simulator_url)
-    original_agent = getattr(args, 'agent_alias', args.agent)
+    requested_agent = getattr(args, 'requested_agent', args.agent)
     default_branch_retries = int(os.environ.get('SHRDLU_AGENT_MAX_BRANCH_RETRIES', '3'))
     kwargs = {
         'model': args.model,
@@ -287,47 +311,62 @@ def _build_shrdlu_agent(args: argparse.Namespace):
         'max_tokens': args.max_tokens,
     }
     if args.agent == 'fsm':
-        preset = _SHRDLU_ALIAS_PRESETS.get(original_agent, {})
+        preset_name = (
+            args.preset
+            or _SHRDLU_AGENT_PRESETS.get(requested_agent)
+            or 'fsm'
+        )
+        preset = planning_preset_config(
+            preset_name,
+            retry_default=default_branch_retries,
+            invalid='raise',
+        )
         kwargs['max_branch_retries'] = (
             args.max_branch_retries
             if args.max_branch_retries is not None
-            else preset.get('max_branch_retries', default_branch_retries)
+            else int(preset['max_retries'])
         )
         kwargs['planning_granularity'] = (
             args.planning_granularity
-            or preset.get('planning_granularity')
-            or 'batch'
+            or str(preset['planning_granularity'])
         )
         kwargs['violation_policy'] = (
             args.violation_policy
-            or preset.get('violation_policy')
-            or 'retry'
+            or str(preset['violation_policy'])
         )
     agent_obj = agent_types[args.agent](simulator, **kwargs)
     return agent_obj, simulator
 
 
 def _print_shrdlu_launch(args: argparse.Namespace) -> None:
-    label = args.agent if args.agent_alias == args.agent else '%s (alias for %s)' % (
-        args.agent_alias,
+    requested_agent = getattr(args, 'requested_agent', args.agent)
+    label = args.agent if requested_agent == args.agent else '%s (preset for %s)' % (
+        requested_agent,
         args.agent,
     )
     print('Agent type: %s' % label)
     if args.agent == 'fsm':
-        preset = _SHRDLU_ALIAS_PRESETS.get(args.agent_alias, {})
+        default_retries = int(os.environ.get('SHRDLU_AGENT_MAX_BRANCH_RETRIES', '3'))
+        preset_name = (
+            args.preset
+            or _SHRDLU_AGENT_PRESETS.get(requested_agent)
+            or 'fsm'
+        )
+        preset = planning_preset_config(
+            preset_name,
+            retry_default=default_retries,
+            invalid='raise',
+        )
         retries = (
             args.max_branch_retries
             if args.max_branch_retries is not None
-            else preset.get(
-                'max_branch_retries',
-                int(os.environ.get('SHRDLU_AGENT_MAX_BRANCH_RETRIES', '3')),
-            )
+            else int(preset['max_retries'])
         )
         print(
             'FSM config: planning=%s violations=%s retries=%d'
             % (
-                args.planning_granularity or preset.get('planning_granularity') or 'batch',
-                args.violation_policy or preset.get('violation_policy') or 'retry',
+                args.planning_granularity or str(preset['planning_granularity']),
+                args.violation_policy or str(preset['violation_policy']),
                 retries,
             )
         )

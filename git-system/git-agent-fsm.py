@@ -1,85 +1,90 @@
 #!/usr/bin/env python3
-"""
-git-agent-fsm — property-verified git agent.
+"""OpenAI-compatible FSM/planning agent for git repositories."""
 
-Code-driven phases:
-  Phase 0: Python — parse inputs (cwd, properties dir)
-  Phase 1: Python — load properties, extract + classify APs
-  Phase 3: LLM (prompt 3A) — select observation commands
-           LLM (prompt 3B) × N_APs — evaluate each AP → s0
-  Phase 4: loop until goal reached or retries exhausted:
-             LLM (prompt 4A) — propose next action
-             LLM (prompt 4B) — predict state_after for all APs
-             Python — write TLA+ spec
-             Python — run TLC
-             Python — parse PASS/FAIL, branch
-  Phase 5: Python — execute verified trace
-  Response: LLM (prompt 5) — success summary
-            LLM (prompt 7) — blocked explanation
-  Guard:    LLM (prompt 6) — out-of-scope check (runs first)
-"""
 from __future__ import annotations
 
-import datetime
+from datetime import datetime, timezone
 import json
 import os
-import random as _random
 import re
 import shlex
 import subprocess
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import openai
 
-# ── utils path ────────────────────────────────────────────────────────────────
+_SCRIPT_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 
-from utils.tla_verifier import (   # noqa: E402
-    build_tla_spec,
-    run_tlc,
-    load_properties as _load_properties_file,
-    has_liveness,
+from utils.planning_modes import (
+    NONBLOCKING_VIOLATION_POLICIES,
+    PLANNING_BATCH,
+    VIOLATION_IGNORE,
+    VIOLATION_RETRY,
+    normalize_planning_granularity,
+    normalize_violation_policy,
+    planning_preset_config,
+    property_guidance_text as _property_guidance_text,
+    property_policy_text as _property_policy_text,
 )
-from utils.session import (        # noqa: E402
-    make_session,
+from utils.property_catalog import (
+    aps_from_properties,
+    load_property_catalog,
+    observe_ap_values,
+    select_properties,
+)
+from utils.session import (
+    accepted_nodes,
+    accepted_plan_from_nodes,
+    annotate_node_executed,
+    append_node,
+    build_tree_summary,
+    make_action,
+    make_attempt,
     make_planning_node,
     make_planning_tree,
+    make_session,
+    make_state_path_entry,
     make_verification,
-    annotate_node_executed,
-    save_session as _save_session_util,
+    mark_accepted_branch_backtracked,
+    mark_feasible,
+)
+from utils.tla_verifier import (
+    build_tla_spec,
+    has_liveness,
+    run_tlc,
 )
 
-# ── constants ─────────────────────────────────────────────────────────────────
+from property_verifier import TransitionPropertyVerifier as GitPropertyVerifier
 
 DEFAULT_MODEL    = "gpt-4o-mini"
 MAX_PLAN_STEPS   = 10
 MAX_RETRIES      = 3
-MAX_OBS_ROUNDS   = 6    # tool-call rounds in phase 3A
 MAX_OUTPUT_CHARS = 4000
 CMD_TIMEOUT      = 20
 
-PLANNING_STEP  = "step"
-PLANNING_BATCH = "batch"
-VIOLATION_RETRY  = "retry"
-VIOLATION_IGNORE = "ignore"
-
 _RESOURCES_DIR      = Path(__file__).resolve().parent / "resources"
 _PROPERTIES_FILE    = _RESOURCES_DIR / "GIT_PROPERTIES_AST.json"
-_AP_CANDIDATES_FILE = _RESOURCES_DIR / "GIT_AP_CANDIDATES.json"
 
 WORK_DIR = Path.cwd().resolve()
+DEFAULT_RESULT_DIR = str(Path(__file__).resolve().parents[2] / "playground-llm-agents-fsm" / "results")
+_RESULT_DIR_ENV = os.environ.get("GIT_AGENT_FSM_RESULT_DIR")
+RESULT_DIR = None if _RESULT_DIR_ENV == "" else Path(_RESULT_DIR_ENV or DEFAULT_RESULT_DIR)
+_last_result_path: str | None = None
 
 
 @dataclass(frozen=True)
 class AgentConfig:
     """Runtime knobs that let the FSM cover both former plan and FSM modes."""
 
-    planning_granularity: str = PLANNING_STEP
+    planning_granularity: str = PLANNING_BATCH
     violation_policy: str = VIOLATION_RETRY
     max_plan_steps: int = MAX_PLAN_STEPS
     max_retries: int = MAX_RETRIES
@@ -95,50 +100,98 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _normalise_planning_granularity(value: str | None, default: str = PLANNING_STEP) -> str:
-    raw = (value or default).strip().lower()
-    if raw in {"batch", "multi", "multiple", "full", "plan"}:
-        return PLANNING_BATCH
-    if raw in {"step", "single", "one", "one_step", "fsm"}:
-        return PLANNING_STEP
-    return default
+def _normalize_planning_granularity(
+    value: str | None,
+    default: str = PLANNING_BATCH,
+    *,
+    invalid: Literal["default", "raise"] = "default",
+) -> str:
+    return normalize_planning_granularity(
+        value,
+        default=default,
+        invalid=invalid,
+    )
 
 
-def _normalise_violation_policy(value: str | None, default: str = VIOLATION_RETRY) -> str:
-    raw = (value or default).strip().lower()
-    if raw in {"ignore", "monitor", "continue", "plan"}:
-        return VIOLATION_IGNORE
-    if raw in {"retry", "stop", "fsm"}:
-        return VIOLATION_RETRY
-    return default
+def _normalize_violation_policy(
+    value: str | None,
+    default: str = VIOLATION_RETRY,
+    *,
+    invalid: Literal["default", "raise"] = "default",
+) -> str:
+    return normalize_violation_policy(value, default=default, invalid=invalid)
 
 
 def default_config_from_env() -> AgentConfig:
-    preset = os.environ.get("GIT_AGENT_FSM_PRESET", "fsm").strip().lower()
-    plan_like = preset in {"plan", "legacy-plan"}
-    default_granularity = PLANNING_BATCH if plan_like else PLANNING_STEP
-    default_policy = VIOLATION_IGNORE if plan_like else VIOLATION_RETRY
-    default_retries = 1 if plan_like else MAX_RETRIES
+    preset = planning_preset_config(
+        os.environ.get("GIT_AGENT_FSM_PRESET"),
+        retry_default=MAX_RETRIES,
+        invalid="raise",
+    )
+    default_granularity = str(preset["planning_granularity"])
+    default_policy = str(preset["violation_policy"])
+    default_retries = int(preset["max_retries"])
     return AgentConfig(
-        planning_granularity=_normalise_planning_granularity(
+        planning_granularity=_normalize_planning_granularity(
             os.environ.get("GIT_AGENT_FSM_PLANNING_GRANULARITY")
             or os.environ.get("GIT_AGENT_FSM_PLANNING"),
             default_granularity,
+            invalid="raise",
         ),
-        violation_policy=_normalise_violation_policy(
+        violation_policy=_normalize_violation_policy(
             os.environ.get("GIT_AGENT_FSM_VIOLATION_POLICY")
             or os.environ.get("GIT_AGENT_FSM_VIOLATIONS"),
             default_policy,
+            invalid="raise",
         ),
         max_plan_steps=_env_int("GIT_AGENT_FSM_MAX_PLAN_STEPS", MAX_PLAN_STEPS),
         max_retries=_env_int("GIT_AGENT_FSM_MAX_RETRIES", default_retries),
     )
 
 
-def _planning_mode_name(config: AgentConfig) -> str:
-    return f"{config.planning_granularity}_{config.violation_policy}"
+def _start_result_session(record: dict[str, Any]) -> str | None:
+    global _last_result_path
+    if RESULT_DIR is None:
+        return None
+    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    result_path = RESULT_DIR / ("result_%s.json" % timestamp)
+    record["_live"] = True
+    result_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    _last_result_path = str(result_path)
+    return _last_result_path
 
-# ── Phase 0: allowlists ───────────────────────────────────────────────────────
+
+def _checkpoint_result(record: dict[str, Any], result_path: str | None) -> str | None:
+    if not result_path:
+        return result_path
+    record["_live"] = True
+    Path(result_path).write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return result_path
+
+
+def _write_result(record: dict[str, Any], result_path: str | None = None) -> str | None:
+    global _last_result_path
+    if RESULT_DIR is None and not result_path:
+        return None
+    if result_path is None:
+        result_path = _start_result_session(record)
+    if not result_path:
+        return None
+    record.pop("_live", None)
+    Path(result_path).write_text(json.dumps(record, indent=2), encoding="utf-8")
+    _last_result_path = str(result_path)
+    return _last_result_path
+
+
+def _append_result_notice(message: str, result_path: str | None) -> str:
+    if not result_path:
+        return message
+    return message + "\n\nResult saved to %s" % result_path
+
+
+def last_result_path() -> str | None:
+    return _last_result_path
 
 ALLOWED_GIT = {
     "status", "log", "diff", "show", "branch", "checkout", "switch",
@@ -156,56 +209,13 @@ SHELL_BINS: dict[str, str] = {
 }
 _SHELL_NAMES = ", ".join(sorted(SHELL_BINS))
 
-# ── Phase 1: load properties + extract APs ───────────────────────────────────
+PROPERTY_SAMPLE_SIZE: int | None = None
 
-def _collect_aps_from_ast(node: Any, out: set[str]) -> None:
-    if isinstance(node, dict):
-        if node.get("type") == "ap":
-            out.add(node["name"])
-        for v in node.values():
-            _collect_aps_from_ast(v, out)
-    elif isinstance(node, list):
-        for v in node:
-            _collect_aps_from_ast(v, out)
+_ALL_PROPS: list[dict] = load_property_catalog(_PROPERTIES_FILE)
+PROPERTIES = select_properties(_ALL_PROPS, sample_size=PROPERTY_SAMPLE_SIZE)
 
-def _aps_from(props: list[dict]) -> tuple[list[str], list[str]]:
-    aps: set[str] = set()
-    for p in props:
-        _collect_aps_from_ast(p.get("ast", p), aps)
-    return (sorted(a for a in aps if not a.startswith("(transition)")),
-            sorted(a for a in aps if a.startswith("(transition)")))
-
-# How many properties to sample per session (set to None to use all)
-PROPERTY_SAMPLE_SIZE: int | None = 2
-
-_ALL_PROPS: list[dict] = _load_properties_file(_PROPERTIES_FILE)
-
-def _sample_properties(props: list[dict], n: int | None) -> list[dict]:
-    if n is None or n >= len(props):
-        return props
-    return _random.sample(props, n)
-
-PROPERTIES = _sample_properties(_ALL_PROPS, PROPERTY_SAMPLE_SIZE)
-
-STATE_APS, TRANS_APS = _aps_from(PROPERTIES)
+STATE_APS, TRANS_APS = aps_from_properties(PROPERTIES)
 ALL_APS = STATE_APS + TRANS_APS
-
-# AP catalog: name → description (for prompting the LLM during observation)
-def _load_ap_catalog(path: Path) -> dict[str, str]:
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        catalog: dict[str, str] = {}
-        for entry in raw.get("current_state_aps", []):
-            catalog[entry["name"]] = entry.get("description", "")
-        for entry in raw.get("transition_aps", []):
-            catalog[entry["name"]] = entry.get("description", "")
-        return catalog
-    except Exception:
-        return {}
-
-AP_CATALOG: dict[str, str] = _load_ap_catalog(_AP_CANDIDATES_FILE)
-
-# ── tool execution (Python, deterministic) ────────────────────────────────────
 
 def _clip(s: str) -> str:
     return s if len(s) <= MAX_OUTPUT_CHARS else s[:MAX_OUTPUT_CHARS] + "\n...[truncated]"
@@ -245,28 +255,9 @@ def tool_shell(command: str, args: list[str] | None = None) -> str:
 
 TOOL_IMPL = {"git_cmd": tool_git, "shell_cmd": tool_shell}
 
-TOOLS = [
-    {"type": "function", "function": {
-        "name": "git_cmd",
-        "description": "Run a read-only git subcommand.",
-        "parameters": {"type": "object",
-                       "properties": {"command": {"type": "string"}},
-                       "required": ["command"]}}},
-    {"type": "function", "function": {
-        "name": "shell_cmd",
-        "description": f"Run one of: {_SHELL_NAMES}.",
-        "parameters": {"type": "object",
-                       "properties": {
-                           "command": {"type": "string"},
-                           "args": {"type": "array", "items": {"type": "string"}}},
-                       "required": ["command"]}}},
-]
-
-# ── AP observability classification ──────────────────────────────────────────
 # These APs describe organizational/remote policies that have no local git
-# equivalent. They can never be determined from git commands alone, so they
-# default to FALSE (closed-world assumption). Prompt 3B is only called for
-# the remaining locally-observable APs.
+# equivalent. They are still observed for s0 through property_verifier, but
+# the planner does not try to predict their changes from local git actions.
 
 UNOBSERVABLE_APS: frozenset[str] = frozenset({
     "A maintainer-level role.",
@@ -288,8 +279,8 @@ UNOBSERVABLE_APS: frozenset[str] = frozenset({
 })
 
 # These APs are structural invariants guaranteed by git's object model or
-# desired liveness goals. They are always TRUE in a valid repository and
-# should never be used to block normal operations.
+# desired liveness goals. The planner does not try to predict their changes
+# from local git actions.
 ALWAYS_TRUE_APS: frozenset[str] = frozenset({
     "The commit graph remains acyclic and does not introduce reference cycles.",
     "The repository repeatedly returns to a clean synchronized state over time.",
@@ -300,9 +291,7 @@ ALWAYS_TRUE_APS: frozenset[str] = frozenset({
 OBSERVABLE_APS  = [ap for ap in ALL_APS
                    if ap not in UNOBSERVABLE_APS and ap not in ALWAYS_TRUE_APS]
 
-# ── LLM call logger ───────────────────────────────────────────────────────────
-
-_LLM_LOG: list[dict] = []   # accumulated across the entire query; reset per query
+_LLM_LOG: list[dict] = []
 
 def _llm_log_reset() -> None:
     _LLM_LOG.clear()
@@ -310,42 +299,45 @@ def _llm_log_reset() -> None:
 def _llm_log_snapshot() -> list[dict]:
     return list(_LLM_LOG)
 
-# ── OpenAI client ─────────────────────────────────────────────────────────────
-
 _CLIENT: openai.OpenAI | None = None
 
 def _get_client() -> openai.OpenAI:
     global _CLIENT
     if _CLIENT is None:
         _CLIENT = openai.OpenAI(
-            api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
             base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
         )
     return _CLIENT
 
-# ── LLM call helper ───────────────────────────────────────────────────────────
+def _make_git_property_verifier(model: str) -> GitPropertyVerifier:
+    return GitPropertyVerifier(
+        str(WORK_DIR),
+        model=model,
+        client=_get_client(),
+    )
 
 def _llm(messages: list[dict], model: str,
          tools: list | None = None, tag: str = "") -> tuple[str, list]:
-    client = _get_client()
     kwargs: dict[str, Any] = {"model": model, "messages": messages}
     if tools:
         kwargs["tools"] = tools
-    resp = client.chat.completions.create(**kwargs)
-    msg  = resp.choices[0].message
+    response = _get_client().chat.completions.create(**kwargs)
+    msg = response.choices[0].message
     content = (msg.content or "").strip()
 
-    # Normalise tool_calls to the same dict shape the rest of the code expects
-    raw_tcs = msg.tool_calls or []
     tool_calls = []
-    for tc in raw_tcs:
+    for tc in msg.tool_calls or []:
         try:
             arguments = json.loads(tc.function.arguments)
         except (json.JSONDecodeError, TypeError):
             arguments = {}
         tool_calls.append({
-            "id":       tc.id,
-            "function": {"name": tc.function.name, "arguments": arguments},
+            "id": tc.id,
+            "function": {
+                "name": tc.function.name,
+                "arguments": arguments,
+            },
         })
 
     _LLM_LOG.append({
@@ -365,8 +357,6 @@ def _extract_json(text: str) -> Any:
             pass
     return None
 
-# ── Prompt 6: guard — is this query in scope? ─────────────────────────────────
-
 PROMPT_6_SYSTEM = f"""\
 You are a scope guard for a git assistant agent.
 The agent can only handle: git repository operations and these shell commands: {_SHELL_NAMES}.
@@ -384,108 +374,18 @@ def prompt6_guard(query: str, model: str) -> tuple[bool, str]:
         return result["in_scope"], result.get("reason", "")
     return True, ""
 
-# ── Prompt 3A: choose the command to observe one AP ──────────────────────────
-# Input:  one AP string
-# Output: one tool call (git_cmd or shell_cmd) — no text
-
-PROMPT_3A_SYSTEM = f"""\
-You are selecting a single read-only git command to gather evidence for one atomic proposition.
-Working directory: {WORK_DIR}
-
-Call exactly ONE tool — the minimal read-only command that best reveals whether the proposition is true.
-Allowed git subcommands: status, log, branch, ls-files, remote, rev-parse, diff, show, stash, tag
-Allowed shell commands: {_SHELL_NAMES}
-No pipes, redirects, or write commands.
-
-Do NOT write any text. Call the tool immediately."""
-
-def prompt3a_choose_cmd(ap: str, model: str) -> tuple[str, str, str]:
-    """
-    Ask LLM to pick one read-only command for this AP.
-    Returns (fn, key, output) — fn is tool name, key is repr, output is stdout.
-    """
-    content, tool_calls = _llm([
-        {"role": "system", "content": PROMPT_3A_SYSTEM},
-        {"role": "user",   "content": f"Atomic proposition: {ap}"},
-    ], model, tools=TOOLS, tag="3A_choose_cmd")
-
-    if tool_calls:
-        tc   = tool_calls[0]
-        fn   = tc.get("function", {}).get("name", "")
-        args = tc.get("function", {}).get("arguments") or {}
-        impl = TOOL_IMPL.get(fn)
-        out  = impl(**args) if impl else f"[error] unknown tool {fn}"
-        key  = f"{fn}({json.dumps(args)})"
-        return fn, key, out
-
-    # Model returned text — fall back to git status
-    out = tool_git("status")
-    return "git_cmd", 'git_cmd({"command": "status"})', out
-
-# ── Prompt 3B: evaluate one AP from its command output ───────────────────────
-# Input:  one AP string + stdout of the chosen command
-# Output: {"value": true/false, "reason": "one sentence"}
-
-PROMPT_3B_SYSTEM = """\
-You are evaluating a single atomic proposition about a git repository.
-You are given the stdout of one git/shell command chosen specifically for this proposition.
-Decide TRUE or FALSE based solely on that output.
-
-Output ONLY valid JSON:
-{"value": true, "reason": "one sentence"}
-{"value": false, "reason": "one sentence"}
-If the output is insufficient, output {"value": false, "reason": "insufficient evidence"}."""
-
-def prompt3b_eval_ap(ap: str, cmd_key: str, cmd_out: str, model: str) -> tuple[bool, str]:
-    content, _ = _llm([
-        {"role": "system", "content": PROMPT_3B_SYSTEM},
-        {"role": "user",   "content":
-            f"Atomic proposition: {ap}\n\n"
-            f"Command output:\n$ {cmd_key}\n{cmd_out}"},
-    ], model, tag="3B_eval_ap")
-    result = _extract_json(content)
-    if isinstance(result, dict) and "value" in result:
-        return bool(result["value"]), result.get("reason", "")
-    return False, "parse error"
-
 def phase3_build_s0(model: str) -> dict[str, bool]:
     """
-    Phase 3: for each observable AP, choose a command (3A), run it with
-    output caching so identical commands are only executed once, then
-    evaluate the AP from the output (3B).
+    Phase 3: observe every AP extracted from the selected property ASTs.
     """
-    n_obs    = len(OBSERVABLE_APS)
-    n_unobs  = len(UNOBSERVABLE_APS & set(ALL_APS))
-    n_always = len(ALWAYS_TRUE_APS & set(ALL_APS))
-    print(f"  \033[36m[Phase 3] Evaluating {n_obs} observable APs "
-          f"({n_unobs} unobservable→FALSE, {n_always} invariant→TRUE)...\033[0m")
-
-    cmd_cache: dict[str, str] = {}   # key → output, avoids re-running identical commands
-
-    s0: dict[str, bool] = {}
+    print(f"  \033[36m[Phase 3] Observing {len(ALL_APS)} APs extracted from properties...\033[0m")
+    verifier = _make_git_property_verifier(model)
+    s0 = observe_ap_values(ALL_APS, verifier.observe_ap)
     for ap in ALL_APS:
-        if ap in UNOBSERVABLE_APS:
-            s0[ap] = False
-            print(f"    ✗ (unobservable) {ap[:70]}")
-        elif ap in ALWAYS_TRUE_APS:
-            s0[ap] = True
-            print(f"    ✓ (invariant)    {ap[:70]}")
-        else:
-            fn, key, out = prompt3a_choose_cmd(ap, model)
-            if key in cmd_cache:
-                out = cmd_cache[key]
-                print(f"    \033[2m→ {key}  [cached]\033[0m")
-            else:
-                cmd_cache[key] = out
-                print(f"    \033[2m→ {key}\033[0m")
-            val, reason = prompt3b_eval_ap(ap, key, out, model)
-            s0[ap] = val
-            mark = "✓" if val else "✗"
-            print(f"    {mark} {ap[:70]}  ({reason[:60]})")
-
+        val = s0[ap]
+        mark = "✓" if val else "✗"
+        print(f"    {mark} {ap[:70]}")
     return s0
-
-# ── Prompt 4A: propose next action ────────────────────────────────────────────
 
 PROMPT_4A_SYSTEM = f"""\
 You are proposing the next single git action toward a goal.
@@ -536,7 +436,9 @@ Output ONLY valid JSON:
 If the goal is already achieved, output {{"plan": [], "finish_response": "done"}}"""
 
 def prompt4a_propose(goal: str, s_current: dict[str, bool],
-                     trace: list[dict], tried: list[str], model: str) -> dict | None:
+                     trace: list[dict], tried: list[str], model: str,
+                     config: AgentConfig | None = None) -> dict | None:
+    config = config or default_config_from_env()
     done_steps = "\n".join(
         f"  {i+1}. {s['action_label']}: {s['tool']}({json.dumps(s['args'])})"
         for i, s in enumerate(trace)
@@ -547,6 +449,7 @@ def prompt4a_propose(goal: str, s_current: dict[str, bool],
         {"role": "user",   "content":
             f"Goal: {goal}\n\n"
             f"Steps done so far:\n{done_steps}\n\n"
+            f"{_property_prompt_block(config.violation_policy)}"
             f"Already tried at this step (rejected): {tried or 'none'}\n\n"
             f"What is the next action?"},
     ], model, tag="4A_propose")
@@ -574,8 +477,10 @@ def _normalise_proposal(item: Any) -> dict | None:
 
 def prompt4a_propose_batch(goal: str, s_current: dict[str, bool],
                            trace: list[dict], tried: list[str],
-                           max_actions: int, model: str) -> dict | None:
+                           max_actions: int, model: str,
+                           config: AgentConfig | None = None) -> dict | None:
     del s_current
+    config = config or default_config_from_env()
     done_steps = "\n".join(
         f"  {i+1}. {s['action_label']}: {s['tool']}({json.dumps(s['args'])})"
         for i, s in enumerate(trace)
@@ -586,6 +491,7 @@ def prompt4a_propose_batch(goal: str, s_current: dict[str, bool],
         {"role": "user",   "content":
             f"Goal: {goal}\n\n"
             f"Steps already accepted:\n{done_steps}\n\n"
+            f"{_property_prompt_block(config.violation_policy)}"
             f"Rejected first actions for this planning point: {tried or 'none'}\n\n"
             f"Return at most {max_actions} remaining action(s)."},
     ], model, tag="4A_propose_batch")
@@ -608,12 +514,6 @@ def prompt4a_propose_batch(goal: str, s_current: dict[str, bool],
         if proposal is not None:
             plan.append(proposal)
     return {"plan": plan, "finish_response": finish_response}
-
-# ── Prompt 4B: predict state_after ────────────────────────────────────────────
-
-# ── Prompt 4B: predict one AP's value after an action ────────────────────────
-# Input:  one AP string + its current value + action label + command
-# Output: {"value": true/false, "reason": "one sentence"}
 
 PROMPT_4B_SYSTEM = """\
 You are predicting the value of one atomic proposition after a git action completes.
@@ -650,17 +550,13 @@ def prompt4b_predict(action_label: str, tool: str, args: dict,
     """
     s_after = dict(s_current)
 
-    # State APs: only query ones currently TRUE (FALSE APs rarely flip on simple ops)
     for ap in OBSERVABLE_APS:
         if ap.startswith("(transition)"):
-            continue   # handled below
-        if s_current.get(ap, False):   # only TRUE APs need checking
+            continue
+        if s_current.get(ap, False):
             new_val, _ = prompt4b_predict_ap(ap, True, action_label, tool, args, model)
             s_after[ap] = new_val
 
-    # Transition APs: set TRUE by matching action_label keywords to AP type.
-    # Use explicit AP-type buckets to avoid substring false-positives
-    # (e.g. "commits" in a rebase AP must not match a "commit" action).
     def _label_is(label: str, *words: str) -> bool:
         return any(w in label.split("_") for w in words)
 
@@ -687,8 +583,6 @@ def prompt4b_predict(action_label: str, tool: str, args: dict,
     s_after["last_action"] = action_label
     return s_after
 
-# ── TLA+ spec + TLC (delegated to utils/tla_verifier) ────────────────────────
-
 def _run_verification(s0: dict[str, bool],
                       trace: list[dict]) -> tuple[bool, str, str]:
     """Build TLA+ spec for s0 + trace and run TLC.
@@ -710,7 +604,82 @@ def _run_verification(s0: dict[str, bool],
     summary = "; ".join(result.get("violations", [])) or result.get("reason", "")
     return passed, tla_spec, summary
 
-# ── Phase 4: plan loop ────────────────────────────────────────────────────────
+def _planning_action_from_step(step: dict) -> dict:
+    return make_action(
+        step.get("action_label"),
+        step.get("tool", "none"),
+        step.get("args") or {},
+    )
+
+
+def _property_prompt_block(policy: str) -> str:
+    if policy == VIOLATION_IGNORE:
+        return ""
+    return (
+        f"Property policy:\n{_property_policy_text(policy)}\n\n"
+        f"Properties to avoid violating:\n{_property_guidance_text(PROPERTIES, bullet=True)}\n\n"
+    )
+
+
+def _state_path_from_trace(trace: list[dict]) -> list[dict]:
+    return [
+        make_state_path_entry(
+            _planning_action_from_step(step),
+            step.get("state_after") or {},
+        )
+        for step in trace
+    ]
+
+
+def _append_finish_node(
+    planning_tree: dict,
+    *,
+    parent_node_id: int | None,
+    depth: int,
+    s_current: dict[str, bool],
+    trace: list[dict],
+    retry_index: int,
+    proposal: dict | None = None,
+) -> dict:
+    node_id = len(planning_tree["nodes"])
+    node = make_planning_node(
+        node_id=node_id,
+        parent_node_id=parent_node_id,
+        depth=depth,
+        state_before=dict(s_current),
+        state_path=_state_path_from_trace(trace),
+        action_label="goal_satisfied",
+        tool="none",
+        args={},
+        state_after=dict(s_current),
+        verification=make_verification(
+            passed=True,
+            properties_checked=[],
+            violations=["[skipped] goal already satisfied"],
+            skipped=True,
+        ),
+        attempts=[
+            make_attempt(
+                retry_index=retry_index,
+                accepted=True,
+                proposal=proposal or {
+                    "action_label": "goal_satisfied",
+                    "tool": "none",
+                    "args": {},
+                },
+                finish=True,
+            )
+        ],
+        result="finish",
+    )
+    node["outcome"] = {"finish_response": "goal already satisfied"}
+    append_node(planning_tree, node, link_parent=True)
+    return node
+
+
+def _mark_branch_backtracked(nodes: list[dict], failure: dict) -> None:
+    mark_accepted_branch_backtracked(nodes, failure)
+
 
 def _check_candidate(
     *,
@@ -718,11 +687,13 @@ def _check_candidate(
     s0: dict[str, bool],
     s_current: dict[str, bool],
     trace: list[dict],
-    planning_nodes: list[dict],
+    planning_tree: dict,
+    parent_node_id: int | None,
     depth: int,
+    retry_index: int,
     model: str,
     config: AgentConfig,
-) -> tuple[dict, dict[str, bool], bool, str]:
+) -> tuple[dict, dict[str, bool], bool, str, dict]:
     action_label = proposal.get("action_label", "unknown")
     tool = proposal.get("tool", "none")
     args = proposal.get("args") or {}
@@ -748,37 +719,78 @@ def _check_candidate(
         tla_spec=tla_spec,
     )
     node_result = "accepted" if passed else "rejected"
-    if not passed and config.violation_policy == VIOLATION_IGNORE:
+    if not passed and config.violation_policy in NONBLOCKING_VIOLATION_POLICIES:
         node_result = "accepted_with_ignored_violations"
+    failure_feedback = None
+    if not passed:
+        failure_feedback = {
+            "type": "tla_property_violation",
+            "violations": violations_list,
+        }
+    accepted_by_policy = passed or config.violation_policy in NONBLOCKING_VIOLATION_POLICIES
     node = make_planning_node(
-        node_id=len(planning_nodes),
-        parent_node_id=len(planning_nodes) - 1 if planning_nodes else None,
+        node_id=len(planning_tree["nodes"]),
+        parent_node_id=parent_node_id,
         depth=depth,
+        state_path=_state_path_from_trace(trace),
         action_label=action_label,
         tool=tool,
         args=args,
         state_before=dict(s_current),
         state_after=s_after,
         verification=verif,
+        attempts=[
+            make_attempt(
+                retry_index=retry_index,
+                accepted=accepted_by_policy,
+                proposal=proposal,
+                predicted_state_after=s_after,
+                verification=verif,
+                violation_policy=config.violation_policy,
+                failure_feedback=failure_feedback,
+                ignored_property_violation=(
+                    failure_feedback
+                    if failure_feedback is not None
+                    and config.violation_policy in NONBLOCKING_VIOLATION_POLICIES
+                    else None
+                ),
+            )
+        ],
         result=node_result,
     )
-    planning_nodes.append(node)
-    return candidate, s_after, passed, violations_str
+    append_node(planning_tree, node, link_parent=True)
+    return candidate, s_after, passed, violations_str, node
 
 
 def phase4_plan(goal: str, s0: dict[str, bool],
                 model: str,
-                config: AgentConfig | None = None) -> tuple[list[dict], list[dict], bool]:
+                config: AgentConfig | None = None,
+                planning_tree: dict | None = None,
+                result_record: dict[str, Any] | None = None,
+                result_path: str | None = None) -> tuple[list[dict], dict, bool]:
     """
-    Returns (trace, planning_nodes, feasible).
+    Returns (trace, planning_tree, feasible).
     trace         — accepted candidate dicts {action_label, tool, args, state_before, state_after}
-    planning_nodes — canonical planning-tree nodes in utils.session schema
+    planning_tree — canonical planning-tree dict in utils.session schema
     """
     config = config or default_config_from_env()
     trace: list[dict] = []
     s_current = dict(s0)
     tried_per_step: list[list[str]] = []
-    planning_nodes: list[dict] = []
+    planning_tree = planning_tree or make_planning_tree(
+        mode="%s_%s" % (config.planning_granularity, config.violation_policy),
+        max_steps=config.max_plan_steps,
+        max_retries=config.max_retries,
+        planning_granularity=config.planning_granularity,
+        violation_policy=config.violation_policy,
+        properties=PROPERTIES,
+        initial_state=s0,
+    )
+    current_parent_node_id: int | None = None
+
+    def checkpoint() -> None:
+        if result_record is not None:
+            _checkpoint_result(result_record, result_path)
 
     print(
         "\n\033[35m[Phase 4] Planning with TLC verification "
@@ -787,11 +799,26 @@ def phase4_plan(goal: str, s0: dict[str, bool],
     )
 
     if config.planning_granularity == PLANNING_BATCH:
-        return _phase4_plan_batch(goal, s0, model, config, trace, s_current, planning_nodes)
+        return _phase4_plan_batch(
+            goal,
+            s0,
+            model,
+            config,
+            trace,
+            s_current,
+            planning_tree,
+            current_parent_node_id,
+            result_record=result_record,
+            result_path=result_path,
+        )
 
-    goal_done = False   # set when LLM declares goal_satisfied; remaining steps are skipped
+    goal_done = False
     blocked = False
-    attempt_budget = max(1, config.max_retries) if config.violation_policy == VIOLATION_IGNORE else config.max_retries
+    attempt_budget = (
+        max(1, config.max_retries)
+        if config.violation_policy in NONBLOCKING_VIOLATION_POLICIES
+        else config.max_retries
+    )
 
     for step_idx in range(config.max_plan_steps):
         while len(tried_per_step) <= step_idx:
@@ -802,21 +829,25 @@ def phase4_plan(goal: str, s0: dict[str, bool],
             print(f"  [step {step_idx+1}] skipped (goal already satisfied)")
             continue
 
-        # Each attempt here represents one TLC-checked action; duplicate proposals
-        # and parse errors do not count against the budget.
         attempt = 0
-        proposal_misses = 0          # safety cap on consecutive non-TLC rounds
+        proposal_misses = 0
         MAX_PROPOSAL_MISSES = 6
         accepted_this_step = False
 
         while attempt < attempt_budget:
             if proposal_misses >= MAX_PROPOSAL_MISSES:
                 print(f"  [step {step_idx+1}] Too many repeated/invalid proposals — stopping")
+                planning_tree["failure"] = {
+                    "type": "proposal_exhausted",
+                    "depth": step_idx,
+                    "message": "Too many repeated or invalid proposals before verification.",
+                }
+                checkpoint()
                 blocked = True
                 break
 
             print(f"  [step {step_idx+1} attempt {attempt+1}] proposing action...")
-            proposal = prompt4a_propose(goal, s_current, trace, tried, model)
+            proposal = prompt4a_propose(goal, s_current, trace, tried, model, config)
             if proposal is None:
                 print(f"    4A parse error, skipping")
                 proposal_misses += 1
@@ -828,6 +859,16 @@ def phase4_plan(goal: str, s0: dict[str, bool],
 
             if action_label == "goal_satisfied":
                 print(f"  [step {step_idx+1}] Goal satisfied — remaining steps will be skipped")
+                _append_finish_node(
+                    planning_tree,
+                    parent_node_id=current_parent_node_id,
+                    depth=step_idx,
+                    s_current=s_current,
+                    trace=trace,
+                    retry_index=attempt,
+                    proposal=proposal,
+                )
+                checkpoint()
                 goal_done = True
                 accepted_this_step = True
                 break
@@ -837,28 +878,32 @@ def phase4_plan(goal: str, s0: dict[str, bool],
                 proposal_misses += 1
                 continue
 
-            proposal_misses = 0   # reset on a fresh action
+            proposal_misses = 0
             attempt += 1
-            candidate, s_after, passed, violations_str = _check_candidate(
+            candidate, s_after, passed, violations_str, node = _check_candidate(
                 proposal=proposal,
                 s0=s0,
                 s_current=s_current,
                 trace=trace,
-                planning_nodes=planning_nodes,
+                planning_tree=planning_tree,
+                parent_node_id=current_parent_node_id,
                 depth=step_idx,
+                retry_index=attempt - 1,
                 model=model,
                 config=config,
             )
+            checkpoint()
 
-            if passed or config.violation_policy == VIOLATION_IGNORE:
+            if passed or config.violation_policy in NONBLOCKING_VIOLATION_POLICIES:
                 if passed:
                     print(f"    \033[32mPASS\033[0m")
                 elif violations_str:
-                    print(f"    \033[33mIGNORED VIOLATION: {violations_str[:120]}\033[0m")
+                    print(f"    \033[33m{config.violation_policy.upper()} VIOLATION: {violations_str[:120]}\033[0m")
                 else:
-                    print(f"    \033[33mIGNORED VERIFICATION FAILURE\033[0m")
+                    print(f"    \033[33m{config.violation_policy.upper()} VERIFICATION FAILURE\033[0m")
                 trace.append(candidate)
                 s_current = s_after
+                current_parent_node_id = node["node_id"]
                 accepted_this_step = True
                 break
 
@@ -870,11 +915,18 @@ def phase4_plan(goal: str, s0: dict[str, bool],
             break
         if not accepted_this_step and not goal_done:
             print(f"  [step {step_idx+1}] Exhausted retries — blocking execution")
+            planning_tree["failure"] = {
+                "type": "max_retries",
+                "depth": step_idx,
+                "tried_actions": list(tried),
+                "message": "Exhausted action retries while planning this step.",
+            }
+            checkpoint()
             blocked = True
             break
 
     feasible = (goal_done or bool(trace)) and not blocked
-    return trace, planning_nodes, feasible
+    return trace, planning_tree, feasible
 
 
 def _phase4_plan_batch(
@@ -884,18 +936,30 @@ def _phase4_plan_batch(
     config: AgentConfig,
     trace: list[dict],
     s_current: dict[str, bool],
-    planning_nodes: list[dict],
-) -> tuple[list[dict], list[dict], bool]:
+    planning_tree: dict,
+    current_parent_node_id: int | None,
+    *,
+    result_record: dict[str, Any] | None = None,
+    result_path: str | None = None,
+) -> tuple[list[dict], dict, bool]:
     tried: list[str] = []
-    attempt_budget = max(1, config.max_retries) if config.violation_policy == VIOLATION_IGNORE else config.max_retries
+    attempt_budget = (
+        max(1, config.max_retries)
+        if config.violation_policy in NONBLOCKING_VIOLATION_POLICIES
+        else config.max_retries
+    )
+
+    def checkpoint() -> None:
+        if result_record is not None:
+            _checkpoint_result(result_record, result_path)
 
     for attempt in range(attempt_budget):
         remaining = config.max_plan_steps - len(trace)
         if remaining <= 0:
-            return trace, planning_nodes, bool(trace)
+            return trace, planning_tree, bool(trace)
 
         print(f"  [batch attempt {attempt+1}] proposing up to {remaining} action(s)...")
-        bundle = prompt4a_propose_batch(goal, s_current, trace, tried, remaining, model)
+        bundle = prompt4a_propose_batch(goal, s_current, trace, tried, remaining, model, config)
         if bundle is None:
             print("    4A batch parse error")
             continue
@@ -903,10 +967,27 @@ def _phase4_plan_batch(
         plan = bundle.get("plan", [])
         if not plan:
             print("  [batch] Goal satisfied or empty plan returned")
-            return trace, planning_nodes, True
+            _append_finish_node(
+                planning_tree,
+                parent_node_id=current_parent_node_id,
+                depth=len(trace),
+                s_current=s_current,
+                trace=trace,
+                retry_index=attempt,
+                proposal={
+                    "action_label": "goal_satisfied",
+                    "tool": "none",
+                    "args": {},
+                    "finish_response": bundle.get("finish_response", ""),
+                },
+            )
+            checkpoint()
+            return trace, planning_tree, True
 
         batch_trace = list(trace)
         batch_state = dict(s_current)
+        batch_parent_node_id = current_parent_node_id
+        batch_nodes: list[dict] = []
         batch_ok = True
         failed_label = ""
 
@@ -914,28 +995,43 @@ def _phase4_plan_batch(
             action_label = proposal.get("action_label", "unknown")
             if action_label == "goal_satisfied":
                 print("  [batch] Goal satisfied")
-                return batch_trace, planning_nodes, True
+                _append_finish_node(
+                    planning_tree,
+                    parent_node_id=batch_parent_node_id,
+                    depth=len(batch_trace),
+                    s_current=batch_state,
+                    trace=batch_trace,
+                    retry_index=attempt,
+                    proposal=proposal,
+                )
+                checkpoint()
+                return batch_trace, planning_tree, True
 
-            candidate, s_after, passed, violations_str = _check_candidate(
+            candidate, s_after, passed, violations_str, node = _check_candidate(
                 proposal=proposal,
                 s0=s0,
                 s_current=batch_state,
                 trace=batch_trace,
-                planning_nodes=planning_nodes,
+                planning_tree=planning_tree,
+                parent_node_id=batch_parent_node_id,
                 depth=len(batch_trace),
+                retry_index=attempt,
                 model=model,
                 config=config,
             )
+            batch_nodes.append(node)
+            checkpoint()
 
-            if passed or config.violation_policy == VIOLATION_IGNORE:
+            if passed or config.violation_policy in NONBLOCKING_VIOLATION_POLICIES:
                 if passed:
                     print(f"    \033[32mPASS\033[0m")
                 elif violations_str:
-                    print(f"    \033[33mIGNORED VIOLATION: {violations_str[:120]}\033[0m")
+                    print(f"    \033[33m{config.violation_policy.upper()} VIOLATION: {violations_str[:120]}\033[0m")
                 else:
-                    print(f"    \033[33mIGNORED VERIFICATION FAILURE\033[0m")
+                    print(f"    \033[33m{config.violation_policy.upper()} VERIFICATION FAILURE\033[0m")
                 batch_trace.append(candidate)
                 batch_state = s_after
+                batch_parent_node_id = node["node_id"]
                 continue
 
             if violations_str:
@@ -945,20 +1041,41 @@ def _phase4_plan_batch(
             break
 
         if batch_ok:
-            return batch_trace, planning_nodes, True
+            return batch_trace, planning_tree, True
 
         if failed_label:
             tried.append(failed_label)
+            _mark_branch_backtracked(
+                batch_nodes,
+                {
+                    "type": "batch_suffix_failed",
+                    "batch_attempt": attempt,
+                    "failed_action": failed_label,
+                    "message": "A later action in this batch failed verification.",
+                },
+            )
+            checkpoint()
 
     print("  [batch] Exhausted retries — blocking execution")
-    return trace, planning_nodes, False
+    planning_tree["failure"] = {
+        "type": "max_retries",
+        "tried_actions": list(tried),
+        "message": "Exhausted batch planning retries.",
+    }
+    checkpoint()
+    return trace, planning_tree, False
 
-# ── Phase 5: execute verified trace (Python) ──────────────────────────────────
-
-def phase5_execute(trace: list[dict]) -> list[str]:
+def phase5_execute(
+    trace: list[dict],
+    *,
+    planning_tree: dict | None = None,
+    result_record: dict[str, Any] | None = None,
+    result_path: str | None = None,
+) -> list[str]:
     results = []
     if not trace:
         return results
+    executed_nodes = accepted_nodes(planning_tree) if planning_tree is not None else []
 
     print(f"\n\033[35m[Phase 5] Executing {len(trace)} verified step(s):\033[0m")
     for i, step in enumerate(trace, 1):
@@ -967,24 +1084,30 @@ def phase5_execute(trace: list[dict]) -> list[str]:
         print(f"\n  \033[33m[exec {i}/{len(trace)}] {step['action_label']}: {tool}({json.dumps(args)})\033[0m")
 
         if tool == "none" or not args:
-            results.append("(no-op)")
-            continue
-
-        impl = TOOL_IMPL.get(tool)
-        if impl is None:
-            result = f"[error] unknown tool '{tool}'"
+            result = "(no-op)"
         else:
-            try:
-                result = impl(**args)
-            except Exception as e:
-                result = f"[error] {e}"
+            impl = TOOL_IMPL.get(tool)
+            if impl is None:
+                result = f"[error] unknown tool '{tool}'"
+            else:
+                try:
+                    result = impl(**args)
+                except Exception as e:
+                    result = f"[error] {e}"
 
-        print(f"  \033[2m{result}\033[0m")
+            print(f"  \033[2m{result}\033[0m")
         results.append(result)
+        node_index = i - 1
+        if node_index < len(executed_nodes):
+            annotate_node_executed(
+                executed_nodes[node_index],
+                execution_step=node_index,
+                execution_result=result,
+            )
+        if result_record is not None:
+            _checkpoint_result(result_record, result_path)
 
     return results
-
-# ── Prompt 5: success summary ─────────────────────────────────────────────────
 
 PROMPT_5_SYSTEM = """\
 You are summarising the result of a verified git workflow for the user.
@@ -1004,8 +1127,6 @@ def prompt5_summary(goal: str, trace: list[dict],
     ], model, tag="5_summary")
     return content
 
-# ── Prompt 7: blocked explanation ─────────────────────────────────────────────
-
 PROMPT_7_SYSTEM = """\
 You are explaining to a user why their git request could not be safely executed.
 The plan was blocked — either every candidate action violated a safety property,
@@ -1024,15 +1145,13 @@ def prompt7_blocked(goal: str, s0: dict[str, bool],
     ], model, tag="7_blocked")
     return content
 
-# ── top-level query handler ───────────────────────────────────────────────────
-
 def handle_query(goal: str, model: str,
                  config: AgentConfig | None = None) -> tuple[str, dict]:
     """Run one query. Returns (response_text, session_turn_dict)."""
     _llm_log_reset()
     config = config or default_config_from_env()
 
-    planning_mode = _planning_mode_name(config)
+    planning_mode = "%s_%s" % (config.planning_granularity, config.violation_policy)
     turn = make_session(
         agent="git-agent-fsm",
         model=model,
@@ -1056,44 +1175,52 @@ def handle_query(goal: str, model: str,
         violation_policy=config.violation_policy,
         properties=PROPERTIES,
     )
+    turn["status"] = "planning"
+    result_path = _start_result_session(turn)
 
-    # Prompt 6: guard
     in_scope, reason = prompt6_guard(goal, model)
     if not in_scope:
         response = f"Out of scope: {reason}"
         turn["status"]        = "out_of_scope"
         turn["final_message"] = response
         turn["llm_log"]       = _llm_log_snapshot()
-        return response, turn
+        turn["planning_tree"]["tree_summary"] = build_tree_summary(turn["planning_tree"])
+        result_path = _write_result(turn, result_path)
+        return _append_result_notice(response, result_path), turn
 
-    # Phase 3: observe s0
     print(f"\n\033[35m[Phase 3] Observing initial state s0...\033[0m")
     s0 = phase3_build_s0(model)
     turn["planning_tree"]["initial_state"] = s0
+    _checkpoint_result(turn, result_path)
 
-    # Phase 4: plan with TLC
-    trace, planning_nodes, feasible = phase4_plan(goal, s0, model, config)
-    turn["planning_tree"]["nodes"]         = planning_nodes
-    turn["planning_tree"]["feasible"]      = feasible
-    turn["planning_tree"]["accepted_plan"] = [
-        {"label": s["action_label"], "tool": s["tool"], "args": s["args"]}
-        for s in trace
-    ] if feasible else []
+    trace, planning_tree, feasible = phase4_plan(
+        goal,
+        s0,
+        model,
+        config,
+        planning_tree=turn["planning_tree"],
+        result_record=turn,
+        result_path=result_path,
+    )
+    if feasible:
+        mark_feasible(planning_tree, accepted_plan_from_nodes(planning_tree))
+    else:
+        planning_tree["feasible"] = False
+        planning_tree["accepted_plan"] = []
 
-    # Phase 5: execute
     executed_trace = trace if feasible else []
-    exec_results = phase5_execute(executed_trace) if feasible else []
-    # Annotate each accepted planning node with its execution outcome.
-    accepted_nodes = [n for n in planning_nodes if n.get("result") in ("accepted", "accepted_with_ignored_violations")]
-    accepted_nodes.sort(key=lambda n: n["depth"])
-    for i, node in enumerate(accepted_nodes):
-        annotate_node_executed(
-            node,
-            execution_step=i,
-            execution_result=exec_results[i] if i < len(exec_results) else "(no result)",
+    if feasible and executed_trace:
+        turn["status"] = "executing"
+        _checkpoint_result(turn, result_path)
+        exec_results = phase5_execute(
+            executed_trace,
+            planning_tree=planning_tree,
+            result_record=turn,
+            result_path=result_path,
         )
+    else:
+        exec_results = []
 
-    # Response
     if feasible:
         if trace:
             response = prompt5_summary(goal, trace, exec_results, model)
@@ -1103,41 +1230,51 @@ def handle_query(goal: str, model: str,
     else:
         tried_all = [
             n["action"]["label"]
-            for n in planning_nodes
+            for n in planning_tree["nodes"]
             if n.get("result") == "rejected"
         ]
         response   = prompt7_blocked(goal, s0, tried_all, model)
         turn["status"] = "infeasible"
 
+    planning_tree["tree_summary"] = build_tree_summary(planning_tree)
     turn["final_message"] = response
     turn["llm_log"]       = _llm_log_snapshot()
-    return response, turn
-
-# ── session save ──────────────────────────────────────────────────────────────
-
-SESSIONS_DIR = WORK_DIR / ".git-agent-sessions"
+    result_path = _write_result(turn, result_path)
+    return _append_result_notice(response, result_path), turn
 
 def save_session(turns: list[dict], model: str,
                  config: AgentConfig | None = None) -> Path:
+    """Compatibility wrapper: persist the latest turn using SHRDLU result files."""
     config = config or default_config_from_env()
-    session = make_session(
-        agent="git-agent-fsm",
-        model=model,
-        domain="git",
-        request="(multi-turn session)",
-        work_dir=str(WORK_DIR),
-        properties=PROPERTIES,
-    )
-    session["planning_config"] = {
-        "planning_granularity": config.planning_granularity,
-        "violation_policy": config.violation_policy,
-        "max_plan_steps": config.max_plan_steps,
-        "max_retries": config.max_retries,
-    }
-    session["turns"] = turns   # embed per-turn dicts for multi-turn sessions
-    return _save_session_util(session, SESSIONS_DIR, filename_prefix="session_fsm")
-
-# ── REPL ──────────────────────────────────────────────────────────────────────
+    latest_turn = turns[-1] if turns else None
+    planning_mode = "%s_%s" % (config.planning_granularity, config.violation_policy)
+    if latest_turn is not None:
+        session = dict(latest_turn)
+    else:
+        session = make_session(
+            agent="git-agent-fsm",
+            model=model,
+            domain="git",
+            request="(multi-turn session)",
+            work_dir=str(WORK_DIR),
+            properties=PROPERTIES,
+            planning_config={
+                "planning_mode": planning_mode,
+                "planning_granularity": config.planning_granularity,
+                "violation_policy": config.violation_policy,
+                "max_plan_steps": config.max_plan_steps,
+                "max_retries": config.max_retries,
+            },
+        )
+    if isinstance(session.get("planning_tree"), dict):
+        session["planning_tree"]["tree_summary"] = build_tree_summary(session["planning_tree"])
+    session["turn_count"] = len(turns)
+    session["latest_turn_index"] = len(turns) - 1 if turns else None
+    session["turns"] = turns
+    path = _write_result(session)
+    if path is None:
+        raise RuntimeError("Result saving is disabled")
+    return Path(path)
 
 HELP_TEXT = """\
 git-agent-fsm commands:
@@ -1145,9 +1282,9 @@ git-agent-fsm commands:
   /props         show property counts
   /model <name>  switch OpenAI model (current: {model})
   /config        show planning config
-  /preset <fsm|plan>
+  /preset <fsm|plan|advisory>
   /planning <step|batch>
-  /violations <retry|ignore>
+  /violations <retry|ignore|advisory>
   /retries <n>
   /cwd           show working directory
   /exit  /quit   exit
@@ -1163,7 +1300,6 @@ def _is_git_repo() -> bool:
 def repl() -> None:
     model   = DEFAULT_MODEL
     config  = default_config_from_env()
-    session_log: list[dict] = []
 
     in_repo     = _is_git_repo()
     repo_notice = "" if in_repo else "  \033[33m(not a git repo)\033[0m"
@@ -1182,18 +1318,12 @@ def repl() -> None:
         try:
             user_input = input("\033[1mYou>\033[0m ").strip()
         except (EOFError, KeyboardInterrupt):
-            if session_log:
-                path = save_session(session_log, model, config)
-                print(f"\nSession saved → {path}")
             print("\nBye.")
             return
 
         if not user_input:
             continue
         if user_input in ("/exit", "/quit"):
-            if session_log:
-                path = save_session(session_log, model, config)
-                print(f"Session saved → {path}")
             print("Bye.")
             return
         if user_input == "/help":
@@ -1219,23 +1349,21 @@ def repl() -> None:
         if user_input.startswith("/preset"):
             parts = user_input.split(maxsplit=1)
             preset = parts[1].strip().lower() if len(parts) == 2 else ""
-            if preset == "plan":
-                config = AgentConfig(
-                    planning_granularity=PLANNING_BATCH,
-                    violation_policy=VIOLATION_IGNORE,
-                    max_plan_steps=config.max_plan_steps,
-                    max_retries=1,
+            try:
+                preset_config = planning_preset_config(
+                    preset,
+                    retry_default=MAX_RETRIES,
+                    invalid="raise",
                 )
-            elif preset == "fsm":
-                config = AgentConfig(
-                    planning_granularity=PLANNING_STEP,
-                    violation_policy=VIOLATION_RETRY,
-                    max_plan_steps=config.max_plan_steps,
-                    max_retries=MAX_RETRIES,
-                )
-            else:
-                print("Usage: /preset <fsm|plan>\n")
+            except ValueError:
+                print("Usage: /preset <fsm|plan|advisory>\n")
                 continue
+            config = AgentConfig(
+                planning_granularity=str(preset_config["planning_granularity"]),
+                violation_policy=str(preset_config["violation_policy"]),
+                max_plan_steps=config.max_plan_steps,
+                max_retries=int(preset_config["max_retries"]),
+            )
             print(
                 "Planning: %s | violations=%s | retries=%d\n"
                 % (config.planning_granularity, config.violation_policy, config.max_retries)
@@ -1246,7 +1374,15 @@ def repl() -> None:
             if len(parts) != 2:
                 print(f"Planning: {config.planning_granularity}\n")
                 continue
-            planning = _normalise_planning_granularity(parts[1], config.planning_granularity)
+            try:
+                planning = _normalize_planning_granularity(
+                    parts[1],
+                    config.planning_granularity,
+                    invalid="raise",
+                )
+            except ValueError as exc:
+                print("%s\n" % exc)
+                continue
             config = replace(config, planning_granularity=planning)
             print(f"Planning: {config.planning_granularity}\n")
             continue
@@ -1255,7 +1391,15 @@ def repl() -> None:
             if len(parts) != 2:
                 print(f"Violations: {config.violation_policy}\n")
                 continue
-            policy = _normalise_violation_policy(parts[1], config.violation_policy)
+            try:
+                policy = _normalize_violation_policy(
+                    parts[1],
+                    config.violation_policy,
+                    invalid="raise",
+                )
+            except ValueError as exc:
+                print("%s\n" % exc)
+                continue
             config = replace(config, violation_policy=policy)
             print(f"Violations: {config.violation_policy}\n")
             continue
@@ -1292,7 +1436,6 @@ def repl() -> None:
             detail  = {"query": user_input, "response": answer, "llm_log": _llm_log_snapshot()}
 
         print(f"\n\033[1mAgent>\033[0m {answer}\n")
-        session_log.append(detail)
 
 if __name__ == "__main__":
     repl()

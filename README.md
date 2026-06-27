@@ -114,15 +114,13 @@ Variants:
 The merged FSM can emulate the old plan-first behavior by changing parameters:
 
 ```bash
-GIT_AGENT_FSM_PLANNING_GRANULARITY=batch \
-GIT_AGENT_FSM_VIOLATION_POLICY=ignore \
-GIT_AGENT_FSM_MAX_RETRIES=1 \
+GIT_AGENT_FSM_PRESET=plan \
 python3 /home/robot/llm-agents-fsm/git-system/git-agent-fsm.py
 ```
 
 Interactive commands include `/help`, `/model <name>`, `/config`,
-`/planning <step|batch>`, `/violations <retry|ignore>`, `/retries <n>`,
-and `/quit`.
+`/preset <fsm|plan|advisory>`, `/planning <step|batch>`,
+`/violations <retry|ignore|advisory>`, `/retries <n>`, and `/quit`.
 Saved sessions are written to `.git-agent-sessions/` in the target working
 directory.
 
@@ -152,32 +150,26 @@ run-agents shrdlu-reactive -- --result-dir "$PWD/results"
 run-agents shrdlu-fsm -- --result-dir "$PWD/results"
 ```
 
-The merged FSM exposes the old plan/FSM distinction as parameters:
+The merged FSM uses the same planning presets as the Git FSM:
 
 ```bash
 # FSM-style: plan a suffix and retry/backtrack on property violations.
 run-agents shrdlu-fsm -- \
-  --planning-granularity batch \
-  --violation-policy retry \
+  --preset fsm \
   --max-branch-retries 3
 
 # Plan-style: plan a suffix, record property violations, and continue.
 run-agents shrdlu-fsm -- \
-  --planning-granularity batch \
-  --violation-policy ignore \
-  --max-branch-retries 1
+  --preset plan
 
-# Stepwise planning with FSM retry behavior.
+# Advisory-style: tell the planner about properties, record violations, and continue.
 run-agents shrdlu-fsm -- \
-  --planning-granularity step \
-  --violation-policy retry
+  --preset advisory
+
 ```
 
-Legacy `--agent preplanned`, `--agent predictive`, and `--agent suffix` names
-are accepted by the SHRDLU launcher as aliases for `--agent fsm` with matching
-parameter presets. The unified launcher also exposes these as
-`run-agents shrdlu-preplanned`, `run-agents shrdlu-predictive`, and
-`run-agents shrdlu-suffix`.
+The unified launcher also exposes these as `run-agents shrdlu-plan` and
+`run-agents shrdlu-advisory`.
 
 Runtime controls:
 
@@ -194,7 +186,7 @@ export SHRDLU_OPENAI_MAX_TOKENS=512
 export SHRDLU_AGENT_MAX_STEPS=50
 export SHRDLU_AGENT_MAX_BRANCH_RETRIES=3
 export SHRDLU_AGENT_FSM_PLANNING_GRANULARITY=batch
-export SHRDLU_AGENT_FSM_VIOLATION_POLICY=retry
+export SHRDLU_AGENT_FSM_VIOLATION_POLICY=retry  # retry | ignore | advisory
 export SHRDLU_AGENT_RESULT_DIR=/path/to/results
 ```
 
@@ -211,7 +203,7 @@ git-system/
 shrdlu-block/                 Installed as the shrdlu_agents package
   __main__.py               Package module entry point
   shrdlu_agent_basic.py     Reactive/basic agent
-  shrdlu_agent_fsm.py       Merged predictive plan/FSM agent
+  shrdlu_agent_fsm.py       Merged planning/FSM agent
   property_verifier.py      SHRDLU property checks
   resources/                SHRDLU atomic-proposition and property catalogs
 

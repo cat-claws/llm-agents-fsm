@@ -1,30 +1,50 @@
 """OpenAI-compatible merged FSM/planning agents for the SHRDLU blocks environment."""
 
+from __future__ import annotations
+
 import copy
 import json
 import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-from utils.session import (  # noqa: E402
-    SCHEMA_VERSION,
-    make_session,
-    make_planning_tree,
-    make_planning_node,
-    set_node_outcome,
-    add_child,
-    annotate_node_executed,
-    make_verification,
-    make_skipped_verification,
-    save_session as _save_session,
+
+from utils.planning_modes import (
+    NONBLOCKING_VIOLATION_POLICIES,
+    PLANNING_BATCH,
+    PLANNING_STEP,
+    VIOLATION_IGNORE,
+    VIOLATION_RETRY,
+    normalize_planning_granularity,
+    normalize_violation_policy,
+    property_guidance_text as _property_guidance_text,
+    property_policy_text as _shared_property_policy_text,
 )
-from utils.tla_verifier import (  # noqa: E402
-    load_properties,
+from utils.property_catalog import (
+    aps_from_properties,
+    load_property_catalog,
+    observe_ap_values,
+)
+from utils.session import (
+    accepted_nodes_by_depth,
+    annotate_node_executed,
+    append_node,
+    build_tree_summary,
+    extract_property_ids_from_violations,
+    make_action,
+    make_planning_node,
+    make_planning_tree,
+    make_session,
+    make_state_path_entry,
+    make_verification,
+    set_node_outcome,
+)
+from utils.tla_verifier import (
     verify_ap_trace as _verify_tla_ap_trace,
 )
 
@@ -38,27 +58,16 @@ from shrdlu_agents.shrdlu_agent_basic import (
     PLAN_SCHEMA,
 )
 from shrdlu_agents.simulator_api import ALLOWED_SIMULATOR_ACTION_NAMES, SimulatorAPI
-from shrdlu_agents.property_verifier import ACTIVE_PROPERTY_IDS, TransitionPropertyVerifier
 from shrdlu_blocks.simulator.state_pred import predict_world_state_after_actions
 
-_AP_CANDIDATES: List[Dict[str, str]] = TransitionPropertyVerifier.from_file().aps
-_AP_NAMES: List[str] = [ap['name'] for ap in _AP_CANDIDATES]
 _TLA_PROPERTIES_FILE = Path(__file__).resolve().parent / 'resources' / 'SHRDLU_PROPERTIES_AST.json'
-_ACTIVE_TLA_PROPERTY_IDS = set(ACTIVE_PROPERTY_IDS)
-_TLA_PROPERTIES = [
-    prop
-    for prop in load_properties(_TLA_PROPERTIES_FILE)
-    if prop.get('id') in _ACTIVE_TLA_PROPERTY_IDS
-]
+_TLA_PROPERTIES = load_property_catalog(_TLA_PROPERTIES_FILE)
+_STATE_AP_NAMES, _TRANSITION_AP_NAMES = aps_from_properties(_TLA_PROPERTIES)
+_AP_NAMES: List[str] = _STATE_AP_NAMES + _TRANSITION_AP_NAMES
 
 __all__ = [
     'FsmOpenAICompatibleShrdluAgent',
 ]
-
-PLANNING_STEP = 'step'
-PLANNING_BATCH = 'batch'
-VIOLATION_RETRY = 'retry'
-VIOLATION_IGNORE = 'ignore'
 
 
 def _verify_ap_trace(
@@ -79,24 +88,26 @@ def _verify_ap_trace(
     )
 
 
-def _normalise_planning_granularity(value: Optional[str]) -> str:
-    raw = (value or PLANNING_BATCH).strip().lower()
-    if raw in {'step', 'single', 'one', 'one_step', 'predictive'}:
-        return PLANNING_STEP
-    if raw in {'batch', 'suffix', 'multi', 'multiple', 'full', 'plan', 'fsm'}:
-        return PLANNING_BATCH
-    raise ValueError(
-        "planning_granularity must be 'step' or 'batch', got %r" % value
+def _normalize_planning_granularity(
+    value: str | None,
+    default: str = PLANNING_BATCH,
+    *,
+    invalid: Literal["default", "raise"] = "raise",
+) -> str:
+    return normalize_planning_granularity(
+        value,
+        default=default,
+        invalid=invalid,
     )
 
 
-def _normalise_violation_policy(value: Optional[str]) -> str:
-    raw = (value or VIOLATION_RETRY).strip().lower()
-    if raw in {'retry', 'stop', 'fsm'}:
-        return VIOLATION_RETRY
-    if raw in {'ignore', 'monitor', 'continue', 'plan'}:
-        return VIOLATION_IGNORE
-    raise ValueError("violation_policy must be 'retry' or 'ignore', got %r" % value)
+def _normalize_violation_policy(
+    value: str | None,
+    default: str = VIOLATION_RETRY,
+    *,
+    invalid: Literal["default", "raise"] = "raise",
+) -> str:
+    return normalize_violation_policy(value, default=default, invalid=invalid)
 
 
 BATCH_PLAN_SYSTEM_PROMPT = """You are planning a SHRDLU blocks-world task before execution.
@@ -147,11 +158,7 @@ Structured planning state summary:
 Accepted action trace so far:
 {accepted_trace_json}
 
-Property policy:
-{property_policy}
-
-Properties:
-{property_text}
+{property_section}
 
 Allowed primitive actions:
 {action_help}
@@ -283,7 +290,7 @@ AP_STATE_SCHEMA = {
 class _FsmShrdluAgentMixin:
     """Plan before execution with configurable granularity and property policy."""
 
-    def _init_predictive_preplanned(self, max_branch_retries: int = 3):
+    def _init_fsm_planner(self, max_branch_retries: int = 3):
         self._max_branch_retries = int(max_branch_retries)
         self._property_text = self._build_property_text()
 
@@ -630,22 +637,28 @@ class _FsmShrdluAgentMixin:
         return matches
 
     def _build_property_text(self) -> str:
-        lines = []
-        for item in self._property_verifier.properties:
-            lines.append('%s: %s' % (item.get('id'), item.get('natural_language')))
-        return '\n'.join(lines)
+        return _property_guidance_text(_TLA_PROPERTIES)
+
+    def _property_monitoring_metadata(self) -> Dict[str, object]:
+        return {
+            'enabled': True,
+            'property_file': str(_TLA_PROPERTIES_FILE),
+            'property_count': len(_TLA_PROPERTIES),
+            'ap_source': 'properties_ast',
+            'ap_count': len(_AP_NAMES),
+        }
 
     def _run_agent_loop(self, request: str) -> str:
         initial_world_state = self._env.snapshot()
         initial_state = self._build_initial_ap_state(initial_world_state)
-        planning_mode = 'fsm_%s_%s' % (self._planning_granularity, self._violation_policy)
+        planning_mode = "%s_%s" % (self._planning_granularity, self._violation_policy)
         action_help = self._env.action_help()
         trace = make_session(
             agent='shrdlu-agent-fsm',
             model=self._model,
             domain='shrdlu',
             request=request,
-            properties=self._property_verifier.properties,
+            properties=_TLA_PROPERTIES,
             planning_config={
                 'host': self._host,
                 'planning_mode': planning_mode,
@@ -662,7 +675,7 @@ class _FsmShrdluAgentMixin:
             max_branch_retries=self._max_branch_retries,
             planning_granularity=self._planning_granularity,
             violation_policy=self._violation_policy,
-            properties=self._property_verifier.properties,
+            properties=_TLA_PROPERTIES,
             initial_state=initial_state,
             initial_world_state=initial_world_state,
             action_help=action_help,
@@ -732,12 +745,10 @@ class _FsmShrdluAgentMixin:
 
         executed_ap_trace = [initial_state]
         trace['status'] = 'executing'
-        # Index accepted nodes by depth so each execution step can annotate its node.
-        accepted_nodes_by_depth = {
-            node['depth']: node
-            for node in trace['planning_tree']['nodes']
-            if node.get('result') in ('accepted', 'finish')
-        }
+        accepted_by_depth = accepted_nodes_by_depth(
+            trace['planning_tree'],
+            include_finish=True,
+        )
         self._checkpoint_result(trace, result_path)
         for step_index, action in enumerate(plan):
             try:
@@ -748,7 +759,7 @@ class _FsmShrdluAgentMixin:
             ap_state = self._build_initial_ap_state(post_state)
             executed_ap_trace.append(ap_state)
             tla_result = _verify_ap_trace(executed_ap_trace, _AP_NAMES)
-            node = accepted_nodes_by_depth.get(step_index)
+            node = accepted_by_depth.get(step_index)
             if node is not None:
                 annotate_node_executed(
                     node,
@@ -844,13 +855,11 @@ class _FsmShrdluAgentMixin:
             state_before=copy.deepcopy(current_state),
             state_path=self._zip_accepted_steps(accepted_trace, preceding_ap_trace),
         )
-        planning_tree['nodes'].append(node)
+        append_node(planning_tree, node, link_parent=True)
         self._checkpoint_result(trace, result_path)
 
         failed_attempts = list(inherited_failures)
-        # Track first actions already tried at this node to avoid same-sibling repeats.
         banned_first_actions: List[Dict[str, object]] = []
-        # The hint from the parent; reused for the first child attempt only.
         current_hint = list(hint_plan) if hint_plan and self._planning_granularity == PLANNING_BATCH else []
 
         for child_index in range(self._max_branch_retries):
@@ -924,7 +933,6 @@ class _FsmShrdluAgentMixin:
                 plan_bundle = dict(plan_bundle)
                 plan_bundle['plan'] = plan_bundle['plan'][:1]
 
-            # Empty plan — LLM says goal already satisfied at this state.
             if not plan_bundle['plan']:
                 attempt_trace['accepted'] = True
                 attempt_trace['finish'] = True
@@ -939,11 +947,9 @@ class _FsmShrdluAgentMixin:
                     'node_id': node_id,
                 }
 
-            # Take only the first action from the proposed plan for this node.
             action = plan_bundle['plan'][0]
             tail = plan_bundle['plan'][1:] if self._planning_granularity == PLANNING_BATCH else []
 
-            # Verify this single action via AP prediction + TLC.
             step_verification = self._verify_single_step(
                 action=action,
                 current_state=current_state,
@@ -957,13 +963,13 @@ class _FsmShrdluAgentMixin:
 
             if not step_verification['passed']:
                 failure = step_verification['failure']
-                can_ignore = (
-                    self._violation_policy == VIOLATION_IGNORE
+                can_continue = (
+                    self._violation_policy in NONBLOCKING_VIOLATION_POLICIES
                     and isinstance(failure, dict)
                     and failure.get('type') == 'tla_property_violation'
                     and step_verification.get('predicted_ap_state') is not None
                 )
-                if can_ignore:
+                if can_continue:
                     attempt_trace['ignored_property_violation'] = failure
                     step_verification['ignored_by_policy'] = True
                 else:
@@ -976,9 +982,6 @@ class _FsmShrdluAgentMixin:
                     current_hint = []
                     continue
 
-            # This action passes, or a property violation is being monitored
-            # and ignored by policy — recurse into the child node for the next
-            # step unless batch mode has reached the end of its suffix.
             predicted_ap_state = step_verification['predicted_ap_state']
             new_preceding_ap_trace = preceding_ap_trace + [predicted_ap_state]
 
@@ -991,9 +994,14 @@ class _FsmShrdluAgentMixin:
                     properties_checked=tlc.get('properties_checked', []),
                     violations=tlc.get('tlc_result', {}).get('violations', []),
                 )
+                node_result = (
+                    'accepted_with_ignored_violations'
+                    if step_verification.get('ignored_by_policy')
+                    else 'accepted'
+                )
                 set_node_outcome(
                     node,
-                    result='accepted',
+                    result=node_result,
                     action_label=action.get('name', 'unknown'),
                     tool='simulator_action',
                     args=action.get('args', {}),
@@ -1026,8 +1034,6 @@ class _FsmShrdluAgentMixin:
                 result_path=result_path,
             )
             attempt_trace['child_node_id'] = child_result.get('node_id')
-            if child_result.get('node_id') is not None:
-                add_child(node, child_result['node_id'])
             node['attempts'].append(attempt_trace)
             self._checkpoint_result(trace, result_path)
 
@@ -1039,9 +1045,14 @@ class _FsmShrdluAgentMixin:
                     properties_checked=tlc.get('properties_checked', []),
                     violations=tlc.get('tlc_result', {}).get('violations', []),
                 )
+                node_result = (
+                    'accepted_with_ignored_violations'
+                    if step_verification.get('ignored_by_policy')
+                    else 'accepted'
+                )
                 set_node_outcome(
                     node,
-                    result='accepted',
+                    result=node_result,
                     action_label=action.get('name', 'unknown'),
                     tool='simulator_action',
                     args=action.get('args', {}),
@@ -1186,16 +1197,12 @@ class _FsmShrdluAgentMixin:
             )
         return 'Return the complete remaining action sequence from the current state to goal completion.'
 
-    def _property_policy_text(self) -> str:
+    def _property_prompt_section(self) -> str:
         if self._violation_policy == VIOLATION_IGNORE:
-            return (
-                'Property checks are monitor-only in this run: record violations, '
-                'but continue to the next planned step instead of retrying solely '
-                'because of a property violation.'
-            )
-        return (
-            'Property checks are blocking in this run: if a candidate violates a '
-            'property, stop that branch and retry with a different candidate.'
+            return ''
+        return 'Property policy:\n%s\n\nProperties:\n%s\n' % (
+            _shared_property_policy_text(self._violation_policy),
+            self._property_text,
         )
 
     def _build_plan_prompt(
@@ -1220,8 +1227,7 @@ class _FsmShrdluAgentMixin:
                 request=request,
             ),
             accepted_trace_json=self._json_or_none(accepted_trace),
-            property_policy=self._property_policy_text(),
-            property_text=self._property_text,
+            property_section=self._property_prompt_section(),
             action_help=action_help,
             plan_instruction=self._plan_instruction(),
             failed_attempts_json=self._json_or_none(failed_attempts[-5:]) if failed_attempts else 'None',
@@ -1237,7 +1243,7 @@ class _FsmShrdluAgentMixin:
         accepted_trace: List[Dict[str, object]],
     ) -> str:
         ap_catalog_text = '\n'.join(
-            self._ap_formula(ap['name']) for ap in _AP_CANDIDATES
+            self._ap_formula(name) for name in _AP_NAMES
         )
         return AP_STATE_PREDICTION_PROMPT_TEMPLATE.format(
             init_world_state_json=self._snapshot_json(init_world_state),
@@ -1327,65 +1333,7 @@ class _FsmShrdluAgentMixin:
 
     @staticmethod
     def _build_tree_summary(planning_tree: Dict[str, object]) -> List[Dict[str, object]]:
-        """Build a compact per-node summary for quick tree inspection.
-
-        Each entry contains only the fields needed to understand tree shape,
-        branching, depth, and which properties were violated where.
-        The full detail stays in planning_tree['nodes'].
-        """
-        # TLC replaces dots with underscores: prop.foo_bar → Property_prop_foo_bar.
-        # Match the underscored form and restore the first underscore to a dot.
-        prop_short = re.compile(r'Property_(prop_[^\s]+?)(?:\s|$|\.)')
-
-        def extract_props(violations: list) -> List[str]:
-            props = []
-            for v in violations:
-                for m in prop_short.finditer(str(v)):
-                    # Convert first underscore back to dot: prop_foo → prop.foo
-                    raw = m.group(1)
-                    restored = raw.replace('_', '.', 1)
-                    props.append(restored)
-            return sorted(set(props))
-
-        summary = []
-        for node in planning_tree.get('nodes', []):
-            attempt_summaries = []
-            for attempt in node.get('attempts', []):
-                ignored = attempt.get('ignored_property_violation')
-                fb = attempt.get('failure_feedback') or ignored or {}
-                ftype = fb.get('type', '')
-                violations = fb.get('violations', [])
-                props = extract_props(violations)
-
-                # Find the suffix step index where TLA first failed.
-                viol_suffix_idx = None
-                for step in attempt.get('predicted_rollout', []):
-                    tlc = step.get('tla_verification', {}).get('tlc_result', {})
-                    if not (tlc.get('success') or tlc.get('skipped')):
-                        viol_suffix_idx = step.get('suffix_index')
-                        break
-
-                plan_len = len(attempt.get('planner_decision', {}).get('plan', []))
-                attempt_summaries.append({
-                    'accepted': attempt.get('accepted'),
-                    'ignored_property_violation': bool(ignored) or None,
-                    'failure_type': ftype or None,
-                    'violated_props': props or None,
-                    'violation_at_suffix_step': viol_suffix_idx,
-                    'plan_length': plan_len if plan_len else None,
-                    'child_node_id': attempt.get('child_node_id'),
-                })
-
-            entry = {
-                'node_id': node['node_id'],
-                'parent_node_id': node.get('parent_node_id'),
-                'depth': node.get('depth'),
-                'result': node.get('result'),
-                'children': node.get('children', []),
-                'attempts': attempt_summaries,
-            }
-            summary.append(entry)
-        return summary
+        return build_tree_summary(planning_tree)
 
     @staticmethod
     def _zip_accepted_steps(
@@ -1396,30 +1344,31 @@ class _FsmShrdluAgentMixin:
 
         preceding_ap_trace[0] is the state before any accepted action.
         preceding_ap_trace[i+1] is the state after accepted_trace[i].
-        Returns a list of {action, ap_state_after} dicts, one per accepted action.
+        Returns a list of {action, state_after} dicts, one per accepted action.
         """
         steps = []
         for i, action in enumerate(accepted_trace):
             ap_after = preceding_ap_trace[i + 1] if i + 1 < len(preceding_ap_trace) else None
-            steps.append({
-                'action': copy.deepcopy(action),
-                'ap_state_after': copy.deepcopy(ap_after),
-            })
+            steps.append(make_state_path_entry(
+                make_action(
+                    action.get('name', 'unknown'),
+                    'simulator_action',
+                    action.get('args', {}),
+                ),
+                ap_after,
+            ))
         return steps
 
     @staticmethod
     def _ap_formula(name: str) -> str:
         """Return a Python-style formula string for each AP name."""
-        # object_N_resting_on_M  →  parts: ['object', 'N', 'resting', 'on', 'M']
         if name.startswith('object_') and '_resting_on_' in name:
-            tail = name[len('object_'):]          # 'N_resting_on_M'
+            tail = name[len('object_'):]
             obj_id, support = tail.split('_resting_on_')
             return '%s: (object with obj_id==%s).resting_on == %s' % (name, obj_id, support)
-        # some_object_resting_on_N
         if name.startswith('some_object_resting_on_'):
             support = name[len('some_object_resting_on_'):]
             return '%s: any object has resting_on == %s' % (name, support)
-        # grasper_closed / grasper_lowered
         return '%s: world-state field %s is true' % (name, name)
 
     @staticmethod
@@ -1441,14 +1390,11 @@ class _FsmShrdluAgentMixin:
         grasper_closed: bool = bool(init_world_state.get('grasper_closed', False))
         grasped_object = init_world_state.get('grasped_object')
 
-        # Map obj_id -> resting_on from initial snapshot.
         resting_on: Dict[int, object] = {}
         for obj in init_world_state.get('objects', []):
             if isinstance(obj, dict) and 'obj_id' in obj:
                 resting_on[int(obj['obj_id'])] = obj.get('resting_on')
 
-        # Map obj_id -> position (x, y) from initial snapshot (used to infer
-        # what object is below the grasper after move_grasper).
         positions: Dict[int, Dict[str, float]] = {}
         graspable: Dict[int, bool] = {}
         for obj in init_world_state.get('objects', []):
@@ -1461,7 +1407,6 @@ class _FsmShrdluAgentMixin:
 
         grasper_x: float = 0.0
         grasper_y: float = 0.0
-        grasper_pos = init_world_state.get('objects')  # not used directly; we track via move_grasper
 
         lines = []
         for action in accepted_trace:
@@ -1487,7 +1432,6 @@ class _FsmShrdluAgentMixin:
                     lines.append('lower_grasper: PRECONDITION FAILED (already lowered) — no state change.')
                 else:
                     grasper_lowered = True
-                    # Find the object at the grasper's (x, y) to infer resting_on.
                     tol = 1e-4
                     obj_below = next(
                         (oid for oid, pos in positions.items()
@@ -1588,7 +1532,6 @@ class _FsmShrdluAgentMixin:
                         grasper_closed = False
                         lines.append('open_grasper: grasper_closed=false. Was not holding anything.')
 
-        # Emit current inferred state.
         resting_on_changes = []
         for obj in init_world_state.get('objects', []):
             if not isinstance(obj, dict):
@@ -1639,7 +1582,6 @@ class _FsmShrdluAgentMixin:
         extracted: Dict[str, bool] = {}
         response_text = ''
 
-        # 1. Try JSON parse.
         try:
             json_content = OpenAICompatibleShrdluAgent._extract_json_object(content)
             decision = json.loads(json_content)
@@ -1654,7 +1596,6 @@ class _FsmShrdluAgentMixin:
         except (json.JSONDecodeError, ValueError):
             pass
 
-        # 2. Regex scan for any APs still missing.
         if len(extracted) < len(_AP_NAMES):
             for name in _AP_NAMES:
                 if name in extracted:
@@ -1664,7 +1605,6 @@ class _FsmShrdluAgentMixin:
                 if m:
                     extracted[name] = m.group(1) == 'true'
 
-        # 3. Fill remaining gaps from current_ap_state (assume no change).
         for name in _AP_NAMES:
             if name not in extracted:
                 extracted[name] = bool(current_ap_state.get(name, False))
@@ -1680,24 +1620,17 @@ class _FsmShrdluAgentMixin:
 
         TLC violation entries are raw stdout lines such as:
           'Error: Property Property_prop_foo_bar is violated.'
-        This extracts the prop.* id by stripping the 'Property_' prefix.
+        The shared parser handles both dotted ids and TLC-safe underscored ids.
         """
         if not failure:
             return []
-        seen: set = set()
-
-        def _extract(violation_str: str) -> Optional[str]:
-            m = re.search(r'Property_(prop\.[^\s.]+)', str(violation_str))
-            return m.group(1) if m else None
+        seen: set[str] = set()
 
         def _walk(f):
             if not isinstance(f, dict):
                 return
             if f.get('type') == 'tla_property_violation':
-                for v in f.get('violations', []):
-                    prop_id = _extract(v)
-                    if prop_id:
-                        seen.add(prop_id)
+                seen.update(extract_property_ids_from_violations(f.get('violations', [])))
             for v in f.get('failed_attempts', []):
                 _walk(v)
             if f.get('child_failure'):
@@ -1720,7 +1653,10 @@ class _FsmShrdluAgentMixin:
         return changes
 
     def _build_initial_ap_state(self, world_state: Dict[str, object]) -> Dict[str, bool]:
-        return self._property_verifier._evaluate_state_aps(world_state)
+        return observe_ap_values(
+            _AP_NAMES,
+            lambda name: self._property_verifier.observe_ap(name, world_state),
+        )
 
     def _build_initial_property_state(self, world_state: Dict[str, object], scene=None) -> Dict[str, object]:
         """Backward-compatible property-state bundle used by older tests/tools."""
@@ -1836,9 +1772,9 @@ class FsmOpenAICompatibleShrdluAgent(
             max_tokens=max_tokens,
             client=client,
         )
-        self._planning_granularity = _normalise_planning_granularity(planning_granularity)
-        self._violation_policy = _normalise_violation_policy(violation_policy)
+        self._planning_granularity = _normalize_planning_granularity(planning_granularity)
+        self._violation_policy = _normalize_violation_policy(violation_policy)
         retries = int(max_branch_retries)
-        if self._violation_policy == VIOLATION_IGNORE:
+        if self._violation_policy in NONBLOCKING_VIOLATION_POLICIES:
             retries = max(1, retries)
-        self._init_predictive_preplanned(max_branch_retries=retries)
+        self._init_fsm_planner(max_branch_retries=retries)

@@ -33,7 +33,7 @@ Tree schema (planning_tree dict):
   max_retries     int?      per-node action-retry budget (git style)
   max_branch_retries int?   per-node branch-retry budget (shrdlu style)
   planning_granularity str? 'step' | 'batch'
-  violation_policy str?     'retry' | 'ignore'
+  violation_policy str?     'retry' | 'ignore' | 'advisory'
   properties      [dict]?   [{id, natural_language}, …]
   initial_state   dict?     AP → bool at start of planning (s0)
   initial_world_state dict? raw world snapshot at start (shrdlu)
@@ -41,7 +41,7 @@ Tree schema (planning_tree dict):
   nodes           [node]    all nodes in creation order
   feasible        bool
   accepted_plan   [dict]    [{label, tool, args}, …] winning root-to-leaf path
-  tree_summary    [dict]?   compact per-node summary (shrdlu)
+  tree_summary    [dict]?   compact per-node summary
   finish_response str?      LLM finish message once plan is found
   planning_response str?    LLM planning narrative
   failure         dict?     top-level failure info when infeasible
@@ -51,9 +51,14 @@ attach them to a tree dict, then pass the tree to utils.session.save_session.
 """
 from __future__ import annotations
 
+import copy
+import re
 from typing import Any, Dict, List, Optional
 
-# ── node IDs ─────────────────────────────────────────────────────────────────
+from utils.planning_modes import (
+    ACCEPTED_NODE_RESULTS,
+    FINISH_NODE_RESULT,
+)
 
 class NodeCounter:
     """Simple integer counter for assigning sequential node IDs within a tree."""
@@ -69,8 +74,6 @@ class NodeCounter:
     def current(self) -> int:
         return self._n
 
-
-# ── tree constructor ──────────────────────────────────────────────────────────
 
 def make_tree(
     *,
@@ -93,7 +96,7 @@ def make_tree(
         max_retries:          per-node action-retry budget (git style)
         max_branch_retries:   per-node branch-retry budget (shrdlu style)
         planning_granularity: 'step' | 'batch'
-        violation_policy:     'retry' | 'ignore'
+        violation_policy:     'retry' | 'ignore' | 'advisory'
         properties:           list of {id, natural_language} dicts
         initial_state:        AP → bool snapshot at start of planning (s0)
         initial_world_state:  raw world snapshot at start (shrdlu)
@@ -128,8 +131,6 @@ def make_tree(
         tree["action_help"] = action_help
     return tree
 
-
-# ── node constructor ──────────────────────────────────────────────────────────
 
 def make_node(
     *,
@@ -176,11 +177,7 @@ def make_node(
         "children":       [],
         "state_path":     state_path if state_path is not None else [],
         "state_before":   state_before,
-        "action": {
-            "label": action_label,
-            "tool":  tool or "none",
-            "args":  args or {},
-        },
+        "action":        make_action(action_label, tool, args),
         "state_after":    state_after if state_after is not None else {},
         "verification":   verification if verification is not None else make_skipped_verification("pending"),
         "attempts":       attempts if attempts is not None else [],
@@ -266,8 +263,6 @@ def annotate_node_executed(
     }
 
 
-# ── verification constructors ─────────────────────────────────────────────────
-
 def make_verification(
     *,
     passed: bool,
@@ -306,11 +301,53 @@ def make_skipped_verification(reason: str = "no safety properties") -> Dict[str,
     )
 
 
-# ── tree helpers ──────────────────────────────────────────────────────────────
+def make_action(
+    label: Optional[str],
+    tool: Optional[str] = "none",
+    args: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Create a canonical planning-tree action record."""
+    return {
+        "label": label,
+        "tool": tool or "none",
+        "args": copy.deepcopy(args or {}),
+    }
 
-def append_node(tree: Dict[str, Any], node: Dict[str, Any]) -> None:
-    """Append a node to tree['nodes'] in-place."""
+
+def make_state_path_entry(
+    action: Dict[str, Any],
+    state_after: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Create one canonical state_path entry."""
+    return {
+        "action": copy.deepcopy(action),
+        "state_after": copy.deepcopy(state_after or {}),
+    }
+
+
+def find_node(tree: Dict[str, Any], node_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    """Find a node by id in a planning tree."""
+    if node_id is None:
+        return None
+    for node in tree.get("nodes", []):
+        if node.get("node_id") == node_id:
+            return node
+    return None
+
+
+def append_node(
+    tree: Dict[str, Any],
+    node: Dict[str, Any],
+    *,
+    link_parent: bool = False,
+) -> None:
+    """Append a node to tree['nodes'] and optionally link it to its parent."""
     tree["nodes"].append(node)
+    if not link_parent:
+        return
+    parent = find_node(tree, node.get("parent_node_id"))
+    if parent is not None:
+        add_child(parent, node["node_id"])
 
 
 def mark_feasible(
@@ -328,13 +365,192 @@ def mark_feasible(
 
 
 def accepted_plan_from_nodes(tree: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Extract accepted_plan from accepted nodes in DFS order."""
-    accepted = [n for n in tree["nodes"] if n["result"] in ("accepted", "finish")]
-    accepted.sort(key=lambda n: n["depth"])
-    return [n["action"] for n in accepted]
+    """Extract the executable accepted_plan from accepted nodes in depth order."""
+    return [
+        n.get("action", {"label": None, "tool": "none", "args": {}})
+        for n in accepted_nodes(tree)
+    ]
 
 
-# ── attempt helper ────────────────────────────────────────────────────────────
+def accepted_nodes(
+    tree: Dict[str, Any],
+    *,
+    include_finish: bool = False,
+) -> List[Dict[str, Any]]:
+    """Return accepted planning nodes in depth order."""
+    accepted_results = set(ACCEPTED_NODE_RESULTS)
+    if include_finish:
+        accepted_results.add(FINISH_NODE_RESULT)
+    nodes = [
+        n for n in tree.get("nodes", [])
+        if n.get("result") in accepted_results
+    ]
+    nodes.sort(key=lambda n: n.get("depth", 0))
+    return nodes
+
+
+def accepted_nodes_by_depth(
+    tree: Dict[str, Any],
+    *,
+    include_finish: bool = False,
+) -> Dict[int, Dict[str, Any]]:
+    """Index accepted planning nodes by depth."""
+    return {
+        node["depth"]: node
+        for node in accepted_nodes(tree, include_finish=include_finish)
+    }
+
+
+def mark_accepted_branch_backtracked(
+    nodes: List[Dict[str, Any]],
+    failure: Dict[str, Any],
+) -> None:
+    """Mark accepted nodes in a failed candidate branch as backtracked."""
+    for node in nodes:
+        if node.get("result") in ACCEPTED_NODE_RESULTS:
+            node["result"] = "backtracked"
+            node["outcome"] = {"failure": failure}
+
+
+def _restore_property_id(raw: str) -> str:
+    """Best-effort inverse for TLC property identifiers.
+
+    TLA+ identifiers cannot contain dots, so ``prop.git.09`` appears in TLC
+    output as ``Property_prop_git_09``.  Restore the common domain/id shape
+    without over-normalising arbitrary property names that contain underscores.
+    """
+    if raw.startswith(("prop_git_", "prop_shrdlu_")):
+        return raw.replace("_", ".", 2)
+    return raw.replace("_", ".", 1)
+
+
+def _extract_property_ids_from_violations(violations: List[Any]) -> List[str]:
+    prop_from_tlc = re.compile(r"Property_(prop_[^\s]+?)(?:\s|$|\.)")
+    prop_direct = re.compile(r"\bprop\.[A-Za-z0-9_.-]+\b")
+    props: List[str] = []
+    for violation in violations:
+        text = str(violation)
+        props.extend(prop_direct.findall(text))
+        for match in prop_from_tlc.finditer(text):
+            props.append(_restore_property_id(match.group(1)))
+    return sorted(set(props))
+
+
+def extract_property_ids_from_violations(violations: List[Any]) -> List[str]:
+    """Extract canonical property IDs from raw verifier/TLC violation text."""
+    return _extract_property_ids_from_violations(violations)
+
+
+def _attempt_violations(attempt: Dict[str, Any]) -> List[Any]:
+    violations: List[Any] = []
+    for key in ("failure_feedback", "ignored_property_violation", "child_failure"):
+        detail = attempt.get(key)
+        if isinstance(detail, dict):
+            raw = detail.get("violations")
+            if isinstance(raw, list):
+                violations.extend(raw)
+
+    verification = attempt.get("verification")
+    if isinstance(verification, dict):
+        raw = verification.get("violations")
+        if isinstance(raw, list):
+            violations.extend(raw)
+
+    step_verification = attempt.get("step_verification")
+    if isinstance(step_verification, dict):
+        failure = step_verification.get("failure")
+        if isinstance(failure, dict):
+            raw = failure.get("violations")
+            if isinstance(raw, list):
+                violations.extend(raw)
+        tlc = step_verification.get("prediction_detail", {}).get("tla_verification", {})
+        if isinstance(tlc, dict):
+            raw = tlc.get("tlc_result", {}).get("violations")
+            if isinstance(raw, list):
+                violations.extend(raw)
+
+    return violations
+
+
+def build_tree_summary(planning_tree: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Build a compact per-node summary for quick tree inspection.
+
+    The full detail stays in ``planning_tree["nodes"]``.  The summary is meant
+    for tree visualisers and quick debugging across domains, so it keeps only
+    shape, action, outcome, and violation hints.
+    """
+    summary: List[Dict[str, Any]] = []
+    for node in planning_tree.get("nodes", []):
+        if not isinstance(node, dict):
+            continue
+        attempt_summaries: List[Dict[str, Any]] = []
+        for attempt in node.get("attempts", []):
+            if not isinstance(attempt, dict):
+                continue
+            ignored = attempt.get("ignored_property_violation")
+            failure = (
+                attempt.get("failure_feedback")
+                or ignored
+                or attempt.get("child_failure")
+                or {}
+            )
+            ftype = failure.get("type", "") if isinstance(failure, dict) else ""
+            violations = _attempt_violations(attempt)
+            props = _extract_property_ids_from_violations(violations)
+
+            viol_suffix_idx = None
+            predicted_rollout = attempt.get("predicted_rollout") or []
+            for step in predicted_rollout:
+                if not isinstance(step, dict):
+                    continue
+                tlc = step.get("tla_verification", {}).get("tlc_result", {})
+                if not (tlc.get("success") or tlc.get("skipped")):
+                    viol_suffix_idx = step.get("suffix_index")
+                    break
+
+            planner_decision = attempt.get("planner_decision")
+            plan = planner_decision.get("plan", []) if isinstance(planner_decision, dict) else []
+            plan_len = len(plan) if isinstance(plan, list) else 0
+            action = attempt.get("action") or attempt.get("proposal") or {}
+            if not isinstance(action, dict):
+                action = {}
+            attempt_summaries.append({
+                "retry_index": attempt.get("retry_index"),
+                "attempt_index": attempt.get("attempt_index"),
+                "child_index": attempt.get("child_index"),
+                "accepted": attempt.get("accepted"),
+                "action_label": action.get("action_label") or action.get("name"),
+                "ignored_property_violation": bool(ignored) or None,
+                "failure_type": ftype or None,
+                "violated_props": props or None,
+                "violation_at_suffix_step": viol_suffix_idx,
+                "plan_length": plan_len if plan_len else None,
+                "child_node_id": attempt.get("child_node_id"),
+            })
+
+        verification = node.get("verification")
+        verification = verification if isinstance(verification, dict) else {}
+        node_violations = verification.get("violations", [])
+        node_props = (
+            _extract_property_ids_from_violations(node_violations)
+            if isinstance(node_violations, list)
+            else []
+        )
+        action = node.get("action", {})
+        action = action if isinstance(action, dict) else {}
+        entry = {
+            "node_id": node.get("node_id"),
+            "parent_node_id": node.get("parent_node_id"),
+            "depth": node.get("depth"),
+            "result": node.get("result"),
+            "action_label": action.get("label"),
+            "children": node.get("children", []),
+            "violated_props": node_props or None,
+            "attempts": attempt_summaries,
+        }
+        summary.append(entry)
+    return summary
+
 
 def make_attempt(
     *,
