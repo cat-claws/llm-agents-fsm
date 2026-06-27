@@ -30,6 +30,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from utils.chat_terminal import ChatCommand, ChatTerminal
+from utils.git_learning_reset import reset_git_learning_lab
 from utils.session import make_session, save_session as _save_session_util
 
 DEFAULT_OPENAI_BASE_URL = "http://127.0.0.1:30000/v1/"
@@ -352,6 +353,14 @@ def repl() -> None:
         lines.append("Conversation reset.")
         return "\n".join(lines)
 
+    def reset_lab(_args: str) -> str:
+        nonlocal messages
+        result = reset_git_learning_lab(WORK_DIR)
+        if result.ok:
+            messages = [{"role": "system", "content": SYSTEM}]
+            return result.message + "\nConversation reset."
+        return result.message
+
     def show_cwd(_args: str) -> str:
         return str(WORK_DIR)
 
@@ -384,7 +393,8 @@ def repl() -> None:
         help_footer="Everything else is sent to the agent.",
         before_exit=save_if_needed,
         commands=[
-            ChatCommand(("/reset",), "clear conversation history", reset_conversation),
+            ChatCommand(("/reset", "reset"), "reset git-learning-lab from parent installer", reset_lab),
+            ChatCommand(("/chat-reset",), "clear conversation history", reset_conversation),
             ChatCommand(("/save",), "save session to .git-agent-sessions/", save_now),
             ChatCommand(("/model",), "switch OpenAI model", set_model, "<name>"),
             ChatCommand(("/verbose",), "toggle verbose tool logging", toggle_verbose),

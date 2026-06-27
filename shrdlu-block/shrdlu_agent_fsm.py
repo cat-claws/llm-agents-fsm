@@ -1032,6 +1032,7 @@ class _FsmShrdluAgentMixin:
                     passed=step_verification['passed'],
                     properties_checked=tlc.get('properties_checked', []),
                     violations=tlc.get('tlc_result', {}).get('violations', []),
+                    skipped=bool(tlc.get('tlc_result', {}).get('skipped')),
                 )
                 node_result = (
                     'accepted_with_ignored_violations'
@@ -1083,6 +1084,7 @@ class _FsmShrdluAgentMixin:
                     passed=step_verification['passed'],
                     properties_checked=tlc.get('properties_checked', []),
                     violations=tlc.get('tlc_result', {}).get('violations', []),
+                    skipped=bool(tlc.get('tlc_result', {}).get('skipped')),
                 )
                 node_result = (
                     'accepted_with_ignored_violations'
@@ -1213,14 +1215,24 @@ class _FsmShrdluAgentMixin:
             }
 
         if not passed:
+            raw_tlc_result = tlc_result.get('tlc_result', {})
+            skipped = bool(raw_tlc_result.get('skipped'))
+            if skipped:
+                message = raw_tlc_result.get('reason') or 'TLC verification was skipped.'
+                violations = []
+                failure_type = 'verification_skipped'
+            else:
+                message = 'TLC found property violations after action.'
+                violations = raw_tlc_result.get('violations', [])
+                failure_type = 'tla_property_violation'
             return {
                 'passed': False,
                 'predicted_ap_state': predicted_ap_state,
                 'failure': {
-                    'type': 'tla_property_violation',
+                    'type': failure_type,
                     'action': action,
-                    'violations': tlc_result['tlc_result'].get('violations', []),
-                    'message': 'TLC found property violations after action.',
+                    'violations': violations,
+                    'message': message,
                 },
                 'prediction_detail': detail,
             }

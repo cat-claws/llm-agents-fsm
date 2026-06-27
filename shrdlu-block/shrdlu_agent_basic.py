@@ -13,7 +13,13 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from utils.session import SCHEMA_VERSION
+from utils.session import (
+    SCHEMA_VERSION,
+    append_result_notice as _shared_append_result_notice,
+    checkpoint_result as _shared_checkpoint_result,
+    start_result_session as _shared_start_result_session,
+    write_result as _shared_write_result,
+)
 
 from shrdlu_agents.property_verifier import PROPERTY_FILE, TransitionPropertyVerifier
 from shrdlu_agents.simulator_api import SimulatorAPI
@@ -396,40 +402,23 @@ class _ShrdluAgentBase:
         return {}
 
     def _start_result_session(self, record: Dict[str, object]) -> Optional[str]:
-        if self._result_dir is None:
-            return None
-        self._result_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
-        result_path = self._result_dir / ('result_%s.json' % timestamp)
-        record['_live'] = True
-        result_path.write_text(json.dumps(record, indent=2), encoding='utf-8')
-        self._last_result_path = str(result_path)
-        return self._last_result_path
-
-    def _checkpoint_result(self, record: Dict[str, object], result_path: Optional[str]) -> Optional[str]:
-        if not result_path:
-            return result_path
-        record['_live'] = True
-        Path(result_path).write_text(json.dumps(record, indent=2), encoding='utf-8')
+        result_path = _shared_start_result_session(record, self._result_dir)
+        if result_path is not None:
+            self._last_result_path = result_path
         return result_path
 
+    def _checkpoint_result(self, record: Dict[str, object], result_path: Optional[str]) -> Optional[str]:
+        return _shared_checkpoint_result(record, result_path)
+
     def _write_result(self, record: Dict[str, object], result_path: Optional[str] = None) -> Optional[str]:
-        if self._result_dir is None and not result_path:
-            return None
-        if result_path is None:
-            result_path = self._start_result_session(record)
-        if not result_path:
-            return None
-        record.pop('_live', None)
-        Path(result_path).write_text(json.dumps(record, indent=2), encoding='utf-8')
-        self._last_result_path = str(result_path)
-        return self._last_result_path
+        result_path = _shared_write_result(record, self._result_dir, result_path)
+        if result_path is not None:
+            self._last_result_path = result_path
+        return result_path
 
     @staticmethod
     def _append_result_notice(message: str, result_path: Optional[str]) -> str:
-        if not result_path:
-            return message
-        return message + "\n\nResult saved to %s" % result_path
+        return _shared_append_result_notice(message, result_path)
 
     def _start_trace_session(self, trace: Dict[str, object]) -> Optional[str]:
         return self._start_result_session(trace)

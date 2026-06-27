@@ -465,7 +465,7 @@ def verify_fsm_trace(
         module_name=module_name,
     )
     tlc_result = run_tlc(tla_spec, cfg, module_name=module_name, timeout=timeout)
-    passed = bool(tlc_result.get("success") or tlc_result.get("skipped"))
+    passed = bool(tlc_result.get("success"))
     return {
         "passed":             passed,
         "tla_spec":           tla_spec,

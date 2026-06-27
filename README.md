@@ -129,6 +129,84 @@ Common commands:
 Compatibility aliases are kept: `/planning-mode` is the same as `/mode`, and
 `/planning` is the same as `/granularity`.
 
+## FSM Defaults and Tuning
+
+The FSM agents share the same planning presets:
+
+| Mode | Planning granularity | Violation policy | Retries |
+| --- | --- | --- | --- |
+| `fsm` | `batch` | `retry` | default retry count, usually `3` |
+| `plan` | `batch` | `ignore` | `1` |
+| `advisory` | `batch` | `advisory` | `1` |
+
+Calling `/config` in an interactive FSM terminal prints the live settings. The
+commands `/mode`, `/granularity`, `/violations`, and `/retries` show the current
+value when called without arguments and update future turns when called with an
+argument, for example `/mode advisory` or `/retries 5`.
+
+Git FSM defaults:
+
+```text
+model:          Qwen/Qwen3-30B-A3B-Instruct-2507
+base_url:       http://127.0.0.1:30000/v1/
+api_key:        EMPTY
+temperature:    0.2
+max_tokens:     512
+max_plan_steps: 10
+max_retries:    3
+cmd_timeout:    20
+```
+
+Git FSM startup settings are read from environment variables:
+
+```bash
+export GIT_AGENT_FSM_PLANNING_MODE=fsm      # fsm | plan | advisory
+export GIT_AGENT_FSM_PLANNING_GRANULARITY=batch
+export GIT_AGENT_FSM_VIOLATION_POLICY=retry # retry | ignore | advisory
+export GIT_AGENT_FSM_MAX_PLAN_STEPS=10
+export GIT_AGENT_FSM_MAX_RETRIES=3
+export GIT_AGENT_FSM_RESULT_DIR=/path/to/results
+```
+
+At startup, the Git FSM currently reads OpenAI-compatible endpoint settings from
+the shared `SHRDLU_OPENAI_*` variables:
+
+```bash
+export SHRDLU_OPENAI_BASE_URL=http://127.0.0.1:30000/v1/
+export SHRDLU_OPENAI_API_KEY=EMPTY
+export SHRDLU_OPENAI_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507
+export SHRDLU_OPENAI_TEMPERATURE=0.2
+export SHRDLU_OPENAI_MAX_TOKENS=512
+```
+
+SHRDLU FSM defaults:
+
+```text
+simulator_url:       http://127.0.0.1:8000
+model:               Qwen/Qwen3-30B-A3B-Instruct-2507
+base_url:            http://127.0.0.1:30000/v1/
+api_key:             EMPTY
+temperature:         0.2
+max_tokens:          512
+max_steps:           50
+max_branch_retries:  3
+planning_granularity: batch
+violation_policy:    retry
+```
+
+SHRDLU startup settings can be supplied either as environment variables or as
+passthrough CLI arguments after `--`:
+
+```bash
+run-agents shrdlu-fsm -- \
+  --planning-mode fsm \
+  --max-branch-retries 3 \
+  --max-steps 50 \
+  --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --temperature 0.2 \
+  --max-tokens 512
+```
+
 ## Git Agents
 
 Run these from the Git repository you want the agent to operate on:
@@ -152,10 +230,12 @@ Variants:
 `git-plan` and `git-advisory` run the Git FSM implementation with the selected
 planning mode.
 
-Git-specific commands include `/model <name>` and `/cwd`. The FSM variant also
-adds `/props`. The basic Git agent adds `/reset`, `/save`, and `/verbose`.
-Saved basic-agent sessions are written to `.git-agent-sessions/` in the target
-working directory.
+Git-specific commands include `/model <name>`, `/cwd`, and `/reset` (`reset`)
+to run the bundled `utils/git-learning-installer.sh reset` against the target
+repo's parent directory. Set `GIT_LEARNING_INSTALLER` to override the bundled
+script. The FSM variant also adds `/props`. The basic Git agent adds
+`/chat-reset`, `/save`, and `/verbose`. Saved basic-agent sessions are written
+to `.git-agent-sessions/` in the target working directory.
 
 ## SHRDLU Block Agents
 

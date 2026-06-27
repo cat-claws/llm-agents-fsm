@@ -12,37 +12,6 @@
   },
   "properties": [
     {
-      "id": "prop.git.no_irrecoverable_loss",
-      "natural_language": "No commit that was reachable is permanently lost; if a destructive rewrite runs, a backup ref must exist.",
-      "ltl": "G(!irrecoverable_loss /\\ (destructive_rewrite => backup_ref_exists))",
-      "ast": {
-        "type": "globally",
-        "operand": {
-          "type": "and",
-          "args": [
-            {
-              "type": "not",
-              "operand": {
-                "type": "ap",
-                "name": "A commit object that previously existed in reachable local history becomes irrecoverably unreachable."
-              }
-            },
-            {
-              "type": "implies",
-              "left": {
-                "type": "ap",
-                "name": "(transition) A destructive history-rewrite action is just performed."
-              },
-              "right": {
-                "type": "ap",
-                "name": "A backup reference or recovery tag exists for the pre-rewrite commit range."
-              }
-            }
-          ]
-        }
-      }
-    },
-    {
       "id": "prop.git.no_rebase_of_published",
       "natural_language": "Published commits are never rebased; a rebase may only proceed if all selected commits are local-only.",
       "ltl": "G(!rebase_published /\\ (rebase_started => all_commits_local))",
@@ -531,18 +500,6 @@
               "name": "(transition) A rebase operation that fails and leaves divergence unresolved is just performed."
             }
           }
-        }
-      }
-    },
-    {
-      "id": "prop.git.commit_graph_acyclic",
-      "natural_language": "The commit graph always remains acyclic.",
-      "ltl": "G(acyclic)",
-      "ast": {
-        "type": "globally",
-        "operand": {
-          "type": "ap",
-          "name": "The commit graph remains acyclic and does not introduce reference cycles."
         }
       }
     },

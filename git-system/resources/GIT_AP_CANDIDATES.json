@@ -15,29 +15,11 @@
   },
   "current_state_aps": [
     {
-      "name": "A backup reference or recovery tag exists for the pre-rewrite commit range.",
-      "description": "A git ref (backup tag, ORIG_HEAD, or reflog entry) still points at commits that were rewritten or removed.",
-      "git_commands": [
-        "git show-ref | grep -E 'backup|pre-rewrite|ORIG_HEAD'",
-        "git rev-parse --verify ORIG_HEAD 2>/dev/null || true",
-        "git tag | grep -E 'backup|pre-rewrite' || true"
-      ]
-    },
-    {
       "name": "A branch reference moves backward to exclude commits that were previously reachable by policy.",
       "description": "The branch tip has been moved to an ancestor, making previously reachable commits unreachable through the ref.",
       "git_commands": [
         "git reflog show HEAD --format='%H %gs' | head -20",
         "git log --oneline -5"
-      ]
-    },
-    {
-      "name": "A commit object that previously existed in reachable local history becomes irrecoverably unreachable.",
-      "description": "A commit is no longer reachable from any ref and is eligible for garbage collection with no backup.",
-      "git_commands": [
-        "git fsck --unreachable --no-reflogs 2>&1 | grep 'unreachable commit' | head -10",
-        "git reflog show --all --format='%H' | sort -u | head -20",
-        "git show-ref --heads --tags | awk '{print $1}' | head -20"
       ]
     },
     {
@@ -209,14 +191,6 @@
       ]
     },
     {
-      "name": "The commit graph remains acyclic and does not introduce reference cycles.",
-      "description": "No commit is its own ancestor; the git DAG is free of cycles.",
-      "git_commands": [
-        "git fsck --connectivity-only 2>&1 | grep -E 'error|cycle|broken' | head -10 || echo 'OK'",
-        "git log --oneline --graph --all | head -20"
-      ]
-    },
-    {
       "name": "The current depth of pending git workflow operations in the processing queue exceeds 64.",
       "description": "The internal workflow queue has accumulated more than 64 pending operations.",
       "git_commands": [
@@ -252,10 +226,6 @@
     }
   ],
   "transition_aps": [
-    {
-      "name": "(transition) A destructive history-rewrite action is just performed.",
-      "description": "The action taken is a git operation that rewrites or removes existing commit history (e.g. reset --hard, rebase -i with drop, filter-branch)."
-    },
     {
       "name": "(transition) A force-push action is just performed.",
       "description": "A 'git push --force' or 'git push --force-with-lease' is executed (distinct from the bare label variant)."

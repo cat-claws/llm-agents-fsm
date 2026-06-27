@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import copy
 import json
 import os
 import re
@@ -12,7 +12,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import openai
 
@@ -26,6 +26,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 from utils.planning_modes import (
     NONBLOCKING_VIOLATION_POLICIES,
     PLANNING_BATCH,
+    PLANNING_STEP,
     VIOLATION_IGNORE,
     VIOLATION_RETRY,
     normalize_planning_granularity,
@@ -44,8 +45,10 @@ from utils.session import (
     accepted_nodes,
     accepted_plan_from_nodes,
     annotate_node_executed,
+    append_result_notice as _shared_append_result_notice,
     append_node,
     build_tree_summary,
+    checkpoint_result as _shared_checkpoint_result,
     make_action,
     make_attempt,
     make_planning_node,
@@ -53,13 +56,16 @@ from utils.session import (
     make_session,
     make_state_path_entry,
     make_verification,
-    mark_accepted_branch_backtracked,
     mark_feasible,
+    set_node_outcome,
+    start_result_session as _shared_start_result_session,
+    write_result as _shared_write_result,
 )
 from utils.tla_verifier import (
     verify_fsm_trace,
 )
 from utils.chat_terminal import ChatCommand, ChatTerminal
+from utils.git_learning_reset import reset_git_learning_lab
 from utils.planning_terminal import (
     RuntimePlanningConfig,
     build_planning_commands,
@@ -74,6 +80,7 @@ DEFAULT_OPENAI_API_KEY = "EMPTY"
 DEFAULT_OPENAI_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 DEFAULT_OPENAI_TEMPERATURE = 0.2
 DEFAULT_OPENAI_MAX_TOKENS = 512
+DEFAULT_OPENAI_PLANNING_MAX_TOKENS = 2048
 DEFAULT_OPENAI_ENABLE_THINKING = True
 DEFAULT_OPENAI_SEPARATE_REASONING = True
 
@@ -164,43 +171,26 @@ def default_config_from_env() -> AgentConfig:
 
 def _start_result_session(record: dict[str, Any]) -> str | None:
     global _last_result_path
-    if RESULT_DIR is None:
-        return None
-    RESULT_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    result_path = RESULT_DIR / ("result_%s.json" % timestamp)
-    record["_live"] = True
-    result_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
-    _last_result_path = str(result_path)
-    return _last_result_path
+    result_path = _shared_start_result_session(record, RESULT_DIR)
+    if result_path is not None:
+        _last_result_path = result_path
+    return result_path
 
 
 def _checkpoint_result(record: dict[str, Any], result_path: str | None) -> str | None:
-    if not result_path:
-        return result_path
-    record["_live"] = True
-    Path(result_path).write_text(json.dumps(record, indent=2), encoding="utf-8")
-    return result_path
+    return _shared_checkpoint_result(record, result_path)
 
 
 def _write_result(record: dict[str, Any], result_path: str | None = None) -> str | None:
     global _last_result_path
-    if RESULT_DIR is None and not result_path:
-        return None
-    if result_path is None:
-        result_path = _start_result_session(record)
-    if not result_path:
-        return None
-    record.pop("_live", None)
-    Path(result_path).write_text(json.dumps(record, indent=2), encoding="utf-8")
-    _last_result_path = str(result_path)
-    return _last_result_path
+    result_path = _shared_write_result(record, RESULT_DIR, result_path)
+    if result_path is not None:
+        _last_result_path = result_path
+    return result_path
 
 
 def _append_result_notice(message: str, result_path: str | None) -> str:
-    if not result_path:
-        return message
-    return message + "\n\nResult saved to %s" % result_path
+    return _shared_append_result_notice(message, result_path)
 
 
 def last_result_path() -> str | None:
@@ -327,7 +317,18 @@ def _openai_temperature() -> float:
     return float(os.environ.get("SHRDLU_OPENAI_TEMPERATURE", str(DEFAULT_OPENAI_TEMPERATURE)))
 
 def _openai_max_tokens() -> int:
-    return int(os.environ.get("SHRDLU_OPENAI_MAX_TOKENS", str(DEFAULT_OPENAI_MAX_TOKENS)))
+    return int(os.environ.get(
+        "GIT_AGENT_FSM_OPENAI_MAX_TOKENS",
+        os.environ.get("SHRDLU_OPENAI_MAX_TOKENS", str(DEFAULT_OPENAI_MAX_TOKENS)),
+    ))
+
+def _openai_planning_max_tokens() -> int:
+    configured = os.environ.get("GIT_AGENT_FSM_OPENAI_PLANNING_MAX_TOKENS")
+    if configured is None:
+        configured = os.environ.get("SHRDLU_OPENAI_PLANNING_MAX_TOKENS")
+    if configured is not None:
+        return int(configured)
+    return max(_openai_max_tokens(), DEFAULT_OPENAI_PLANNING_MAX_TOKENS)
 
 def _openai_extra_body() -> dict[str, Any]:
     return {
@@ -352,12 +353,13 @@ def _make_git_property_verifier(model: str) -> GitPropertyVerifier:
     )
 
 def _llm(messages: list[dict], model: str,
-         tools: list | None = None, tag: str = "") -> tuple[str, list]:
+         tools: list | None = None, tag: str = "",
+         max_tokens: int | None = None) -> tuple[str, list]:
     kwargs: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "temperature": _openai_temperature(),
-        "max_tokens": _openai_max_tokens(),
+        "max_tokens": _openai_max_tokens() if max_tokens is None else max_tokens,
         "extra_body": _openai_extra_body(),
     }
     if tools:
@@ -392,6 +394,8 @@ def _llm(messages: list[dict], model: str,
         "tag":             tag,
         "messages_in":     messages,
         "content_out":     content,
+        "finish_reason":   getattr(response.choices[0], "finish_reason", None),
+        "max_tokens":      kwargs["max_tokens"],
         "tool_calls_out":  tool_calls,
     })
     return content, tool_calls
@@ -404,23 +408,6 @@ def _extract_json(text: str) -> Any:
         except Exception:
             pass
     return None
-
-PROMPT_6_SYSTEM = f"""\
-You are a scope guard for a git assistant agent.
-The agent can only handle: git repository operations and these shell commands: {_SHELL_NAMES}.
-Decide if the user's request is in scope.
-
-Output ONLY valid JSON: {{"in_scope": true}} or {{"in_scope": false, "reason": "one sentence"}}"""
-
-def prompt6_guard(query: str, model: str) -> tuple[bool, str]:
-    content, _ = _llm([
-        {"role": "system", "content": PROMPT_6_SYSTEM},
-        {"role": "user",   "content": query},
-    ], model, tag="6_guard")
-    result = _extract_json(content)
-    if isinstance(result, dict) and "in_scope" in result:
-        return result["in_scope"], result.get("reason", "")
-    return True, ""
 
 def phase3_build_s0(model: str) -> dict[str, bool]:
     """
@@ -483,9 +470,17 @@ Output ONLY valid JSON:
 }}
 If the goal is already achieved, output {{"plan": [], "finish_response": "done"}}"""
 
+
+def _feedback_json(value: list[dict] | None) -> str:
+    if not value:
+        return "none"
+    return json.dumps(value[-5:], indent=2, sort_keys=True)
+
+
 def prompt4a_propose(goal: str, s_current: dict[str, bool],
                      trace: list[dict], tried: list[str], model: str,
-                     config: AgentConfig | None = None) -> dict | None:
+                     config: AgentConfig | None = None,
+                     failed_attempts: list[dict] | None = None) -> dict | None:
     config = config or default_config_from_env()
     done_steps = "\n".join(
         f"  {i+1}. {s['action_label']}: {s['tool']}({json.dumps(s['args'])})"
@@ -498,12 +493,13 @@ def prompt4a_propose(goal: str, s_current: dict[str, bool],
             f"Goal: {goal}\n\n"
             f"Steps done so far:\n{done_steps}\n\n"
             f"{_property_prompt_block(config.violation_policy)}"
-            f"Already tried at this step (rejected): {tried or 'none'}\n\n"
+            f"Failed plan attempts and backtrack feedback:\n{_feedback_json(failed_attempts)}\n\n"
+            f"Banned first actions at this planning point: {tried or 'none'}\n\n"
             f"What is the next action?"},
-    ], model, tag="4A_propose")
+    ], model, tag="4A_propose", max_tokens=_openai_planning_max_tokens())
 
     result = _extract_json(content)
-    return result if isinstance(result, dict) else None
+    return _normalise_proposal(result) if isinstance(result, dict) else None
 
 
 def _normalise_proposal(item: Any) -> dict | None:
@@ -515,18 +511,22 @@ def _normalise_proposal(item: Any) -> dict | None:
     if not action_label:
         command = args.get("command") if isinstance(args, dict) else None
         action_label = command.replace(" ", "_")[:40] if isinstance(command, str) else tool
-    return {
+    proposal = {
         "action_label": action_label,
         "tool": tool,
         "args": args,
         "rationale": str(item.get("rationale", "")),
     }
+    if "finish_response" in item:
+        proposal["finish_response"] = str(item.get("finish_response", ""))
+    return proposal
 
 
 def prompt4a_propose_batch(goal: str, s_current: dict[str, bool],
                            trace: list[dict], tried: list[str],
                            max_actions: int, model: str,
-                           config: AgentConfig | None = None) -> dict | None:
+                           config: AgentConfig | None = None,
+                           failed_attempts: list[dict] | None = None) -> dict | None:
     del s_current
     config = config or default_config_from_env()
     done_steps = "\n".join(
@@ -540,9 +540,10 @@ def prompt4a_propose_batch(goal: str, s_current: dict[str, bool],
             f"Goal: {goal}\n\n"
             f"Steps already accepted:\n{done_steps}\n\n"
             f"{_property_prompt_block(config.violation_policy)}"
-            f"Rejected first actions for this planning point: {tried or 'none'}\n\n"
+            f"Failed plan attempts and backtrack feedback:\n{_feedback_json(failed_attempts)}\n\n"
+            f"Banned first actions at this planning point: {tried or 'none'}\n\n"
             f"Return at most {max_actions} remaining action(s)."},
-    ], model, tag="4A_propose_batch")
+    ], model, tag="4A_propose_batch", max_tokens=_openai_planning_max_tokens())
 
     result = _extract_json(content)
     if isinstance(result, list):
@@ -707,75 +708,82 @@ def _state_path_from_trace(trace: list[dict]) -> list[dict]:
     ]
 
 
-def _append_finish_node(
-    planning_tree: dict,
-    *,
-    parent_node_id: int | None,
-    depth: int,
-    s_current: dict[str, bool],
-    trace: list[dict],
-    retry_index: int,
-    proposal: dict | None = None,
-) -> dict:
-    node_id = len(planning_tree["nodes"])
-    node = make_planning_node(
-        node_id=node_id,
-        parent_node_id=parent_node_id,
-        depth=depth,
-        state_before=dict(s_current),
-        state_path=_state_path_from_trace(trace),
-        action_label="goal_satisfied",
-        tool="none",
-        args={},
-        state_after=dict(s_current),
-        verification=make_verification(
-            passed=True,
-            properties_checked=[],
-            violations=["[skipped] goal already satisfied"],
-            skipped=True,
-        ),
-        attempts=[
-            make_attempt(
-                retry_index=retry_index,
-                accepted=True,
-                proposal=proposal or {
-                    "action_label": "goal_satisfied",
-                    "tool": "none",
-                    "args": {},
-                },
-                finish=True,
-            )
-        ],
-        result="finish",
+def _branch_retry_budget(config: AgentConfig) -> int:
+    if config.violation_policy in NONBLOCKING_VIOLATION_POLICIES:
+        return max(1, config.max_retries)
+    return config.max_retries
+
+
+def _proposal_finish_response(proposal: dict | None) -> str:
+    if not isinstance(proposal, dict):
+        return "done"
+    return str(
+        proposal.get("finish_response")
+        or proposal.get("rationale")
+        or "done"
     )
-    node["outcome"] = {"finish_response": "goal already satisfied"}
-    append_node(planning_tree, node, link_parent=True)
-    return node
 
 
-def _mark_branch_backtracked(nodes: list[dict], failure: dict) -> None:
-    mark_accepted_branch_backtracked(nodes, failure)
+def _request_plan_bundle(
+    *,
+    goal: str,
+    current_state: dict[str, bool],
+    accepted_trace: list[dict],
+    failed_attempts: list[dict],
+    banned_first_actions: list[str],
+    depth: int,
+    model: str,
+    config: AgentConfig,
+) -> dict | None:
+    if config.planning_granularity == PLANNING_BATCH:
+        max_actions = max(1, config.max_plan_steps - depth)
+        return prompt4a_propose_batch(
+            goal,
+            current_state,
+            accepted_trace,
+            banned_first_actions,
+            max_actions,
+            model,
+            config,
+            failed_attempts=failed_attempts,
+        )
+
+    proposal = prompt4a_propose(
+        goal,
+        current_state,
+        accepted_trace,
+        banned_first_actions,
+        model,
+        config,
+        failed_attempts=failed_attempts,
+    )
+    if proposal is None:
+        return None
+    if str(proposal.get("action_label", "")) == "goal_satisfied":
+        return {
+            "plan": [],
+            "finish_response": _proposal_finish_response(proposal),
+        }
+    return {
+        "plan": [proposal],
+        "finish_response": _proposal_finish_response(proposal),
+    }
 
 
-def _check_candidate(
+def _verify_candidate(
     *,
     proposal: dict,
     s0: dict[str, bool],
     s_current: dict[str, bool],
     trace: list[dict],
-    planning_tree: dict,
-    parent_node_id: int | None,
-    depth: int,
-    retry_index: int,
     model: str,
-    config: AgentConfig,
     is_complete_trace: bool = False,
-) -> tuple[dict, dict[str, bool], bool, str, dict]:
+) -> dict:
     action_label = proposal.get("action_label", "unknown")
     tool = proposal.get("tool", "none")
     args = proposal.get("args") or {}
 
-    print(f"    → {action_label}: {tool}({json.dumps(args)})")
+    print(f"    -> {action_label}: {tool}({json.dumps(args)})")
     s_after = prompt4b_predict(action_label, tool, args, s_current, model)
     candidate = {
         "action_label": action_label,
@@ -792,55 +800,339 @@ def _check_candidate(
     )
     violations_list = [v for v in violations_str.split(";") if v.strip()] if violations_str else []
 
+    tlc_result = verification_result.get("tlc_result", {})
+    skipped = bool(tlc_result.get("skipped"))
     verif = make_verification(
         passed=passed,
         properties_checked=verification_result.get("properties_checked", []),
         violations=violations_list,
         tla_spec=tla_spec,
-        skipped=bool(verification_result.get("tlc_result", {}).get("skipped")),
+        skipped=skipped,
     )
-    node_result = "accepted" if passed else "rejected"
-    if not passed and config.violation_policy in NONBLOCKING_VIOLATION_POLICIES:
-        node_result = "accepted_with_ignored_violations"
     failure_feedback = None
     if not passed:
         failure_feedback = {
-            "type": "tla_property_violation",
+            "type": "verification_skipped" if skipped else "tla_property_violation",
+            "action": _planning_action_from_step(candidate),
             "violations": violations_list,
+            "message": violations_str or (
+                "TLC verification was skipped." if skipped else "TLC verification failed."
+            ),
         }
-    accepted_by_policy = passed or config.violation_policy in NONBLOCKING_VIOLATION_POLICIES
+    return {
+        "candidate": candidate,
+        "state_after": s_after,
+        "passed": passed,
+        "violations_str": violations_str,
+        "verification": verif,
+        "failure": failure_feedback,
+    }
+
+
+def _accept_node(node: dict, candidate: dict, check: dict) -> None:
+    result = (
+        "accepted_with_ignored_violations"
+        if check.get("ignored_by_policy")
+        else "accepted"
+    )
+    set_node_outcome(
+        node,
+        result=result,
+        action_label=candidate.get("action_label", "unknown"),
+        tool=candidate.get("tool", "none"),
+        args=candidate.get("args") or {},
+        state_after=check.get("state_after") or {},
+        verification=check.get("verification"),
+    )
+
+
+def _search_plan(
+    *,
+    goal: str,
+    s0: dict[str, bool],
+    current_state: dict[str, bool],
+    accepted_trace: list[dict],
+    depth: int,
+    planning_tree: dict,
+    parent_node_id: int | None,
+    inherited_failures: list[dict],
+    hint_plan: list[dict] | None,
+    model: str,
+    config: AgentConfig,
+    checkpoint: Callable[[], None],
+) -> dict:
+    """Search recursively using one planning-tree node per candidate action."""
+    if len(planning_tree["nodes"]) >= config.max_plan_steps:
+        return {
+            "success": False,
+            "failure": {
+                "type": "max_tries",
+                "depth": depth,
+                "nodes_created": len(planning_tree["nodes"]),
+                "message": (
+                    "Planning exceeded the max node budget of %d."
+                    % config.max_plan_steps
+                ),
+            },
+            "finish_response": "No feasible property-satisfying plan found.",
+        }
+
+    node_id = len(planning_tree["nodes"])
     node = make_planning_node(
-        node_id=len(planning_tree["nodes"]),
+        node_id=node_id,
         parent_node_id=parent_node_id,
         depth=depth,
-        state_path=_state_path_from_trace(trace),
-        action_label=action_label,
-        tool=tool,
-        args=args,
-        state_before=dict(s_current),
-        state_after=s_after,
-        verification=verif,
-        attempts=[
-            make_attempt(
-                retry_index=retry_index,
-                accepted=accepted_by_policy,
-                proposal=proposal,
-                predicted_state_after=s_after,
-                verification=verif,
-                violation_policy=config.violation_policy,
-                failure_feedback=failure_feedback,
-                ignored_property_violation=(
-                    failure_feedback
-                    if failure_feedback is not None
-                    and config.violation_policy in NONBLOCKING_VIOLATION_POLICIES
-                    else None
-                ),
-            )
-        ],
-        result=node_result,
+        state_before=dict(current_state),
+        state_path=_state_path_from_trace(accepted_trace),
     )
     append_node(planning_tree, node, link_parent=True)
-    return candidate, s_after, passed, violations_str, node
+    checkpoint()
+
+    failed_attempts = list(inherited_failures)
+    banned_first_actions: list[str] = []
+    current_hint = (
+        copy.deepcopy(hint_plan)
+        if hint_plan and config.planning_granularity == PLANNING_BATCH
+        else []
+    )
+
+    for child_index in range(_branch_retry_budget(config)):
+        if current_hint:
+            print(f"  [depth {depth+1} attempt {child_index+1}] reusing planned suffix")
+            plan_bundle = {
+                "plan": copy.deepcopy(current_hint),
+                "finish_response": "done",
+            }
+            attempt = make_attempt(
+                retry_index=child_index,
+                accepted=False,
+                planner_decision=plan_bundle,
+                plan_source="hint_plan",
+                hint_plan_length=len(current_hint),
+            )
+            current_hint = []
+        else:
+            print(f"  [depth {depth+1} attempt {child_index+1}] proposing action...")
+            try:
+                plan_bundle = _request_plan_bundle(
+                    goal=goal,
+                    current_state=current_state,
+                    accepted_trace=accepted_trace,
+                    failed_attempts=failed_attempts,
+                    banned_first_actions=banned_first_actions,
+                    depth=depth,
+                    model=model,
+                    config=config,
+                )
+            except Exception as exc:
+                failure = {
+                    "type": "planning_error",
+                    "depth": depth,
+                    "child_index": child_index,
+                    "message": str(exc),
+                }
+                node["attempts"].append(
+                    make_attempt(
+                        retry_index=child_index,
+                        accepted=False,
+                        error=str(exc),
+                        failure_feedback=failure,
+                    )
+                )
+                checkpoint()
+                failed_attempts.append(failure)
+                current_hint = []
+                continue
+
+            if plan_bundle is None:
+                failure = {
+                    "type": "planning_error",
+                    "depth": depth,
+                    "child_index": child_index,
+                    "message": "Planner returned unparsable or invalid JSON.",
+                }
+                node["attempts"].append(
+                    make_attempt(
+                        retry_index=child_index,
+                        accepted=False,
+                        error=failure["message"],
+                        failure_feedback=failure,
+                    )
+                )
+                checkpoint()
+                failed_attempts.append(failure)
+                current_hint = []
+                continue
+
+            attempt = make_attempt(
+                retry_index=child_index,
+                accepted=False,
+                planner_decision=plan_bundle,
+            )
+
+        plan = plan_bundle.get("plan", [])
+        if not isinstance(plan, list):
+            plan = []
+        if config.planning_granularity == PLANNING_STEP and len(plan) > 1:
+            attempt["truncated_to_single_step"] = True
+            plan = plan[:1]
+            plan_bundle = dict(plan_bundle)
+            plan_bundle["plan"] = plan
+            attempt["planner_decision"] = plan_bundle
+
+        first_action = plan[0] if plan else None
+        if isinstance(first_action, dict) and first_action.get("action_label") == "goal_satisfied":
+            plan = []
+            plan_bundle = dict(plan_bundle)
+            plan_bundle["plan"] = []
+            plan_bundle["finish_response"] = _proposal_finish_response(first_action)
+            attempt["planner_decision"] = plan_bundle
+
+        if not plan:
+            finish_response = str(plan_bundle.get("finish_response") or "done")
+            attempt["accepted"] = True
+            attempt["finish"] = True
+            node["attempts"].append(attempt)
+            set_node_outcome(
+                node,
+                result="finish",
+                finish_response=finish_response,
+            )
+            checkpoint()
+            return {
+                "success": True,
+                "plan": [],
+                "finish_response": finish_response,
+                "node_id": node_id,
+            }
+
+        action = plan[0]
+        tail = plan[1:] if config.planning_granularity == PLANNING_BATCH else []
+        check = _verify_candidate(
+            proposal=action,
+            s0=s0,
+            s_current=current_state,
+            trace=accepted_trace,
+            model=model,
+            is_complete_trace=(
+                not tail and config.planning_granularity == PLANNING_BATCH
+            ),
+        )
+        candidate = check["candidate"]
+        attempt["action"] = candidate
+        attempt["proposal"] = action
+        attempt["predicted_state_after"] = check["state_after"]
+        attempt["verification"] = check["verification"]
+
+        if not check["passed"]:
+            failure = check["failure"]
+            can_continue = (
+                config.violation_policy in NONBLOCKING_VIOLATION_POLICIES
+                and failure is not None
+            )
+            if can_continue:
+                attempt["ignored_property_violation"] = failure
+                check["ignored_by_policy"] = True
+            else:
+                if check["violations_str"]:
+                    print(f"    FAIL: {check['violations_str'][:120]}")
+                attempt["failure_feedback"] = failure
+                node["attempts"].append(attempt)
+                checkpoint()
+                if failure is not None:
+                    failed_attempts.append(failure)
+                banned_first_actions.append(str(candidate.get("action_label", "unknown")))
+                current_hint = []
+                continue
+
+        if check["passed"]:
+            print("    PASS")
+        elif check["violations_str"]:
+            print(f"    {config.violation_policy.upper()} VIOLATION: {check['violations_str'][:120]}")
+        else:
+            print(f"    {config.violation_policy.upper()} VERIFICATION FAILURE")
+
+        if not tail and config.planning_granularity == PLANNING_BATCH:
+            attempt["accepted"] = True
+            node["attempts"].append(attempt)
+            _accept_node(node, candidate, check)
+            checkpoint()
+            return {
+                "success": True,
+                "plan": [candidate],
+                "finish_response": str(plan_bundle.get("finish_response") or "done"),
+                "node_id": node_id,
+            }
+
+        child_result = _search_plan(
+            goal=goal,
+            s0=s0,
+            current_state=check["state_after"],
+            accepted_trace=accepted_trace + [candidate],
+            depth=depth + 1,
+            planning_tree=planning_tree,
+            parent_node_id=node_id,
+            inherited_failures=[],
+            hint_plan=tail if config.planning_granularity == PLANNING_BATCH else None,
+            model=model,
+            config=config,
+            checkpoint=checkpoint,
+        )
+        attempt["child_node_id"] = child_result.get("node_id")
+
+        if child_result.get("success"):
+            attempt["accepted"] = True
+            node["attempts"].append(attempt)
+            _accept_node(node, candidate, check)
+            checkpoint()
+            return {
+                "success": True,
+                "plan": [candidate] + child_result.get("plan", []),
+                "finish_response": child_result.get(
+                    "finish_response",
+                    str(plan_bundle.get("finish_response") or "done"),
+                ),
+                "node_id": node_id,
+            }
+
+        child_failure = child_result.get("failure") or {
+            "type": "child_failure",
+            "depth": depth + 1,
+            "message": "Child subtree exhausted.",
+        }
+        attempt["child_failure"] = child_failure
+        node["attempts"].append(attempt)
+        checkpoint()
+        if child_failure.get("type") == "max_tries":
+            set_node_outcome(node, result="backtracked", failure=child_failure)
+            checkpoint()
+            return {
+                "success": False,
+                "failure": child_failure,
+                "finish_response": "No feasible property-satisfying plan found.",
+                "node_id": node_id,
+            }
+        failed_attempts.append(child_failure)
+        current_hint = []
+
+    exhaustion_failure = {
+        "type": "branch_exhausted",
+        "depth": depth,
+        "node_id": node_id,
+        "failed_attempts": failed_attempts,
+        "message": (
+            "All %d action attempts at this node were exhausted."
+            % _branch_retry_budget(config)
+        ),
+    }
+    set_node_outcome(node, result="backtracked", failure=exhaustion_failure)
+    checkpoint()
+    return {
+        "success": False,
+        "failure": exhaustion_failure,
+        "finish_response": "No feasible property-satisfying plan found.",
+        "node_id": node_id,
+    }
 
 
 def phase4_plan(goal: str, s0: dict[str, bool],
@@ -855,19 +1147,17 @@ def phase4_plan(goal: str, s0: dict[str, bool],
     planning_tree — canonical planning-tree dict in utils.session schema
     """
     config = config or default_config_from_env()
-    trace: list[dict] = []
-    s_current = dict(s0)
-    tried_per_step: list[list[str]] = []
     planning_tree = planning_tree or make_planning_tree(
         mode="%s_%s" % (config.planning_granularity, config.violation_policy),
         max_steps=config.max_plan_steps,
         max_retries=config.max_retries,
+        max_branch_retries=config.max_retries,
         planning_granularity=config.planning_granularity,
         violation_policy=config.violation_policy,
         properties=PROPERTIES,
         initial_state=s0,
     )
-    current_parent_node_id: int | None = None
+    planning_tree.setdefault("max_branch_retries", config.max_retries)
 
     def checkpoint() -> None:
         if result_record is not None:
@@ -879,273 +1169,53 @@ def phase4_plan(goal: str, s0: dict[str, bool],
         f"retries={config.max_retries})...\033[0m"
     )
 
-    if config.planning_granularity == PLANNING_BATCH:
-        return _phase4_plan_batch(
-            goal,
-            s0,
-            model,
-            config,
-            trace,
-            s_current,
-            planning_tree,
-            current_parent_node_id,
-            result_record=result_record,
-            result_path=result_path,
-        )
-
-    goal_done = False
-    blocked = False
-    attempt_budget = (
-        max(1, config.max_retries)
-        if config.violation_policy in NONBLOCKING_VIOLATION_POLICIES
-        else config.max_retries
+    result = _search_plan(
+        goal=goal,
+        s0=s0,
+        current_state=dict(s0),
+        accepted_trace=[],
+        depth=0,
+        planning_tree=planning_tree,
+        parent_node_id=None,
+        inherited_failures=[],
+        hint_plan=None,
+        model=model,
+        config=config,
+        checkpoint=checkpoint,
     )
+    feasible = bool(result.get("success"))
+    if feasible:
+        return result.get("plan", []), planning_tree, True
 
-    for step_idx in range(config.max_plan_steps):
-        while len(tried_per_step) <= step_idx:
-            tried_per_step.append([])
-        tried = tried_per_step[step_idx]
+    if result.get("failure"):
+        planning_tree["failure"] = result["failure"]
+    return [], planning_tree, False
 
-        if goal_done:
-            print(f"  [step {step_idx+1}] skipped (goal already satisfied)")
+
+def _rejected_action_labels(planning_tree: dict) -> list[str]:
+    labels: list[str] = []
+    seen: set[str] = set()
+
+    def add(label: Any) -> None:
+        text = str(label or "").strip()
+        if text and text not in seen:
+            labels.append(text)
+            seen.add(text)
+
+    for node in planning_tree.get("nodes", []):
+        if not isinstance(node, dict):
             continue
-
-        attempt = 0
-        proposal_misses = 0
-        MAX_PROPOSAL_MISSES = 6
-        accepted_this_step = False
-
-        while attempt < attempt_budget:
-            if proposal_misses >= MAX_PROPOSAL_MISSES:
-                print(f"  [step {step_idx+1}] Too many repeated/invalid proposals — stopping")
-                planning_tree["failure"] = {
-                    "type": "proposal_exhausted",
-                    "depth": step_idx,
-                    "message": "Too many repeated or invalid proposals before verification.",
-                }
-                checkpoint()
-                blocked = True
-                break
-
-            print(f"  [step {step_idx+1} attempt {attempt+1}] proposing action...")
-            proposal = prompt4a_propose(goal, s_current, trace, tried, model, config)
-            if proposal is None:
-                print(f"    4A parse error, skipping")
-                proposal_misses += 1
+        action = node.get("action") or {}
+        if node.get("result") == "rejected" and isinstance(action, dict):
+            add(action.get("label"))
+        for attempt in node.get("attempts", []):
+            if not isinstance(attempt, dict) or attempt.get("accepted"):
                 continue
+            proposal = attempt.get("proposal") or attempt.get("action") or {}
+            if isinstance(proposal, dict):
+                add(proposal.get("action_label") or proposal.get("label"))
+    return labels
 
-            action_label = proposal.get("action_label", "unknown")
-            tool         = proposal.get("tool", "none")
-            args         = proposal.get("args") or {}
-
-            if action_label == "goal_satisfied":
-                print(f"  [step {step_idx+1}] Goal satisfied — remaining steps will be skipped")
-                _append_finish_node(
-                    planning_tree,
-                    parent_node_id=current_parent_node_id,
-                    depth=step_idx,
-                    s_current=s_current,
-                    trace=trace,
-                    retry_index=attempt,
-                    proposal=proposal,
-                )
-                checkpoint()
-                goal_done = True
-                accepted_this_step = True
-                break
-
-            if action_label in tried:
-                print(f"    {action_label} already tried, re-asking LLM")
-                proposal_misses += 1
-                continue
-
-            proposal_misses = 0
-            attempt += 1
-            candidate, s_after, passed, violations_str, node = _check_candidate(
-                proposal=proposal,
-                s0=s0,
-                s_current=s_current,
-                trace=trace,
-                planning_tree=planning_tree,
-                parent_node_id=current_parent_node_id,
-                depth=step_idx,
-                retry_index=attempt - 1,
-                model=model,
-                config=config,
-            )
-            checkpoint()
-
-            if passed or config.violation_policy in NONBLOCKING_VIOLATION_POLICIES:
-                if passed:
-                    print(f"    \033[32mPASS\033[0m")
-                elif violations_str:
-                    print(f"    \033[33m{config.violation_policy.upper()} VIOLATION: {violations_str[:120]}\033[0m")
-                else:
-                    print(f"    \033[33m{config.violation_policy.upper()} VERIFICATION FAILURE\033[0m")
-                trace.append(candidate)
-                s_current = s_after
-                current_parent_node_id = node["node_id"]
-                accepted_this_step = True
-                break
-
-            if violations_str:
-                print(f"    \033[31mFAIL: {violations_str[:120]}\033[0m")
-            tried.append(action_label)
-
-        if blocked:
-            break
-        if not accepted_this_step and not goal_done:
-            print(f"  [step {step_idx+1}] Exhausted retries — blocking execution")
-            planning_tree["failure"] = {
-                "type": "max_retries",
-                "depth": step_idx,
-                "tried_actions": list(tried),
-                "message": "Exhausted action retries while planning this step.",
-            }
-            checkpoint()
-            blocked = True
-            break
-
-    feasible = (goal_done or bool(trace)) and not blocked
-    return trace, planning_tree, feasible
-
-
-def _phase4_plan_batch(
-    goal: str,
-    s0: dict[str, bool],
-    model: str,
-    config: AgentConfig,
-    trace: list[dict],
-    s_current: dict[str, bool],
-    planning_tree: dict,
-    current_parent_node_id: int | None,
-    *,
-    result_record: dict[str, Any] | None = None,
-    result_path: str | None = None,
-) -> tuple[list[dict], dict, bool]:
-    tried: list[str] = []
-    attempt_budget = (
-        max(1, config.max_retries)
-        if config.violation_policy in NONBLOCKING_VIOLATION_POLICIES
-        else config.max_retries
-    )
-
-    def checkpoint() -> None:
-        if result_record is not None:
-            _checkpoint_result(result_record, result_path)
-
-    for attempt in range(attempt_budget):
-        remaining = config.max_plan_steps - len(trace)
-        if remaining <= 0:
-            return trace, planning_tree, bool(trace)
-
-        print(f"  [batch attempt {attempt+1}] proposing up to {remaining} action(s)...")
-        bundle = prompt4a_propose_batch(goal, s_current, trace, tried, remaining, model, config)
-        if bundle is None:
-            print("    4A batch parse error")
-            continue
-
-        plan = bundle.get("plan", [])
-        if not plan:
-            print("  [batch] Goal satisfied or empty plan returned")
-            _append_finish_node(
-                planning_tree,
-                parent_node_id=current_parent_node_id,
-                depth=len(trace),
-                s_current=s_current,
-                trace=trace,
-                retry_index=attempt,
-                proposal={
-                    "action_label": "goal_satisfied",
-                    "tool": "none",
-                    "args": {},
-                    "finish_response": bundle.get("finish_response", ""),
-                },
-            )
-            checkpoint()
-            return trace, planning_tree, True
-
-        batch_trace = list(trace)
-        batch_state = dict(s_current)
-        batch_parent_node_id = current_parent_node_id
-        batch_nodes: list[dict] = []
-        batch_ok = True
-        failed_label = ""
-
-        for offset, proposal in enumerate(plan):
-            action_label = proposal.get("action_label", "unknown")
-            if action_label == "goal_satisfied":
-                print("  [batch] Goal satisfied")
-                _append_finish_node(
-                    planning_tree,
-                    parent_node_id=batch_parent_node_id,
-                    depth=len(batch_trace),
-                    s_current=batch_state,
-                    trace=batch_trace,
-                    retry_index=attempt,
-                    proposal=proposal,
-                )
-                checkpoint()
-                return batch_trace, planning_tree, True
-
-            candidate, s_after, passed, violations_str, node = _check_candidate(
-                proposal=proposal,
-                s0=s0,
-                s_current=batch_state,
-                trace=batch_trace,
-                planning_tree=planning_tree,
-                parent_node_id=batch_parent_node_id,
-                depth=len(batch_trace),
-                retry_index=attempt,
-                model=model,
-                config=config,
-                is_complete_trace=(offset == len(plan) - 1),
-            )
-            batch_nodes.append(node)
-            checkpoint()
-
-            if passed or config.violation_policy in NONBLOCKING_VIOLATION_POLICIES:
-                if passed:
-                    print(f"    \033[32mPASS\033[0m")
-                elif violations_str:
-                    print(f"    \033[33m{config.violation_policy.upper()} VIOLATION: {violations_str[:120]}\033[0m")
-                else:
-                    print(f"    \033[33m{config.violation_policy.upper()} VERIFICATION FAILURE\033[0m")
-                batch_trace.append(candidate)
-                batch_state = s_after
-                batch_parent_node_id = node["node_id"]
-                continue
-
-            if violations_str:
-                print(f"    \033[31mFAIL: {violations_str[:120]}\033[0m")
-            batch_ok = False
-            failed_label = action_label
-            break
-
-        if batch_ok:
-            return batch_trace, planning_tree, True
-
-        if failed_label:
-            tried.append(failed_label)
-            _mark_branch_backtracked(
-                batch_nodes,
-                {
-                    "type": "batch_suffix_failed",
-                    "batch_attempt": attempt,
-                    "failed_action": failed_label,
-                    "message": "A later action in this batch failed verification.",
-                },
-            )
-            checkpoint()
-
-    print("  [batch] Exhausted retries — blocking execution")
-    planning_tree["failure"] = {
-        "type": "max_retries",
-        "tried_actions": list(tried),
-        "message": "Exhausted batch planning retries.",
-    }
-    checkpoint()
-    return trace, planning_tree, False
 
 def phase5_execute(
     trace: list[dict],
@@ -1194,10 +1264,14 @@ def phase5_execute(
             observed_trace,
             is_complete_trace=(i == len(trace)),
         )
-        if tla_result["passed"]:
+        tlc_result = tla_result.get("tlc_result", {})
+        if tlc_result.get("skipped"):
+            reason = str(tlc_result.get("reason") or "TLC verification was skipped.")
+            print(f"  \033[33mexecution verification SKIPPED: {reason[:120]}\033[0m")
+        elif tla_result["passed"]:
             print("  \033[32mexecution verification PASS\033[0m")
         else:
-            violations = "; ".join(tla_result.get("tlc_result", {}).get("violations", []))
+            violations = "; ".join(tlc_result.get("violations", []))
             print(f"  \033[31mexecution verification FAIL: {violations[:120]}\033[0m")
         node_index = i - 1
         if node_index < len(executed_nodes):
@@ -1271,28 +1345,20 @@ def handle_query(goal: str, model: str,
             "violation_policy":     config.violation_policy,
             "max_plan_steps":       config.max_plan_steps,
             "max_retries":          config.max_retries,
+            "max_branch_retries":   config.max_retries,
         },
     )
     turn["planning_tree"] = make_planning_tree(
         mode=planning_mode,
         max_steps=config.max_plan_steps,
         max_retries=config.max_retries,
+        max_branch_retries=config.max_retries,
         planning_granularity=config.planning_granularity,
         violation_policy=config.violation_policy,
         properties=PROPERTIES,
     )
     turn["status"] = "planning"
     result_path = _start_result_session(turn)
-
-    in_scope, reason = prompt6_guard(goal, model)
-    if not in_scope:
-        response = f"Out of scope: {reason}"
-        turn["status"]        = "out_of_scope"
-        turn["final_message"] = response
-        turn["llm_log"]       = _llm_log_snapshot()
-        turn["planning_tree"]["tree_summary"] = build_tree_summary(turn["planning_tree"])
-        result_path = _write_result(turn, result_path)
-        return _append_result_notice(response, result_path), turn
 
     print(f"\n\033[35m[Phase 3] Observing initial state s0...\033[0m")
     s0 = phase3_build_s0(model)
@@ -1336,11 +1402,7 @@ def handle_query(goal: str, model: str,
             response = "The request appears already satisfied; no git action was executed."
         turn["status"] = "finished"
     else:
-        tried_all = [
-            n["action"]["label"]
-            for n in planning_tree["nodes"]
-            if n.get("result") == "rejected"
-        ]
+        tried_all = _rejected_action_labels(planning_tree)
         response   = prompt7_blocked(goal, s0, tried_all, model)
         turn["status"] = "infeasible"
 
@@ -1372,6 +1434,7 @@ def save_session(turns: list[dict], model: str,
                 "violation_policy": config.violation_policy,
                 "max_plan_steps": config.max_plan_steps,
                 "max_retries": config.max_retries,
+                "max_branch_retries": config.max_retries,
             },
         )
     if isinstance(session.get("planning_tree"), dict):
@@ -1427,6 +1490,9 @@ def repl() -> None:
     def show_cwd(_args: str) -> str:
         return str(WORK_DIR)
 
+    def reset_lab(_args: str) -> str:
+        return reset_git_learning_lab(WORK_DIR).message
+
     def set_model(args: str) -> str:
         nonlocal model
         if args:
@@ -1463,8 +1529,9 @@ def repl() -> None:
         message_handler=handle_message,
         intro=intro_lines,
         help_title=help_title,
-        help_footer="Each query runs: guard -> Phase 3 (observe s0) -> Phase 4 (plan+TLC) -> Phase 5 (execute).",
+        help_footer="Each query runs: Phase 3 (observe s0) -> Phase 4 (plan+TLC) -> Phase 5 (execute).",
         commands=[
+            ChatCommand(("/reset", "reset"), "reset git-learning-lab from parent installer", reset_lab),
             ChatCommand(("/props",), "show property counts", show_props),
             ChatCommand(("/model",), "switch OpenAI model", set_model, "<name>"),
             *build_planning_commands(

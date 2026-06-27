@@ -15,6 +15,7 @@ dependencies = [
 [project.scripts]
 run-agents = "utils.run_agents:main"
 run_agents = "utils.run_agents:main"
+tree-report = "utils.tree_report:main"
 
 [tool.setuptools]
 packages = ["shrdlu_agents", "utils"]
@@ -27,3 +28,4 @@ utils = "utils"
 
 [tool.setuptools.package-data]
 shrdlu_agents = ["resources/*.json"]
+utils = ["*.sh"]
