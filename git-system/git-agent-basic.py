@@ -9,8 +9,9 @@ Launch it anywhere inside (or outside) a git repo:
 The agent works on the directory where it is launched.
 
 Environment variables:
-    OPENAI_API_KEY      API key (default: "EMPTY" for local servers)
-    OPENAI_BASE_URL     Base URL (default: https://api.openai.com/v1)
+    SHRDLU_OPENAI_API_KEY      API key (default: "EMPTY" for local servers)
+    SHRDLU_OPENAI_BASE_URL     Base URL (default: http://127.0.0.1:30000/v1/)
+    SHRDLU_OPENAI_MODEL        model name
 """
 from __future__ import annotations
 
@@ -31,7 +32,15 @@ if str(_REPO_ROOT) not in sys.path:
 from utils.chat_terminal import ChatCommand, ChatTerminal
 from utils.session import make_session, save_session as _save_session_util
 
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_OPENAI_BASE_URL = "http://127.0.0.1:30000/v1/"
+DEFAULT_OPENAI_API_KEY = "EMPTY"
+DEFAULT_OPENAI_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+DEFAULT_OPENAI_TEMPERATURE = 0.2
+DEFAULT_OPENAI_MAX_TOKENS = 512
+DEFAULT_OPENAI_ENABLE_THINKING = True
+DEFAULT_OPENAI_SEPARATE_REASONING = True
+
+DEFAULT_MODEL = DEFAULT_OPENAI_MODEL
 MAX_STEPS = 15
 MAX_OUTPUT_CHARS = 6000
 CMD_TIMEOUT = 20
@@ -133,10 +142,37 @@ TOOL_IMPL: dict[str, Any] = {
     "shell_cmd": tool_shell,
 }
 
+def _openai_base_url() -> str:
+    return os.environ.get("SHRDLU_OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL)
+
+
+def _openai_api_key() -> str:
+    return os.environ.get("SHRDLU_OPENAI_API_KEY", DEFAULT_OPENAI_API_KEY)
+
+
+def _openai_model() -> str:
+    return os.environ.get("SHRDLU_OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+
+
+def _openai_temperature() -> float:
+    return float(os.environ.get("SHRDLU_OPENAI_TEMPERATURE", str(DEFAULT_OPENAI_TEMPERATURE)))
+
+
+def _openai_max_tokens() -> int:
+    return int(os.environ.get("SHRDLU_OPENAI_MAX_TOKENS", str(DEFAULT_OPENAI_MAX_TOKENS)))
+
+
+def _openai_extra_body() -> dict[str, Any]:
+    return {
+        "chat_template_kwargs": {"enable_thinking": DEFAULT_OPENAI_ENABLE_THINKING},
+        "separate_reasoning": DEFAULT_OPENAI_SEPARATE_REASONING,
+    }
+
+
 def _make_client() -> openai.OpenAI:
     return openai.OpenAI(
-        api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
-        base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        api_key=_openai_api_key(),
+        base_url=_openai_base_url(),
     )
 
 TOOLS = [
@@ -194,8 +230,23 @@ def run_turn(messages: list[dict], user_query: str, model: str, verbose: bool,
     messages.append({"role": "user", "content": user_query})
 
     for _ in range(MAX_STEPS):
-        resp = client.chat.completions.create(model=model, messages=messages, tools=TOOLS)
-        msg = resp.choices[0].message
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=TOOLS,
+                temperature=_openai_temperature(),
+                max_tokens=_openai_max_tokens(),
+                extra_body=_openai_extra_body(),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "OpenAI-compatible chat error at %s: %s" % (_openai_base_url(), exc)
+            ) from exc
+        try:
+            msg = resp.choices[0].message
+        except (AttributeError, IndexError, TypeError) as exc:
+            raise RuntimeError("Unexpected OpenAI-compatible response: %r" % resp) from exc
         tool_calls = msg.tool_calls or []
 
         if not tool_calls:
@@ -260,7 +311,7 @@ def _is_git_repo(path: Path) -> bool:
 
 
 def repl() -> None:
-    model = DEFAULT_MODEL
+    model = _openai_model()
     verbose = False
     messages: list[dict] = [{"role": "system", "content": SYSTEM}]
     client = _make_client()
@@ -268,7 +319,7 @@ def repl() -> None:
     in_repo = _is_git_repo(WORK_DIR)
     repo_notice = "" if in_repo else "  \033[33m(not a git repo)\033[0m"
 
-    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    base_url = _openai_base_url()
 
     def intro_lines() -> list[str]:
         return [

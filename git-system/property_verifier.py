@@ -40,8 +40,15 @@ __all__ = [
 PROPERTY_FILE = Path(__file__).resolve().parent / 'resources' / 'GIT_PROPERTIES_AST.json'
 AP_FILE = Path(__file__).resolve().parent / 'resources' / 'GIT_AP_CANDIDATES.json'
 
-_DEFAULT_BASE_URL = 'http://localhost:30000/v1'
-_DEFAULT_API_KEY = 'none'
+_DEFAULT_BASE_URL = 'http://127.0.0.1:30000/v1/'
+_DEFAULT_API_KEY = 'EMPTY'
+_DEFAULT_MODEL = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
+_DEFAULT_TEMPERATURE = 0.2
+_DEFAULT_MAX_TOKENS = 512
+_DEFAULT_EXTRA_BODY = {
+    'chat_template_kwargs': {'enable_thinking': True},
+    'separate_reasoning': True,
+}
 
 
 def _load_properties(path: Path) -> List[Dict]:
@@ -101,8 +108,10 @@ def _ask_llm(ap_name: str, ap_description: str, evidence: str, client, model: st
     ]
     response = client.chat.completions.create(
         model=model,
-        max_tokens=256,
         messages=messages,
+        temperature=_DEFAULT_TEMPERATURE,
+        max_tokens=_DEFAULT_MAX_TOKENS,
+        extra_body=_DEFAULT_EXTRA_BODY,
     )
     raw = response.choices[0].message.content or ''
     answer = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip().upper()
@@ -182,10 +191,10 @@ class TransitionPropertyVerifier:
     repo_path:
         Absolute path to the git repository to inspect.
     model:
-        Anthropic model ID used for AP evaluation.
+        OpenAI-compatible model ID used for AP evaluation.
     client:
-        An ``anthropic.Anthropic`` client instance.  If omitted, one is
-        created from the ``ANTHROPIC_API_KEY`` environment variable.
+        An ``openai.OpenAI`` client instance. If omitted, one is created from
+        the OpenAI-compatible base URL and API key.
     """
 
     def __init__(
@@ -199,7 +208,7 @@ class TransitionPropertyVerifier:
     ):
         self._repo_path = repo_path
         self._client = client or self._make_client(base_url, api_key)
-        self._model = model or self._detect_model()
+        self._model = model or _DEFAULT_MODEL
         self._properties = _load_properties(PROPERTY_FILE)
         self._state_aps, self._transition_aps = _load_ap_specs(AP_FILE)
         self._state_ap_by_name: Dict[str, Dict] = {
@@ -210,12 +219,6 @@ class TransitionPropertyVerifier:
     def _make_client(base_url: str, api_key: str):
         from openai import OpenAI
         return OpenAI(base_url=base_url, api_key=api_key)
-
-    def _detect_model(self) -> str:
-        models = self._client.models.list().data
-        if not models:
-            raise RuntimeError('No models reported by the server at the given base_url.')
-        return models[0].id
 
     @property
     def properties(self) -> List[Dict]:
@@ -371,7 +374,7 @@ def main(argv=None) -> int:
     )
     parser.add_argument('--base-url', default=_DEFAULT_BASE_URL)
     parser.add_argument('--api-key', default=_DEFAULT_API_KEY)
-    parser.add_argument('--model', default=None, help='model id (auto-detected if omitted)')
+    parser.add_argument('--model', default=None, help='model id (default: SHRDLU-compatible Qwen model)')
     args = parser.parse_args(argv)
 
     verifier = TransitionPropertyVerifier(

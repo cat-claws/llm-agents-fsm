@@ -69,7 +69,15 @@ from utils.planning_terminal import (
 
 from property_verifier import TransitionPropertyVerifier as GitPropertyVerifier
 
-DEFAULT_MODEL    = "gpt-4o-mini"
+DEFAULT_OPENAI_BASE_URL = "http://127.0.0.1:30000/v1/"
+DEFAULT_OPENAI_API_KEY = "EMPTY"
+DEFAULT_OPENAI_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+DEFAULT_OPENAI_TEMPERATURE = 0.2
+DEFAULT_OPENAI_MAX_TOKENS = 512
+DEFAULT_OPENAI_ENABLE_THINKING = True
+DEFAULT_OPENAI_SEPARATE_REASONING = True
+
+DEFAULT_MODEL    = DEFAULT_OPENAI_MODEL
 MAX_PLAN_STEPS   = 10
 MAX_RETRIES      = 3
 MAX_OUTPUT_CHARS = 4000
@@ -306,12 +314,33 @@ def _llm_log_snapshot() -> list[dict]:
 
 _CLIENT: openai.OpenAI | None = None
 
+def _openai_base_url() -> str:
+    return os.environ.get("SHRDLU_OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL)
+
+def _openai_api_key() -> str:
+    return os.environ.get("SHRDLU_OPENAI_API_KEY", DEFAULT_OPENAI_API_KEY)
+
+def _openai_model() -> str:
+    return os.environ.get("SHRDLU_OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+
+def _openai_temperature() -> float:
+    return float(os.environ.get("SHRDLU_OPENAI_TEMPERATURE", str(DEFAULT_OPENAI_TEMPERATURE)))
+
+def _openai_max_tokens() -> int:
+    return int(os.environ.get("SHRDLU_OPENAI_MAX_TOKENS", str(DEFAULT_OPENAI_MAX_TOKENS)))
+
+def _openai_extra_body() -> dict[str, Any]:
+    return {
+        "chat_template_kwargs": {"enable_thinking": DEFAULT_OPENAI_ENABLE_THINKING},
+        "separate_reasoning": DEFAULT_OPENAI_SEPARATE_REASONING,
+    }
+
 def _get_client() -> openai.OpenAI:
     global _CLIENT
     if _CLIENT is None:
         _CLIENT = openai.OpenAI(
-            base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-            api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
+            base_url=_openai_base_url(),
+            api_key=_openai_api_key(),
         )
     return _CLIENT
 
@@ -324,11 +353,25 @@ def _make_git_property_verifier(model: str) -> GitPropertyVerifier:
 
 def _llm(messages: list[dict], model: str,
          tools: list | None = None, tag: str = "") -> tuple[str, list]:
-    kwargs: dict[str, Any] = {"model": model, "messages": messages}
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": _openai_temperature(),
+        "max_tokens": _openai_max_tokens(),
+        "extra_body": _openai_extra_body(),
+    }
     if tools:
         kwargs["tools"] = tools
-    response = _get_client().chat.completions.create(**kwargs)
-    msg = response.choices[0].message
+    try:
+        response = _get_client().chat.completions.create(**kwargs)
+    except Exception as exc:
+        raise RuntimeError(
+            "OpenAI-compatible chat error at %s: %s" % (_openai_base_url(), exc)
+        ) from exc
+    try:
+        msg = response.choices[0].message
+    except (AttributeError, IndexError, TypeError) as exc:
+        raise RuntimeError("Unexpected OpenAI-compatible response: %r" % response) from exc
     content = (msg.content or "").strip()
 
     tool_calls = []
@@ -1347,7 +1390,7 @@ def _is_git_repo() -> bool:
     return r.returncode == 0
 
 def repl() -> None:
-    model = DEFAULT_MODEL
+    model = _openai_model()
     config = default_config_from_env()
     runtime_config = runtime_config_from_values(
         planning_granularity=config.planning_granularity,
@@ -1361,7 +1404,7 @@ def repl() -> None:
     repo_notice = "" if in_repo else "  \033[33m(not a git repo)\033[0m"
     sample_note = (f"sampled {len(PROPERTIES)}/{len(_ALL_PROPS)}"
                    if PROPERTY_SAMPLE_SIZE else f"all {len(PROPERTIES)}")
-    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    base_url = _openai_base_url()
 
     def intro_lines() -> list[str]:
         return [
