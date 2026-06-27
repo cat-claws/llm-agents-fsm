@@ -1,24 +1,22 @@
 """OpenAI-compatible natural-language agents for the SHRDLU blocks world."""
 
 import copy
-from datetime import datetime, timezone
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from shrdlu_agents.property_verifier import PROPERTY_FILE, TransitionPropertyVerifier
-from shrdlu_agents.simulator_api import SimulatorAPI
+import openai
 
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-from utils.session import SCHEMA_VERSION  # noqa: E402
+
+from utils.session import SCHEMA_VERSION
+
+from shrdlu_agents.property_verifier import PROPERTY_FILE, TransitionPropertyVerifier
+from shrdlu_agents.simulator_api import SimulatorAPI
 
 __all__ = [
     'OpenAICompatibleShrdluAgent',
@@ -26,7 +24,6 @@ __all__ = [
 
 DEFAULT_MAX_STEPS = 50
 DEFAULT_RESULT_DIR = str(Path(__file__).resolve().parents[2] / 'playground-llm-agents-fsm' / 'results')
-# Backward-compatible alias for older callers; new CLI/docs use result_dir.
 DEFAULT_TRACE_DIR = DEFAULT_RESULT_DIR
 DEFAULT_OPENAI_BASE_URL = 'http://127.0.0.1:30000/v1/'
 DEFAULT_OPENAI_API_KEY = 'EMPTY'
@@ -434,7 +431,6 @@ class _ShrdluAgentBase:
             return message
         return message + "\n\nResult saved to %s" % result_path
 
-    # Backward-compatible aliases for older FSM code/callers.
     def _start_trace_session(self, trace: Dict[str, object]) -> Optional[str]:
         return self._start_result_session(trace)
 
@@ -519,11 +515,7 @@ class OpenAICompatibleShrdluAgent(_ShrdluAgentBase):
             trace_dir=trace_dir,
         )
         if client is None:
-            if OpenAI is None:
-                raise RuntimeError(
-                    'openai package is required for OpenAI-compatible demo support.'
-                )
-            client = OpenAI(base_url=base_url, api_key=api_key)
+            client = openai.OpenAI(base_url=base_url, api_key=api_key)
         self._client = client
         self._temperature = float(temperature)
         self._max_tokens = int(max_tokens)

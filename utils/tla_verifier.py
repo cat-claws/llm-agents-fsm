@@ -1,24 +1,24 @@
 """Shared TLA+/TLC verification utilities for llm-agents-fsm.
 
-Supports two trace styles that both domains use:
+The strict cross-domain verification path is:
 
-  plain-state traces (SHRDLU style)
-    ap_trace  : list of {ap_name: bool}  — one dict per state
-    No action labels; stuttering terminal state appended automatically.
+  initial_state : {ap_name: bool}
+  action_labels : [transition/action label, ...]
+  states_after  : [{ap_name: bool}, ...]
 
-  action-labelled traces (git-agent-fsm style)
-    ap_trace  : list of {ap_name: bool}  — first entry is s0, rest are state_after
-    action_labels : list of str, len == len(ap_trace) - 1
+verify_fsm_trace() combines these into an AP trace, writes the action-labelled
+FSM into TLA+ with the active properties, then runs TLC.  AP prediction and AP
+observation stay domain-specific; TLA generation and TLC execution live here.
 
-The unified build_tla_spec() accepts both by checking whether action_labels
-is provided.  In both cases every AP name is slugified to a valid TLA+
-identifier, so long natural-language AP strings are handled cleanly.
+build_tla_spec() also retains the older plain-state trace mode for compatibility.
+In both modes every AP name is slugified to a valid TLA+ identifier, so long
+natural-language AP strings are handled cleanly.
 
 Property format (shared, SHRDLU-originated):
   {
     "id":               "prop.git.01",
     "natural_language": "...",
-    "ltl":              "G(...)",          # informational only
+    "ltl":              "G(...)",
     "ast": { "type": "globally", "operand": ... }
   }
 
@@ -38,19 +38,17 @@ __all__ = [
     "build_tla_spec",
     "build_tla_cfg",
     "run_tlc",
+    "verify_fsm_trace",
     "verify_ap_trace",
     "load_properties",
     "has_liveness",
 ]
-
-# ── jar discovery ─────────────────────────────────────────────────────────────
 
 _JAR_SEARCH = [
     "/usr/local/lib/tla2tools.jar",
     "/usr/lib/tla2tools.jar",
     str(Path.home() / "tla2tools.jar"),
     str(Path(__file__).resolve().parent.parent / "tla2tools.jar"),
-    # legacy hardcoded path used by git-agent-fsm
     "/common/home/users/r/rhzhang/tools/tla/tla2tools.jar",
 ]
 
@@ -69,13 +67,10 @@ def _find_java() -> str:
     env = os.environ.get("JAVA_BIN")
     if env:
         return env
-    # also check the conda env path used by git-agent-fsm
     legacy = "/common/home/users/r/rhzhang/.conda/envs/rh1/bin/java"
     if os.path.isfile(legacy):
         return legacy
-    return "java"   # fall back to PATH
-
-# ── AP name → valid TLA+ identifier ──────────────────────────────────────────
+    return "java"
 
 def _ap_slug(name: str, index: int) -> str:
     """Stable short TLA+ variable name: AP_<index>_<sanitised_prefix>."""
@@ -86,8 +81,6 @@ def _ap_slug(name: str, index: int) -> str:
 def _make_slug_map(ap_names: List[str]) -> Dict[str, str]:
     """Return {ap_name: tla_var} for every AP in the list."""
     return {name: _ap_slug(name, i) for i, name in enumerate(ap_names)}
-
-# ── liveness detection ────────────────────────────────────────────────────────
 
 def has_liveness(node: Dict) -> bool:
     """Return True if the LTL AST contains any finally/until operator."""
@@ -101,8 +94,6 @@ def has_liveness(node: Dict) -> bool:
     if t == "implies":
         return has_liveness(node.get("left", {})) or has_liveness(node.get("right", {}))
     return False
-
-# ── AST → TLA+ formula ───────────────────────────────────────────────────────
 
 def _ast_to_tla(node: Dict, slug_map: Dict[str, str], ap_slugs: List[str]) -> str:
     """Recursively translate an LTL AST node to a TLA+ formula string.
@@ -140,7 +131,6 @@ def _ast_to_tla(node: Dict, slug_map: Dict[str, str], ap_slugs: List[str]) -> st
 
     if t == "globally":
         inner = node["operand"]
-        # G(A => X(P))  →  [][A => P']_<<vars>>
         if (inner.get("type") == "implies"
                 and inner["right"].get("type") == "next"):
             antecedent = _ast_to_tla(inner["left"], slug_map, ap_slugs)
@@ -154,7 +144,6 @@ def _ast_to_tla(node: Dict, slug_map: Dict[str, str], ap_slugs: List[str]) -> st
         return "<>(%s)" % _ast_to_tla(node["operand"], slug_map, ap_slugs)
 
     if t == "next":
-        # Bare X outside G(A=>X(P)) — approximate as G on finite traces
         return "[](%s)" % _ast_to_tla(node["operand"], slug_map, ap_slugs)
 
     if t == "until":
@@ -163,8 +152,6 @@ def _ast_to_tla(node: Dict, slug_map: Dict[str, str], ap_slugs: List[str]) -> st
         return "(%s ~> %s)" % (l, r)
 
     return "TRUE"
-
-# ── spec builders ─────────────────────────────────────────────────────────────
 
 def build_tla_spec(
     ap_trace: List[Dict[str, bool]],
@@ -203,8 +190,6 @@ def build_tla_spec(
     lines: List[str] = []
 
     if action_labels is not None:
-        # ── action-labelled style (git-agent-fsm) ────────────────────────────
-        # ap_trace[0] = s0, ap_trace[k] = state_after action_labels[k-1]
         n = len(action_labels)
         assert len(ap_trace) == n + 1, \
             "action_labels length must be len(ap_trace)-1"
@@ -245,7 +230,6 @@ def build_tla_spec(
                 '     /\\ last_action\' = "%s"' % label,
                 "     /\\ step' = %d" % (k + 1),
             ]
-        # terminal stutter
         lines += [
             "  \\/ /\\ step = %d" % (n + 1),
             "     /\\ UNCHANGED <<%s>>" % ", ".join(all_vars),
@@ -255,8 +239,6 @@ def build_tla_spec(
         ]
 
     else:
-        # ── plain-state style (SHRDLU) ───────────────────────────────────────
-        # ap_trace[0] = state 0, ap_trace[n-1] = final state; stutter at end
         n = len(ap_trace)
         all_vars_str = "<<step, %s>>" % ", ".join(ap_slugs)
 
@@ -291,7 +273,6 @@ def build_tla_spec(
                 "     /\\ step' = %d" % i,
                 "     /\\ %s" % conj_p,
             ]
-        # stutter at final state
         lines += [
             "  \\/ /\\ step = %d" % (n - 1),
             "     /\\ step' = step",
@@ -304,13 +285,12 @@ def build_tla_spec(
             "",
         ]
 
-    # ── property definitions (shared by both styles) ──────────────────────────
     prop_names: List[str] = []
     for i, prop in enumerate(properties, 1):
         pid  = prop.get("id", "prop_%02d" % i)
         tla_id = "Property_%s" % re.sub(r"[^a-zA-Z0-9]", "_", pid)
         nl   = prop.get("natural_language", "")
-        ast  = prop.get("ast", prop)   # fall back to bare AST if no wrapper
+        ast  = prop.get("ast", prop)
         if has_liveness(ast):
             lines.append("(* %s [liveness — skipped on finite trace] *)" % pid)
             lines.append("%s == TRUE" % tla_id)
@@ -323,7 +303,6 @@ def build_tla_spec(
 
     lines.append("=" * 20)
     tla_str = "\n".join(lines)
-    # action-labelled specs include TypeOK; plain-state specs do not
     has_type_ok = action_labels is not None
     cfg_str = build_tla_cfg(prop_names, has_type_ok=has_type_ok)
     return tla_str, cfg_str, prop_names
@@ -337,8 +316,6 @@ def build_tla_cfg(prop_names: List[str], *, has_type_ok: bool = False) -> str:
     for pn in prop_names:
         lines.append("PROPERTY %s" % pn)
     return "\n".join(lines)
-
-# ── TLC runner ────────────────────────────────────────────────────────────────
 
 def run_tlc(
     tla_spec: str,
@@ -421,8 +398,6 @@ def run_tlc(
         }
 
 
-# ── high-level helper ─────────────────────────────────────────────────────────
-
 def verify_ap_trace(
     ap_trace: List[Dict[str, bool]],
     ap_names: List[str],
@@ -457,7 +432,52 @@ def verify_ap_trace(
     }
 
 
-# ── property loader ───────────────────────────────────────────────────────────
+def verify_fsm_trace(
+    initial_state: Dict[str, bool],
+    action_labels: List[str],
+    states_after: List[Dict[str, bool]],
+    ap_names: List[str],
+    properties: List[Dict],
+    *,
+    module_name: str = "AgentTrace",
+    timeout: int = 60,
+    is_complete_trace: bool = True,
+) -> Dict:
+    """Verify one explicit FSM trace using the shared action-labelled TLA path.
+
+    The caller is responsible for domain-specific AP prediction/observation.
+    This function is deliberately domain-neutral: it only assembles
+    ``s0 --action--> s1 ...`` into TLA+ and runs TLC.
+    """
+    if len(action_labels) != len(states_after):
+        raise ValueError("action_labels length must equal states_after length")
+
+    active = properties
+    if not is_complete_trace:
+        active = [p for p in properties if not has_liveness(p.get("ast", p))]
+
+    ap_trace = [initial_state] + states_after
+    tla_spec, cfg, prop_names = build_tla_spec(
+        ap_trace,
+        ap_names,
+        active,
+        action_labels=action_labels,
+        module_name=module_name,
+    )
+    tlc_result = run_tlc(tla_spec, cfg, module_name=module_name, timeout=timeout)
+    passed = bool(tlc_result.get("success") or tlc_result.get("skipped"))
+    return {
+        "passed":             passed,
+        "tla_spec":           tla_spec,
+        "tla_cfg":            cfg,
+        "tlc_result":         tlc_result,
+        "trace_length":       len(ap_trace),
+        "transition_count":   len(action_labels),
+        "action_labels":      list(action_labels),
+        "properties_checked": [p.get("id", "?") for p in active],
+        "tla_properties":     prop_names,
+    }
+
 
 def load_properties(path: str | Path) -> List[Dict]:
     """Load a properties JSON file.
@@ -472,7 +492,6 @@ def load_properties(path: str | Path) -> List[Dict]:
         return data["properties"]
     if isinstance(data, list):
         return data
-    # bare AST — wrap it
     stem = Path(path).stem
     return [{
         "id":               stem,

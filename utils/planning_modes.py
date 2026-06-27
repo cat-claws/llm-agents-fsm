@@ -15,7 +15,7 @@ PLANNING_MODE_FSM = "fsm"
 PLANNING_MODE_PLAN = "plan"
 PLANNING_MODE_ADVISORY = "advisory"
 
-PLANNING_MODE_PRESETS = {
+PLANNING_MODE_CONFIGS = {
     PLANNING_MODE_FSM: (PLANNING_BATCH, VIOLATION_RETRY, None),
     PLANNING_MODE_PLAN: (PLANNING_BATCH, VIOLATION_IGNORE, 1),
     PLANNING_MODE_ADVISORY: (PLANNING_BATCH, VIOLATION_ADVISORY, 1),
@@ -46,9 +46,9 @@ def _choice(name, value, default, allowed, invalid="default"):
     return default if default in allowed else sorted(allowed)[0]
 
 
-def planning_preset_config(value, *, retry_default, default=PLANNING_MODE_FSM, invalid="default"):
-    preset = _choice("planning preset", value, default, PLANNING_MODE_PRESETS, invalid)
-    granularity, policy, retries = PLANNING_MODE_PRESETS[preset]
+def planning_mode_config(value, *, retry_default, default=PLANNING_MODE_FSM, invalid="default"):
+    mode = _choice("planning mode", value, default, PLANNING_MODE_CONFIGS, invalid)
+    granularity, policy, retries = PLANNING_MODE_CONFIGS[mode]
     return {
         "planning_granularity": granularity,
         "violation_policy": policy,

@@ -4,7 +4,7 @@ git-agent — a terminal chat agent for git operations.
 
 Launch it anywhere inside (or outside) a git repo:
     python3 /path/to/git-agent.py
-    git-agent          # if installed via symlink in ~/bin/
+    git-agent
 
 The agent works on the directory where it is launched.
 
@@ -14,7 +14,6 @@ Environment variables:
 """
 from __future__ import annotations
 
-import datetime
 import json
 import os
 import shlex
@@ -25,25 +24,18 @@ from typing import Any
 
 import openai
 
-import sys as _sys
-from pathlib import Path as _Path
-_REPO_ROOT = _Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in _sys.path:
-    _sys.path.insert(0, str(_REPO_ROOT))
-from utils.session import make_session, save_session as _save_session_util  # noqa: E402
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-# ── configuration ────────────────────────────────────────────────────────────
+from utils.session import make_session, save_session as _save_session_util
 
 DEFAULT_MODEL = "gpt-4o-mini"
 MAX_STEPS = 15
 MAX_OUTPUT_CHARS = 6000
 CMD_TIMEOUT = 20
 
-# ── working directory ─────────────────────────────────────────────────────────
-
 WORK_DIR = Path.cwd().resolve()
-
-# ── git allowlist ─────────────────────────────────────────────────────────────
 
 ALLOWED_GIT_SUBCOMMANDS = {
     "status", "log", "diff", "show", "branch", "checkout", "switch",
@@ -52,10 +44,6 @@ ALLOWED_GIT_SUBCOMMANDS = {
     "shortlog", "describe", "reflog", "cherry-pick", "revert", "clean",
     "ls-files", "ls-remote", "submodule", "config", "init", "clone",
 }
-
-# ── shell allowlist ───────────────────────────────────────────────────────────
-# Maps the name the model uses → absolute binary path.
-# Nothing outside this table can ever be executed.
 
 SHELL_COMMANDS: dict[str, str] = {
     "ls":    "/bin/ls",
@@ -69,8 +57,6 @@ SHELL_COMMANDS: dict[str, str] = {
     "tail":  "/usr/bin/tail",
     "stat":  "/usr/bin/stat",
 }
-
-# ── system prompt ─────────────────────────────────────────────────────────────
 
 _SHELL_NAMES = ", ".join(sorted(SHELL_COMMANDS))
 
@@ -88,8 +74,6 @@ CRITICAL RULES — never break these:
 3. After performing an action, verify the result with a follow-up tool call, then report what changed.
 5. If the user asks for anything outside git operations or the allowed shell commands ({_SHELL_NAMES}), immediately refuse without calling any tool. Say clearly: "That is outside my scope. I can only help with git operations and these shell commands: {_SHELL_NAMES}."
 """
-
-# ── tool ──────────────────────────────────────────────────────────────────────
 
 def _clip(s: str) -> str:
     if len(s) <= MAX_OUTPUT_CHARS:
@@ -148,8 +132,6 @@ TOOL_IMPL: dict[str, Any] = {
     "shell_cmd": tool_shell,
 }
 
-# ── OpenAI client ─────────────────────────────────────────────────────────────
-
 def _make_client() -> openai.OpenAI:
     return openai.OpenAI(
         api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
@@ -206,8 +188,6 @@ TOOLS = [
     },
 ]
 
-# ── agent loop ────────────────────────────────────────────────────────────────
-
 def run_turn(messages: list[dict], user_query: str, model: str, verbose: bool,
              client: openai.OpenAI) -> str:
     messages.append({"role": "user", "content": user_query})
@@ -252,8 +232,6 @@ def run_turn(messages: list[dict], user_query: str, model: str, verbose: bool,
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     return f"[agent] stopped after {MAX_STEPS} steps without a final answer."
-
-# ── REPL ──────────────────────────────────────────────────────────────────────
 
 SESSIONS_DIR = WORK_DIR / ".git-agent-sessions"
 

@@ -10,7 +10,7 @@ Schema (version "1.0"):
 {
   "schema_version": "1.0",
   "timestamp_utc":  "2026-06-26T...",
-  "agent":          "git-agent-fsm | git-agent | shrdlu-agent-fsm | shrdlu-reactive | ...",
+  "agent":          "git-agent-fsm | git-agent | shrdlu-agent-fsm | shrdlu-agent-basic | ...",
   "model":          "gpt-4o-mini",
   "domain":         "git | shrdlu",
   "work_dir":       "/path/to/cwd",

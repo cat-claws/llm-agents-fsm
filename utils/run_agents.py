@@ -15,33 +15,73 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from utils.planning_modes import (
+    PLANNING_MODE_ADVISORY,
+    PLANNING_MODE_FSM,
+    PLANNING_MODE_PLAN,
     normalize_planning_granularity,
     normalize_violation_policy,
-    planning_preset_config,
+    planning_mode_config,
 )
+
+_PLANNING_MODES = (
+    PLANNING_MODE_FSM,
+    PLANNING_MODE_PLAN,
+    PLANNING_MODE_ADVISORY,
+)
+_PLANNING_MODE_TARGET_DOMAINS = ('git', 'shrdlu')
+_PLANNING_MODE_TARGET_MODES = (PLANNING_MODE_PLAN, PLANNING_MODE_ADVISORY)
 
 _TARGETS = {
     'git-basic': ('git', 'basic'),
-    'git-fsm': ('git', 'fsm'),
-    'shrdlu-reactive': ('shrdlu', 'reactive'),
-    'shrdlu-fsm': ('shrdlu', 'fsm'),
-    'shrdlu-plan': ('shrdlu', 'plan'),
-    'shrdlu-advisory': ('shrdlu', 'advisory'),
+    'git-fsm': ('git', PLANNING_MODE_FSM),
+    'shrdlu-basic': ('shrdlu', 'basic'),
+    'shrdlu-fsm': ('shrdlu', PLANNING_MODE_FSM),
+}
+_TARGETS.update(
+    {
+        '%s-%s' % (domain, mode): (domain, mode)
+        for domain in _PLANNING_MODE_TARGET_DOMAINS
+        for mode in _PLANNING_MODE_TARGET_MODES
+    }
+)
+
+_CANONICAL_TARGETS = ('git-basic', 'git-fsm', 'shrdlu-basic', 'shrdlu-fsm')
+_PLANNING_MODE_TARGETS = {
+    domain: tuple('%s-%s' % (domain, mode) for mode in _PLANNING_MODE_TARGET_MODES)
+    for domain in _PLANNING_MODE_TARGET_DOMAINS
+}
+_DOMAIN_LABELS = {
+    'git': 'Git',
+    'shrdlu': 'SHRDLU',
+}
+_FSM_AGENT_IMPL = {
+    PLANNING_MODE_ADVISORY: PLANNING_MODE_FSM,
+    PLANNING_MODE_PLAN: PLANNING_MODE_FSM,
 }
 
-_CANONICAL_TARGETS = ('git-basic', 'git-fsm', 'shrdlu-reactive', 'shrdlu-fsm')
-_SHRDLU_PRESET_TARGETS = (
-    'shrdlu-plan',
-    'shrdlu-advisory',
-)
-_SHRDLU_FSM_PRESET_AGENTS = {
-    'advisory': 'fsm',
-    'plan': 'fsm',
-}
-_SHRDLU_AGENT_PRESETS = {
-    'advisory': 'advisory',
-    'plan': 'plan',
-}
+
+def _agent_impl(agent: str) -> str:
+    return _FSM_AGENT_IMPL.get(agent, agent)
+
+
+def _planning_mode_agent(agent: str) -> str | None:
+    return agent if agent in _PLANNING_MODES else None
+
+
+def _restore_env(name: str, previous: str | None) -> None:
+    if previous is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = previous
+
+
+def _set_git_planning_mode_for_agent(agent: str) -> str | None:
+    planning_mode = _planning_mode_agent(agent)
+    if planning_mode in {PLANNING_MODE_PLAN, PLANNING_MODE_ADVISORY}:
+        previous = os.environ.get('GIT_AGENT_FSM_PLANNING_MODE')
+        os.environ['GIT_AGENT_FSM_PLANNING_MODE'] = planning_mode
+        return previous
+    return None
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -51,11 +91,13 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog="""examples:
   run-agents git-basic
   run-agents git-fsm
-  run-agents shrdlu-reactive -- --result-dir "$PWD/results"
+  run-agents git-plan
+  run-agents shrdlu-basic -- --result-dir "$PWD/results"
   run-agents shrdlu-fsm -- --result-dir "$PWD/results"
 
 Equivalent option form:
   run-agents --domain shrdlu --agent fsm -- --max-steps 20
+  run-agents shrdlu-fsm -- --planning-mode advisory
 """,
     )
     parser.add_argument(
@@ -76,9 +118,8 @@ Equivalent option form:
             'basic',
             'fsm',
             'plan',
-            'reactive',
         ],
-        help='agent mode',
+        help='agent or planning mode',
     )
     parser.add_argument(
         '--list',
@@ -101,10 +142,11 @@ def _print_targets() -> None:
     for target in _CANONICAL_TARGETS:
         domain, agent = _TARGETS[target]
         print('  %-17s domain=%-6s agent=%s' % (target, domain, agent))
-    print('\nSHRDLU FSM preset targets:')
-    for target in _SHRDLU_PRESET_TARGETS:
-        domain, agent = _TARGETS[target]
-        print('  %-17s domain=%-6s preset=%s' % (target, domain, agent))
+    for domain in _PLANNING_MODE_TARGET_DOMAINS:
+        print('\n%s planning-mode targets:' % _DOMAIN_LABELS[domain])
+        for target in _PLANNING_MODE_TARGETS[domain]:
+            target_domain, agent = _TARGETS[target]
+            print('  %-17s domain=%-6s mode=%s' % (target, target_domain, agent))
 
 
 def _resolve_target(args: argparse.Namespace, parser: argparse.ArgumentParser) -> tuple[str, str]:
@@ -117,19 +159,12 @@ def _resolve_target(args: argparse.Namespace, parser: argparse.ArgumentParser) -
     domain = args.domain
     agent = args.agent
 
-    if domain == 'git':
-        if agent in {'basic', 'reactive'}:
-            return 'git', 'basic'
-        if agent == 'fsm':
-            return 'git', 'fsm'
-        parser.error("git agents support --agent basic/reactive or fsm")
+    if agent == 'basic':
+        return domain, 'basic'
+    if agent in _PLANNING_MODES:
+        return domain, agent
 
-    if agent in {'basic', 'reactive'}:
-        return 'shrdlu', 'reactive'
-    if agent in {'advisory', 'fsm', 'plan'}:
-        return 'shrdlu', agent
-
-    parser.error("unsupported domain/agent combination")
+    parser.error('%s agents support --agent basic, fsm, plan, or advisory' % domain)
     raise AssertionError('unreachable')
 
 
@@ -137,7 +172,9 @@ def _run_git(agent: str, passthrough: Sequence[str]) -> int:
     if passthrough:
         raise SystemExit('git agents do not accept launcher passthrough args')
 
-    script_name = 'git-agent-basic.py' if agent == 'basic' else 'git-agent-fsm.py'
+    impl_agent = _agent_impl(agent)
+    previous_planning_mode = _set_git_planning_mode_for_agent(agent)
+    script_name = 'git-agent-basic.py' if impl_agent == 'basic' else 'git-agent-fsm.py'
     script_path = _REPO_ROOT / 'git-system' / script_name
     old_argv = sys.argv[:]
     sys.argv = [str(script_path)]
@@ -145,6 +182,8 @@ def _run_git(agent: str, passthrough: Sequence[str]) -> int:
         runpy.run_path(str(script_path), run_name='__main__')
     finally:
         sys.argv = old_argv
+        if previous_planning_mode is not None or agent in {PLANNING_MODE_PLAN, PLANNING_MODE_ADVISORY}:
+            _restore_env('GIT_AGENT_FSM_PLANNING_MODE', previous_planning_mode)
     return 0
 
 
@@ -169,7 +208,7 @@ def _build_shrdlu_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--agent',
         default=os.environ.get('SHRDLU_AGENT_TYPE', 'fsm'),
-        help='agent strategy to run: reactive, fsm, plan, or advisory',
+        help='agent to run: basic or fsm; plan/advisory are shorthand for fsm planning modes',
     )
     parser.add_argument(
         '--simulator-url',
@@ -216,25 +255,27 @@ def _build_shrdlu_parser() -> argparse.ArgumentParser:
         help='planning retries per branch',
     )
     parser.add_argument(
-        '--preset',
-        default=os.environ.get('SHRDLU_AGENT_FSM_PRESET'),
-        help='FSM planning preset: fsm, plan, or advisory',
+        '--planning-mode',
+        choices=list(_PLANNING_MODES),
+        default=os.environ.get('SHRDLU_AGENT_FSM_PLANNING_MODE'),
+        help='FSM planning mode: fsm, plan, or advisory',
     )
-    parser.add_argument(
+    overrides = parser.add_argument_group('advanced planning overrides')
+    overrides.add_argument(
         '--planning-granularity',
         default=(
             os.environ.get('SHRDLU_AGENT_FSM_PLANNING_GRANULARITY')
             or os.environ.get('SHRDLU_AGENT_FSM_PLANNING')
         ),
-        help='FSM planning granularity: step plans one action at a time; batch plans a remaining suffix',
+        help='advanced override: step or batch; normally set by --planning-mode',
     )
-    parser.add_argument(
+    overrides.add_argument(
         '--violation-policy',
         default=(
             os.environ.get('SHRDLU_AGENT_FSM_VIOLATION_POLICY')
             or os.environ.get('SHRDLU_AGENT_FSM_VIOLATIONS')
         ),
-        help='FSM property behavior: retry blocks/replans; ignore/advisory record and continue',
+        help='advanced override: retry, ignore, or advisory; normally set by --planning-mode',
     )
     parser.add_argument(
         '--result-dir',
@@ -259,10 +300,10 @@ def _parse_shrdlu_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = _build_shrdlu_parser()
     args = parser.parse_args(argv)
     args.requested_agent = args.agent
-    args.agent = _SHRDLU_FSM_PRESET_AGENTS.get(args.agent, args.agent)
-    if args.agent not in {'reactive', 'fsm'}:
+    args.agent = _agent_impl(args.agent)
+    if args.agent not in {'basic', 'fsm'}:
         parser.error(
-            '--agent must be one of advisory, fsm, plan, reactive; got %r'
+            '--agent must be one of advisory, basic, fsm, plan; got %r'
             % args.requested_agent
         )
     try:
@@ -276,9 +317,9 @@ def _parse_shrdlu_args(argv: Sequence[str] | None) -> argparse.Namespace:
                 args.violation_policy,
                 invalid='raise',
             )
-        if args.preset:
-            planning_preset_config(
-                args.preset,
+        if args.planning_mode:
+            planning_mode_config(
+                args.planning_mode,
                 retry_default=int(os.environ.get('SHRDLU_AGENT_MAX_BRANCH_RETRIES', '3')),
                 invalid='raise',
             )
@@ -289,17 +330,25 @@ def _parse_shrdlu_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return args
 
 
+def _shrdlu_planning_mode(args: argparse.Namespace) -> str:
+    requested_agent = getattr(args, 'requested_agent', args.agent)
+    if args.planning_mode:
+        return args.planning_mode
+    if requested_agent in _PLANNING_MODES:
+        return requested_agent
+    return PLANNING_MODE_FSM
+
+
 def _build_shrdlu_agent(args: argparse.Namespace):
     from shrdlu_agents.shrdlu_agent_basic import OpenAICompatibleShrdluAgent
     from shrdlu_agents.shrdlu_agent_fsm import FsmOpenAICompatibleShrdluAgent
     from shrdlu_agents.simulator_api import HttpSimulatorClient
 
     agent_types = {
-        'reactive': OpenAICompatibleShrdluAgent,
+        'basic': OpenAICompatibleShrdluAgent,
         'fsm': FsmOpenAICompatibleShrdluAgent,
     }
     simulator = HttpSimulatorClient(args.simulator_url)
-    requested_agent = getattr(args, 'requested_agent', args.agent)
     default_branch_retries = int(os.environ.get('SHRDLU_AGENT_MAX_BRANCH_RETRIES', '3'))
     kwargs = {
         'model': args.model,
@@ -311,28 +360,24 @@ def _build_shrdlu_agent(args: argparse.Namespace):
         'max_tokens': args.max_tokens,
     }
     if args.agent == 'fsm':
-        preset_name = (
-            args.preset
-            or _SHRDLU_AGENT_PRESETS.get(requested_agent)
-            or 'fsm'
-        )
-        preset = planning_preset_config(
-            preset_name,
+        planning_mode = _shrdlu_planning_mode(args)
+        mode_config = planning_mode_config(
+            planning_mode,
             retry_default=default_branch_retries,
             invalid='raise',
         )
         kwargs['max_branch_retries'] = (
             args.max_branch_retries
             if args.max_branch_retries is not None
-            else int(preset['max_retries'])
+            else int(mode_config['max_retries'])
         )
         kwargs['planning_granularity'] = (
             args.planning_granularity
-            or str(preset['planning_granularity'])
+            or str(mode_config['planning_granularity'])
         )
         kwargs['violation_policy'] = (
             args.violation_policy
-            or str(preset['violation_policy'])
+            or str(mode_config['violation_policy'])
         )
     agent_obj = agent_types[args.agent](simulator, **kwargs)
     return agent_obj, simulator
@@ -340,33 +385,30 @@ def _build_shrdlu_agent(args: argparse.Namespace):
 
 def _print_shrdlu_launch(args: argparse.Namespace) -> None:
     requested_agent = getattr(args, 'requested_agent', args.agent)
-    label = args.agent if requested_agent == args.agent else '%s (preset for %s)' % (
+    label = args.agent if requested_agent == args.agent else '%s (planning mode for %s)' % (
         requested_agent,
         args.agent,
     )
     print('Agent type: %s' % label)
     if args.agent == 'fsm':
         default_retries = int(os.environ.get('SHRDLU_AGENT_MAX_BRANCH_RETRIES', '3'))
-        preset_name = (
-            args.preset
-            or _SHRDLU_AGENT_PRESETS.get(requested_agent)
-            or 'fsm'
-        )
-        preset = planning_preset_config(
-            preset_name,
+        planning_mode = _shrdlu_planning_mode(args)
+        mode_config = planning_mode_config(
+            planning_mode,
             retry_default=default_retries,
             invalid='raise',
         )
         retries = (
             args.max_branch_retries
             if args.max_branch_retries is not None
-            else int(preset['max_retries'])
+            else int(mode_config['max_retries'])
         )
         print(
-            'FSM config: planning=%s violations=%s retries=%d'
+            'FSM mode: %s | planning=%s violations=%s retries=%d'
             % (
-                args.planning_granularity or str(preset['planning_granularity']),
-                args.violation_policy or str(preset['violation_policy']),
+                planning_mode,
+                args.planning_granularity or str(mode_config['planning_granularity']),
+                args.violation_policy or str(mode_config['violation_policy']),
                 retries,
             )
         )

@@ -45,7 +45,7 @@ from utils.session import (
     set_node_outcome,
 )
 from utils.tla_verifier import (
-    verify_ap_trace as _verify_tla_ap_trace,
+    verify_fsm_trace as _verify_tla_fsm_trace,
 )
 
 from shrdlu_agents.shrdlu_agent_basic import (
@@ -70,16 +70,20 @@ __all__ = [
 ]
 
 
-def _verify_ap_trace(
-    ap_trace: List[Dict[str, bool]],
+def _verify_fsm_trace(
+    initial_state: Dict[str, bool],
+    action_labels: List[str],
+    states_after: List[Dict[str, bool]],
     ap_names: List[str],
     *,
     module_name: str = 'ShrdluTrace',
     timeout: int = 60,
     is_complete_trace: bool = True,
 ) -> Dict:
-    return _verify_tla_ap_trace(
-        ap_trace,
+    return _verify_tla_fsm_trace(
+        initial_state,
+        action_labels,
+        states_after,
         ap_names,
         _TLA_PROPERTIES,
         module_name=module_name,
@@ -744,6 +748,7 @@ class _FsmShrdluAgentMixin:
             )
 
         executed_ap_trace = [initial_state]
+        executed_action_labels: List[str] = []
         trace['status'] = 'executing'
         accepted_by_depth = accepted_nodes_by_depth(
             trace['planning_tree'],
@@ -758,7 +763,14 @@ class _FsmShrdluAgentMixin:
             post_state = self._env.snapshot()
             ap_state = self._build_initial_ap_state(post_state)
             executed_ap_trace.append(ap_state)
-            tla_result = _verify_ap_trace(executed_ap_trace, _AP_NAMES)
+            executed_action_labels.append(str(action.get('name', 'unknown')))
+            tla_result = _verify_fsm_trace(
+                initial_state,
+                executed_action_labels,
+                executed_ap_trace[1:],
+                _AP_NAMES,
+                is_complete_trace=(step_index == len(plan) - 1),
+            )
             node = accepted_by_depth.get(step_index)
             if node is not None:
                 annotate_node_executed(
@@ -1134,9 +1146,19 @@ class _FsmShrdluAgentMixin:
             }
 
         predicted_ap_state = self._build_initial_ap_state(predicted_world_state)
-        full_ap_trace = preceding_ap_trace + [predicted_ap_state]
-        tlc_result = _verify_ap_trace(full_ap_trace, _AP_NAMES, is_complete_trace=is_last_step)
-        passed = tlc_result['tlc_result'].get('success') or tlc_result['tlc_result'].get('skipped')
+        action_labels = [
+            str(step.get('name', 'unknown'))
+            for step in accepted_trace
+        ] + [str(action.get('name', 'unknown'))]
+        states_after = preceding_ap_trace[1:] + [predicted_ap_state]
+        tlc_result = _verify_fsm_trace(
+            preceding_ap_trace[0],
+            action_labels,
+            states_after,
+            _AP_NAMES,
+            is_complete_trace=is_last_step,
+        )
+        passed = tlc_result['passed']
 
         detail = {
             'prediction_source': 'deterministic_symbolic_replay',

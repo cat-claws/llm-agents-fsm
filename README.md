@@ -67,25 +67,34 @@ export TLA2TOOLS_JAR=/path/to/tla2tools.jar
 
 ## Launching Agents
 
-After `pip install -e`, use `run-agents` to launch the four canonical agents:
+After `pip install -e`, use `run-agents` to launch the canonical agents and
+planning-mode shorthands:
 
 ```bash
 # Run these from the Git repository the agent should operate on.
 run-agents git-basic
 run-agents git-fsm
+run-agents git-plan
+run-agents git-advisory
 
 # Run these with SHRDLU_SIMULATOR_URL pointing at a running simulator.
-run-agents shrdlu-reactive -- --result-dir "$PWD/results"
+run-agents shrdlu-basic -- --result-dir "$PWD/results"
 run-agents shrdlu-fsm -- --result-dir "$PWD/results"
+run-agents shrdlu-plan -- --result-dir "$PWD/results"
+run-agents shrdlu-advisory -- --result-dir "$PWD/results"
 ```
 
-The same four targets are available through option form:
+The same targets are available through option form:
 
 ```bash
 run-agents --domain git --agent basic
 run-agents --domain git --agent fsm
-run-agents --domain shrdlu --agent reactive -- --result-dir "$PWD/results"
+run-agents --domain git --agent plan
+run-agents --domain git --agent advisory
+run-agents --domain shrdlu --agent basic -- --result-dir "$PWD/results"
 run-agents --domain shrdlu --agent fsm -- --result-dir "$PWD/results"
+run-agents --domain shrdlu --agent plan -- --result-dir "$PWD/results"
+run-agents --domain shrdlu --agent advisory -- --result-dir "$PWD/results"
 ```
 
 Use `run-agents --list` to print the supported targets. Arguments after `--`
@@ -101,25 +110,34 @@ Run these from the Git repository you want the agent to operate on:
 cd /path/to/target/git/repo
 run-agents git-basic
 run-agents git-fsm
+run-agents git-plan
+run-agents git-advisory
 ```
 
 Variants:
 
-- `git-agent-basic.py`: reactive terminal agent with allowlisted Git and shell
+- `git-agent-basic.py`: basic terminal agent with allowlisted Git and shell
   commands.
 - `git-agent-fsm.py`: observes atomic propositions, plans before executing,
   checks finite traces against property resources, then executes the accepted
   plan.
 
-The merged FSM can emulate the old plan-first behavior by changing parameters:
+The merged FSM can emulate the old plan-first behavior through the launcher:
 
 ```bash
-GIT_AGENT_FSM_PRESET=plan \
+run-agents git-plan
+run-agents git-advisory
+```
+
+The same modes are available by changing parameters directly:
+
+```bash
+GIT_AGENT_FSM_PLANNING_MODE=plan \
 python3 /home/robot/llm-agents-fsm/git-system/git-agent-fsm.py
 ```
 
 Interactive commands include `/help`, `/model <name>`, `/config`,
-`/preset <fsm|plan|advisory>`, `/planning <step|batch>`,
+`/planning-mode <fsm|plan|advisory>`, `/planning <step|batch>`,
 `/violations <retry|ignore|advisory>`, `/retries <n>`, and `/quit`.
 Saved sessions are written to `.git-agent-sessions/` in the target working
 directory.
@@ -146,30 +164,31 @@ export SHRDLU_OPENAI_BASE_URL=http://127.0.0.1:30000/v1
 export SHRDLU_OPENAI_API_KEY=EMPTY
 export SHRDLU_OPENAI_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507
 
-run-agents shrdlu-reactive -- --result-dir "$PWD/results"
+run-agents shrdlu-basic -- --result-dir "$PWD/results"
 run-agents shrdlu-fsm -- --result-dir "$PWD/results"
 ```
 
-The merged FSM uses the same planning presets as the Git FSM:
+The merged FSM uses the same planning modes as the Git FSM:
 
 ```bash
 # FSM-style: plan a suffix and retry/backtrack on property violations.
 run-agents shrdlu-fsm -- \
-  --preset fsm \
+  --planning-mode fsm \
   --max-branch-retries 3
 
 # Plan-style: plan a suffix, record property violations, and continue.
 run-agents shrdlu-fsm -- \
-  --preset plan
+  --planning-mode plan
 
 # Advisory-style: tell the planner about properties, record violations, and continue.
 run-agents shrdlu-fsm -- \
-  --preset advisory
+  --planning-mode advisory
 
 ```
 
 The unified launcher also exposes these as `run-agents shrdlu-plan` and
-`run-agents shrdlu-advisory`.
+`run-agents shrdlu-advisory`, matching Git's `run-agents git-plan` and
+`run-agents git-advisory` targets.
 
 Runtime controls:
 
@@ -202,7 +221,7 @@ git-system/
 
 shrdlu-block/                 Installed as the shrdlu_agents package
   __main__.py               Package module entry point
-  shrdlu_agent_basic.py     Reactive/basic agent
+  shrdlu_agent_basic.py     Basic agent
   shrdlu_agent_fsm.py       Merged planning/FSM agent
   property_verifier.py      SHRDLU property checks
   resources/                SHRDLU atomic-proposition and property catalogs

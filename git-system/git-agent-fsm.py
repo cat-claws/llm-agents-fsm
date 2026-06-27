@@ -30,7 +30,7 @@ from utils.planning_modes import (
     VIOLATION_RETRY,
     normalize_planning_granularity,
     normalize_violation_policy,
-    planning_preset_config,
+    planning_mode_config,
     property_guidance_text as _property_guidance_text,
     property_policy_text as _property_policy_text,
 )
@@ -57,9 +57,7 @@ from utils.session import (
     mark_feasible,
 )
 from utils.tla_verifier import (
-    build_tla_spec,
-    has_liveness,
-    run_tlc,
+    verify_fsm_trace,
 )
 
 from property_verifier import TransitionPropertyVerifier as GitPropertyVerifier
@@ -123,14 +121,14 @@ def _normalize_violation_policy(
 
 
 def default_config_from_env() -> AgentConfig:
-    preset = planning_preset_config(
-        os.environ.get("GIT_AGENT_FSM_PRESET"),
+    mode_config = planning_mode_config(
+        os.environ.get("GIT_AGENT_FSM_PLANNING_MODE"),
         retry_default=MAX_RETRIES,
         invalid="raise",
     )
-    default_granularity = str(preset["planning_granularity"])
-    default_policy = str(preset["violation_policy"])
-    default_retries = int(preset["max_retries"])
+    default_granularity = str(mode_config["planning_granularity"])
+    default_policy = str(mode_config["violation_policy"])
+    default_retries = int(mode_config["max_retries"])
     return AgentConfig(
         planning_granularity=_normalize_planning_granularity(
             os.environ.get("GIT_AGENT_FSM_PLANNING_GRANULARITY")
@@ -541,6 +539,33 @@ def prompt4b_predict_ap(ap: str, current_val: bool,
         return bool(result["value"]), result.get("reason", "")
     return current_val, "parse error — unchanged"
 
+
+def _label_is(label: str, *words: str) -> bool:
+    return any(w in label.split("_") for w in words)
+
+
+def _set_transition_ap_values(ap_state: dict[str, bool], action_label: str) -> None:
+    al = action_label.lower()
+    for ap in TRANS_APS:
+        apl = ap.lower()
+        if "force" in apl and "push" in apl:
+            ap_state[ap] = _label_is(al, "force", "forcepush", "force_push")
+        elif "rebase" in apl:
+            ap_state[ap] = _label_is(al, "rebase")
+        elif "merge" in apl:
+            ap_state[ap] = _label_is(al, "merge")
+        elif "push" in apl:
+            ap_state[ap] = _label_is(al, "push") and "force" not in al
+        elif "direct commit" in apl or ("commit" in apl and "rebase" not in apl and "push" not in apl):
+            ap_state[ap] = _label_is(al, "commit", "stage", "add")
+        elif "destructive" in apl or "rewrite" in apl:
+            ap_state[ap] = _label_is(al, "force", "rebase", "reset", "amend")
+        elif "mutating" in apl:
+            ap_state[ap] = _label_is(al, "commit", "push", "merge", "rebase", "reset", "force")
+        else:
+            ap_state[ap] = False
+
+
 def prompt4b_predict(action_label: str, tool: str, args: dict,
                      s_current: dict[str, bool], model: str) -> dict[str, bool]:
     """
@@ -557,52 +582,53 @@ def prompt4b_predict(action_label: str, tool: str, args: dict,
             new_val, _ = prompt4b_predict_ap(ap, True, action_label, tool, args, model)
             s_after[ap] = new_val
 
-    def _label_is(label: str, *words: str) -> bool:
-        return any(w in label.split("_") for w in words)
-
-    for ap in TRANS_APS:
-        al = action_label.lower()
-        apl = ap.lower()
-        if "force" in apl and "push" in apl:
-            s_after[ap] = _label_is(al, "force", "forcepush", "force_push")
-        elif "rebase" in apl:
-            s_after[ap] = _label_is(al, "rebase")
-        elif "merge" in apl:
-            s_after[ap] = _label_is(al, "merge")
-        elif "push" in apl:
-            s_after[ap] = _label_is(al, "push") and "force" not in al
-        elif "direct commit" in apl or ("commit" in apl and "rebase" not in apl and "push" not in apl):
-            s_after[ap] = _label_is(al, "commit", "stage", "add")
-        elif "destructive" in apl or "rewrite" in apl:
-            s_after[ap] = _label_is(al, "force", "rebase", "reset", "amend")
-        elif "mutating" in apl:
-            s_after[ap] = _label_is(al, "commit", "push", "merge", "rebase", "reset", "force")
-        else:
-            s_after[ap] = False
-
+    _set_transition_ap_values(s_after, action_label)
     s_after["last_action"] = action_label
     return s_after
 
-def _run_verification(s0: dict[str, bool],
-                      trace: list[dict]) -> tuple[bool, str, str]:
+def _observe_execution_ap_state(verifier: GitPropertyVerifier, action_label: str) -> dict[str, bool]:
+    ap_state = observe_ap_values(ALL_APS, verifier.observe_ap)
+    _set_transition_ap_values(ap_state, action_label)
+    ap_state["last_action"] = action_label
+    return ap_state
+
+
+def _diff_ap_states(previous: dict[str, bool], current: dict[str, bool]) -> list[dict[str, object]]:
+    changes: list[dict[str, object]] = []
+    for name in ALL_APS:
+        prev_val = previous.get(name)
+        curr_val = current.get(name)
+        if prev_val is not None and prev_val != curr_val:
+            changes.append({"name": name, "before": prev_val, "after": curr_val})
+    return changes
+
+
+def _run_verification(
+    s0: dict[str, bool],
+    trace: list[dict],
+    *,
+    is_complete_trace: bool = False,
+) -> tuple[bool, str, str, dict]:
     """Build TLA+ spec for s0 + trace and run TLC.
 
-    Returns (passed, tla_spec, violations_summary).
+    Returns (passed, tla_spec, violations_summary, shared_verification_result).
     trace entries: {action_label, state_after: dict[str,bool]}
     """
-    ap_trace     = [s0] + [step["state_after"] for step in trace]
-    action_labels = [step["action_label"] for step in trace]
-    safety_props  = [p for p in PROPERTIES if not has_liveness(p.get("ast", p))]
-
-    tla_spec, cfg, _prop_names = build_tla_spec(
-        ap_trace, ALL_APS, safety_props,
-        action_labels=action_labels,
+    action_labels = [str(step["action_label"]) for step in trace]
+    states_after = [step["state_after"] for step in trace]
+    result = verify_fsm_trace(
+        s0,
+        action_labels,
+        states_after,
+        ALL_APS,
+        PROPERTIES,
         module_name="GitTrace",
+        timeout=CMD_TIMEOUT,
+        is_complete_trace=is_complete_trace,
     )
-    result = run_tlc(tla_spec, cfg, module_name="GitTrace", timeout=CMD_TIMEOUT)
-    passed  = result["success"]
-    summary = "; ".join(result.get("violations", [])) or result.get("reason", "")
-    return passed, tla_spec, summary
+    tlc_result = result["tlc_result"]
+    summary = "; ".join(tlc_result.get("violations", [])) or tlc_result.get("reason", "")
+    return result["passed"], result["tla_spec"], summary, result
 
 def _planning_action_from_step(step: dict) -> dict:
     return make_action(
@@ -693,6 +719,7 @@ def _check_candidate(
     retry_index: int,
     model: str,
     config: AgentConfig,
+    is_complete_trace: bool = False,
 ) -> tuple[dict, dict[str, bool], bool, str, dict]:
     action_label = proposal.get("action_label", "unknown")
     tool = proposal.get("tool", "none")
@@ -708,15 +735,19 @@ def _check_candidate(
         "state_after": s_after,
     }
 
-    passed, tla_spec, violations_str = _run_verification(s0, trace + [candidate])
+    passed, tla_spec, violations_str, verification_result = _run_verification(
+        s0,
+        trace + [candidate],
+        is_complete_trace=is_complete_trace,
+    )
     violations_list = [v for v in violations_str.split(";") if v.strip()] if violations_str else []
-    safety_props = [p for p in PROPERTIES if not has_liveness(p.get("ast", p))]
 
     verif = make_verification(
         passed=passed,
-        properties_checked=[p.get("id", "?") for p in safety_props],
+        properties_checked=verification_result.get("properties_checked", []),
         violations=violations_list,
         tla_spec=tla_spec,
+        skipped=bool(verification_result.get("tlc_result", {}).get("skipped")),
     )
     node_result = "accepted" if passed else "rejected"
     if not passed and config.violation_policy in NONBLOCKING_VIOLATION_POLICIES:
@@ -1018,6 +1049,7 @@ def _phase4_plan_batch(
                 retry_index=attempt,
                 model=model,
                 config=config,
+                is_complete_trace=(offset == len(plan) - 1),
             )
             batch_nodes.append(node)
             checkpoint()
@@ -1068,6 +1100,8 @@ def _phase4_plan_batch(
 def phase5_execute(
     trace: list[dict],
     *,
+    s0: dict[str, bool],
+    model: str,
     planning_tree: dict | None = None,
     result_record: dict[str, Any] | None = None,
     result_path: str | None = None,
@@ -1076,12 +1110,16 @@ def phase5_execute(
     if not trace:
         return results
     executed_nodes = accepted_nodes(planning_tree) if planning_tree is not None else []
+    verifier = _make_git_property_verifier(model)
+    observed_trace: list[dict] = []
+    previous_ap_state = s0
 
     print(f"\n\033[35m[Phase 5] Executing {len(trace)} verified step(s):\033[0m")
     for i, step in enumerate(trace, 1):
         tool = step.get("tool", "none")
         args = step.get("args") or {}
-        print(f"\n  \033[33m[exec {i}/{len(trace)}] {step['action_label']}: {tool}({json.dumps(args)})\033[0m")
+        action_label = str(step["action_label"])
+        print(f"\n  \033[33m[exec {i}/{len(trace)}] {action_label}: {tool}({json.dumps(args)})\033[0m")
 
         if tool == "none" or not args:
             result = "(no-op)"
@@ -1097,13 +1135,31 @@ def phase5_execute(
 
             print(f"  \033[2m{result}\033[0m")
         results.append(result)
+        ap_state = _observe_execution_ap_state(verifier, action_label)
+        observed_step = dict(step)
+        observed_step["state_after"] = ap_state
+        observed_trace.append(observed_step)
+        _, _, _, tla_result = _run_verification(
+            s0,
+            observed_trace,
+            is_complete_trace=(i == len(trace)),
+        )
+        if tla_result["passed"]:
+            print("  \033[32mexecution verification PASS\033[0m")
+        else:
+            violations = "; ".join(tla_result.get("tlc_result", {}).get("violations", []))
+            print(f"  \033[31mexecution verification FAIL: {violations[:120]}\033[0m")
         node_index = i - 1
         if node_index < len(executed_nodes):
             annotate_node_executed(
                 executed_nodes[node_index],
                 execution_step=node_index,
                 execution_result=result,
+                ap_state=ap_state,
+                ap_changes=_diff_ap_states(previous_ap_state, ap_state),
+                tla_verification=tla_result,
             )
+        previous_ap_state = ap_state
         if result_record is not None:
             _checkpoint_result(result_record, result_path)
 
@@ -1214,6 +1270,8 @@ def handle_query(goal: str, model: str,
         _checkpoint_result(turn, result_path)
         exec_results = phase5_execute(
             executed_trace,
+            s0=s0,
+            model=model,
             planning_tree=planning_tree,
             result_record=turn,
             result_path=result_path,
@@ -1282,7 +1340,7 @@ git-agent-fsm commands:
   /props         show property counts
   /model <name>  switch OpenAI model (current: {model})
   /config        show planning config
-  /preset <fsm|plan|advisory>
+  /planning-mode <fsm|plan|advisory>
   /planning <step|batch>
   /violations <retry|ignore|advisory>
   /retries <n>
@@ -1346,23 +1404,23 @@ def repl() -> None:
         if user_input == "/cwd":
             print(f"{WORK_DIR}\n")
             continue
-        if user_input.startswith("/preset"):
+        if user_input.startswith("/planning-mode"):
             parts = user_input.split(maxsplit=1)
-            preset = parts[1].strip().lower() if len(parts) == 2 else ""
+            planning_mode = parts[1].strip().lower() if len(parts) == 2 else ""
             try:
-                preset_config = planning_preset_config(
-                    preset,
+                mode_config = planning_mode_config(
+                    planning_mode,
                     retry_default=MAX_RETRIES,
                     invalid="raise",
                 )
             except ValueError:
-                print("Usage: /preset <fsm|plan|advisory>\n")
+                print("Usage: /planning-mode <fsm|plan|advisory>\n")
                 continue
             config = AgentConfig(
-                planning_granularity=str(preset_config["planning_granularity"]),
-                violation_policy=str(preset_config["violation_policy"]),
+                planning_granularity=str(mode_config["planning_granularity"]),
+                violation_policy=str(mode_config["violation_policy"]),
                 max_plan_steps=config.max_plan_steps,
-                max_retries=int(preset_config["max_retries"]),
+                max_retries=int(mode_config["max_retries"]),
             )
             print(
                 "Planning: %s | violations=%s | retries=%d\n"
