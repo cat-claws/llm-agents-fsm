@@ -129,13 +129,13 @@ def default_config_from_env() -> AgentConfig:
         planning_granularity=normalize_planning_granularity(
             os.environ.get("GIT_AGENT_FSM_PLANNING_GRANULARITY")
             or os.environ.get("GIT_AGENT_FSM_PLANNING"),
-            default_granularity,
+            default=default_granularity,
             invalid="raise",
         ),
         violation_policy=normalize_violation_policy(
             os.environ.get("GIT_AGENT_FSM_VIOLATION_POLICY")
             or os.environ.get("GIT_AGENT_FSM_VIOLATIONS"),
-            default_policy,
+            default=default_policy,
             invalid="raise",
         ),
         max_plan_steps=_env_int("GIT_AGENT_FSM_MAX_PLAN_STEPS", MAX_PLAN_STEPS),
