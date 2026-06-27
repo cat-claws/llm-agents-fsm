@@ -15,7 +15,9 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from utils.planning_modes import (
+    PLANNING_MODES,
     PLANNING_MODE_ADVISORY,
+    PLANNING_MODE_CHOICES_TEXT,
     PLANNING_MODE_FSM,
     PLANNING_MODE_PLAN,
     normalize_planning_granularity,
@@ -23,12 +25,6 @@ from utils.planning_modes import (
     planning_mode_config,
 )
 
-_PLANNING_MODES = (
-    PLANNING_MODE_FSM,
-    PLANNING_MODE_PLAN,
-    PLANNING_MODE_ADVISORY,
-)
-_PLANNING_MODE_TARGET_DOMAINS = ('git', 'shrdlu')
 _PLANNING_MODE_TARGET_MODES = (PLANNING_MODE_PLAN, PLANNING_MODE_ADVISORY)
 
 _TARGETS = {
@@ -40,20 +36,11 @@ _TARGETS = {
 _TARGETS.update(
     {
         '%s-%s' % (domain, mode): (domain, mode)
-        for domain in _PLANNING_MODE_TARGET_DOMAINS
+        for domain in ('git', 'shrdlu')
         for mode in _PLANNING_MODE_TARGET_MODES
     }
 )
 
-_CANONICAL_TARGETS = ('git-basic', 'git-fsm', 'shrdlu-basic', 'shrdlu-fsm')
-_PLANNING_MODE_TARGETS = {
-    domain: tuple('%s-%s' % (domain, mode) for mode in _PLANNING_MODE_TARGET_MODES)
-    for domain in _PLANNING_MODE_TARGET_DOMAINS
-}
-_DOMAIN_LABELS = {
-    'git': 'Git',
-    'shrdlu': 'SHRDLU',
-}
 _FSM_AGENT_IMPL = {
     PLANNING_MODE_ADVISORY: PLANNING_MODE_FSM,
     PLANNING_MODE_PLAN: PLANNING_MODE_FSM,
@@ -65,7 +52,7 @@ def _agent_impl(agent: str) -> str:
 
 
 def _planning_mode_agent(agent: str) -> str | None:
-    return agent if agent in _PLANNING_MODES else None
+    return agent if agent in PLANNING_MODES else None
 
 
 def _restore_env(name: str, previous: str | None) -> None:
@@ -94,10 +81,11 @@ def _build_parser() -> argparse.ArgumentParser:
   run-agents git-plan
   run-agents shrdlu-basic -- --result-dir "$PWD/results"
   run-agents shrdlu-fsm -- --result-dir "$PWD/results"
+  run-agents shrdlu-plan -- --result-dir "$PWD/results"
 
 Equivalent option form:
   run-agents --domain shrdlu --agent fsm -- --max-steps 20
-  run-agents shrdlu-fsm -- --planning-mode advisory
+  run-agents --domain shrdlu --agent advisory
 """,
     )
     parser.add_argument(
@@ -113,13 +101,8 @@ Equivalent option form:
     )
     parser.add_argument(
         '--agent',
-        choices=[
-            'advisory',
-            'basic',
-            'fsm',
-            'plan',
-        ],
-        help='agent or planning mode',
+        choices=['basic', *PLANNING_MODES],
+        help='agent kind or planning mode; planning modes run the FSM agent',
     )
     parser.add_argument(
         '--list',
@@ -138,15 +121,14 @@ def _split_passthrough(argv: Sequence[str] | None) -> tuple[list[str], list[str]
 
 
 def _print_targets() -> None:
-    print('Canonical targets:')
-    for target in _CANONICAL_TARGETS:
-        domain, agent = _TARGETS[target]
-        print('  %-17s domain=%-6s agent=%s' % (target, domain, agent))
-    for domain in _PLANNING_MODE_TARGET_DOMAINS:
-        print('\n%s planning-mode targets:' % _DOMAIN_LABELS[domain])
-        for target in _PLANNING_MODE_TARGETS[domain]:
-            target_domain, agent = _TARGETS[target]
-            print('  %-17s domain=%-6s mode=%s' % (target, target_domain, agent))
+    print('Targets:')
+    for target in sorted(_TARGETS):
+        domain, requested = _TARGETS[target]
+        agent = _agent_impl(requested)
+        if requested in PLANNING_MODES:
+            print('  %-17s domain=%-6s agent=%-5s mode=%s' % (target, domain, agent, requested))
+        else:
+            print('  %-17s domain=%-6s agent=%s' % (target, domain, agent))
 
 
 def _resolve_target(args: argparse.Namespace, parser: argparse.ArgumentParser) -> tuple[str, str]:
@@ -161,7 +143,7 @@ def _resolve_target(args: argparse.Namespace, parser: argparse.ArgumentParser) -
 
     if agent == 'basic':
         return domain, 'basic'
-    if agent in _PLANNING_MODES:
+    if agent in PLANNING_MODES:
         return domain, agent
 
     parser.error('%s agents support --agent basic, fsm, plan, or advisory' % domain)
@@ -208,7 +190,8 @@ def _build_shrdlu_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--agent',
         default=os.environ.get('SHRDLU_AGENT_TYPE', 'fsm'),
-        help='agent to run: basic or fsm; plan/advisory are shorthand for fsm planning modes',
+        choices=['basic', *PLANNING_MODES],
+        help='agent kind or planning mode; plan/advisory run the FSM agent',
     )
     parser.add_argument(
         '--simulator-url',
@@ -256,9 +239,9 @@ def _build_shrdlu_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--planning-mode',
-        choices=list(_PLANNING_MODES),
+        choices=list(PLANNING_MODES),
         default=os.environ.get('SHRDLU_AGENT_FSM_PLANNING_MODE'),
-        help='FSM planning mode: fsm, plan, or advisory',
+        help='initial FSM planning mode %s' % PLANNING_MODE_CHOICES_TEXT,
     )
     overrides = parser.add_argument_group('advanced planning overrides')
     overrides.add_argument(
@@ -300,6 +283,17 @@ def _parse_shrdlu_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = _build_shrdlu_parser()
     args = parser.parse_args(argv)
     args.requested_agent = args.agent
+    if (
+        args.requested_agent in {PLANNING_MODE_PLAN, PLANNING_MODE_ADVISORY}
+        and args.planning_mode
+        and args.planning_mode != args.requested_agent
+    ):
+        parser.error(
+            'planning mode supplied twice: --agent/target %r conflicts with --planning-mode %r'
+            % (args.requested_agent, args.planning_mode)
+        )
+    if args.requested_agent in PLANNING_MODES and not args.planning_mode:
+        args.planning_mode = args.requested_agent
     args.agent = _agent_impl(args.agent)
     if args.agent not in {'basic', 'fsm'}:
         parser.error(
@@ -331,11 +325,8 @@ def _parse_shrdlu_args(argv: Sequence[str] | None) -> argparse.Namespace:
 
 
 def _shrdlu_planning_mode(args: argparse.Namespace) -> str:
-    requested_agent = getattr(args, 'requested_agent', args.agent)
     if args.planning_mode:
         return args.planning_mode
-    if requested_agent in _PLANNING_MODES:
-        return requested_agent
     return PLANNING_MODE_FSM
 
 
@@ -350,6 +341,11 @@ def _build_shrdlu_agent(args: argparse.Namespace):
     }
     simulator = HttpSimulatorClient(args.simulator_url)
     default_branch_retries = int(os.environ.get('SHRDLU_AGENT_MAX_BRANCH_RETRIES', '3'))
+    args.runtime_retry_default = (
+        args.max_branch_retries
+        if args.max_branch_retries is not None
+        else default_branch_retries
+    )
     kwargs = {
         'model': args.model,
         'base_url': args.base_url,
@@ -383,46 +379,34 @@ def _build_shrdlu_agent(args: argparse.Namespace):
     return agent_obj, simulator
 
 
-def _print_shrdlu_launch(args: argparse.Namespace) -> None:
+def _shrdlu_launch_lines(args: argparse.Namespace) -> list[str]:
     requested_agent = getattr(args, 'requested_agent', args.agent)
-    label = args.agent if requested_agent == args.agent else '%s (planning mode for %s)' % (
-        requested_agent,
-        args.agent,
-    )
-    print('Agent type: %s' % label)
-    if args.agent == 'fsm':
-        default_retries = int(os.environ.get('SHRDLU_AGENT_MAX_BRANCH_RETRIES', '3'))
-        planning_mode = _shrdlu_planning_mode(args)
-        mode_config = planning_mode_config(
-            planning_mode,
-            retry_default=default_retries,
-            invalid='raise',
-        )
-        retries = (
-            args.max_branch_retries
-            if args.max_branch_retries is not None
-            else int(mode_config['max_retries'])
-        )
-        print(
-            'FSM mode: %s | planning=%s violations=%s retries=%d'
-            % (
-                planning_mode,
-                args.planning_granularity or str(mode_config['planning_granularity']),
-                args.violation_policy or str(mode_config['violation_policy']),
-                retries,
-            )
-        )
+    if requested_agent == args.agent:
+        return ['Launch: domain=shrdlu | agent=%s' % args.agent]
+    return [
+        'Launch: domain=shrdlu | agent=%s | requested_mode=%s'
+        % (args.agent, requested_agent)
+    ]
 
 
 def main_shrdlu(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(stream=sys.stdout, level=logging.INFO)
     args = _parse_shrdlu_args(argv)
     agent_obj, simulator = _build_shrdlu_agent(args)
-    _print_shrdlu_launch(args)
 
     from shrdlu_agents.terminal import run_agent_against_simulator
 
-    run_agent_against_simulator(agent_obj, simulator)
+    launch_lines = _shrdlu_launch_lines(args)
+    run_agent_against_simulator(
+        agent_obj,
+        simulator,
+        launch_lines=launch_lines,
+        planning_retry_default=(
+            args.runtime_retry_default
+            if args.agent == 'fsm'
+            else None
+        ),
+    )
     return 0
 
 

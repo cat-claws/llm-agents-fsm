@@ -14,12 +14,19 @@ FINISH_NODE_RESULT = "finish"
 PLANNING_MODE_FSM = "fsm"
 PLANNING_MODE_PLAN = "plan"
 PLANNING_MODE_ADVISORY = "advisory"
+PLANNING_MODE_CUSTOM = "custom"
 
 PLANNING_MODE_CONFIGS = {
     PLANNING_MODE_FSM: (PLANNING_BATCH, VIOLATION_RETRY, None),
     PLANNING_MODE_PLAN: (PLANNING_BATCH, VIOLATION_IGNORE, 1),
     PLANNING_MODE_ADVISORY: (PLANNING_BATCH, VIOLATION_ADVISORY, 1),
 }
+PLANNING_MODES = (
+    PLANNING_MODE_FSM,
+    PLANNING_MODE_PLAN,
+    PLANNING_MODE_ADVISORY,
+)
+PLANNING_MODE_CHOICES_TEXT = "<fsm|plan|advisory>"
 PLANNING_GRANULARITIES = {PLANNING_STEP, PLANNING_BATCH}
 VIOLATION_POLICIES = {VIOLATION_RETRY, VIOLATION_IGNORE, VIOLATION_ADVISORY}
 
@@ -50,10 +57,43 @@ def planning_mode_config(value, *, retry_default, default=PLANNING_MODE_FSM, inv
     mode = _choice("planning mode", value, default, PLANNING_MODE_CONFIGS, invalid)
     granularity, policy, retries = PLANNING_MODE_CONFIGS[mode]
     return {
+        "mode": mode,
         "planning_granularity": granularity,
         "violation_policy": policy,
         "max_retries": retry_default if retries is None else retries,
     }
+
+
+def infer_planning_mode(granularity, policy, retries, *, retry_default):
+    """Return the named planning mode for a config, or ``custom``."""
+    for mode in PLANNING_MODES:
+        config = planning_mode_config(mode, retry_default=retry_default, invalid="raise")
+        if (
+            config["planning_granularity"] == granularity
+            and config["violation_policy"] == policy
+            and int(config["max_retries"]) == int(retries)
+        ):
+            return mode
+    return PLANNING_MODE_CUSTOM
+
+
+def format_planning_config(
+    *,
+    mode,
+    planning_granularity,
+    violation_policy,
+    max_retries,
+    max_steps=None,
+):
+    parts = [
+        "mode=%s" % mode,
+        "granularity=%s" % planning_granularity,
+        "violations=%s" % violation_policy,
+        "retries=%d" % int(max_retries),
+    ]
+    if max_steps is not None:
+        parts.append("max_steps=%d" % int(max_steps))
+    return " | ".join(parts)
 
 
 def normalize_planning_granularity(value, *, default=PLANNING_STEP, invalid="default"):

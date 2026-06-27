@@ -25,6 +25,7 @@ from utils.planning_modes import (
     property_guidance_text as _property_guidance_text,
     property_policy_text as _shared_property_policy_text,
 )
+from utils.planning_terminal import RuntimePlanningConfig, runtime_config_from_values
 from utils.property_catalog import (
     aps_from_properties,
     load_property_catalog,
@@ -297,6 +298,32 @@ class _FsmShrdluAgentMixin:
     def _init_fsm_planner(self, max_branch_retries: int = 3):
         self._max_branch_retries = int(max_branch_retries)
         self._property_text = self._build_property_text()
+
+    def get_runtime_planning_config(self, retry_default: int | None = None) -> RuntimePlanningConfig:
+        """Return the live planning settings for terminal mode controls."""
+        default = int(retry_default if retry_default is not None else self._max_branch_retries)
+        return runtime_config_from_values(
+            planning_granularity=self._planning_granularity,
+            violation_policy=self._violation_policy,
+            max_retries=self._max_branch_retries,
+            retry_default=default,
+            max_steps=self._max_steps,
+        )
+
+    def set_runtime_planning_config(
+        self,
+        config: RuntimePlanningConfig,
+        retry_default: int | None = None,
+    ) -> RuntimePlanningConfig:
+        """Update live FSM planning settings and return the normalized config."""
+        del retry_default
+        self._planning_granularity = _normalize_planning_granularity(config.planning_granularity)
+        self._violation_policy = _normalize_violation_policy(config.violation_policy)
+        retries = int(config.max_retries)
+        if self._violation_policy in NONBLOCKING_VIOLATION_POLICIES:
+            retries = max(1, retries)
+        self._init_fsm_planner(max_branch_retries=retries)
+        return self.get_runtime_planning_config()
 
     @staticmethod
     def _snapshot_json(snapshot) -> str:

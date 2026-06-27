@@ -59,6 +59,13 @@ from utils.session import (
 from utils.tla_verifier import (
     verify_fsm_trace,
 )
+from utils.chat_terminal import ChatCommand, ChatTerminal
+from utils.planning_terminal import (
+    RuntimePlanningConfig,
+    build_planning_commands,
+    format_runtime_config,
+    runtime_config_from_values,
+)
 
 from property_verifier import TransitionPropertyVerifier as GitPropertyVerifier
 
@@ -1334,166 +1341,97 @@ def save_session(turns: list[dict], model: str,
         raise RuntimeError("Result saving is disabled")
     return Path(path)
 
-HELP_TEXT = """\
-git-agent-fsm commands:
-  /help          show this message
-  /props         show property counts
-  /model <name>  switch OpenAI model (current: {model})
-  /config        show planning config
-  /planning-mode <fsm|plan|advisory>
-  /planning <step|batch>
-  /violations <retry|ignore|advisory>
-  /retries <n>
-  /cwd           show working directory
-  /exit  /quit   exit
-
-Each query runs: guard → Phase 3 (observe s0) → Phase 4 (plan+TLC) → Phase 5 (execute).
-"""
-
 def _is_git_repo() -> bool:
     r = subprocess.run(["git", "rev-parse", "--git-dir"],
                        cwd=str(WORK_DIR), capture_output=True, text=True)
     return r.returncode == 0
 
 def repl() -> None:
-    model   = DEFAULT_MODEL
-    config  = default_config_from_env()
+    model = DEFAULT_MODEL
+    config = default_config_from_env()
+    runtime_config = runtime_config_from_values(
+        planning_granularity=config.planning_granularity,
+        violation_policy=config.violation_policy,
+        max_retries=config.max_retries,
+        retry_default=MAX_RETRIES,
+        max_steps=config.max_plan_steps,
+    )
 
-    in_repo     = _is_git_repo()
+    in_repo = _is_git_repo()
     repo_notice = "" if in_repo else "  \033[33m(not a git repo)\033[0m"
     sample_note = (f"sampled {len(PROPERTIES)}/{len(_ALL_PROPS)}"
                    if PROPERTY_SAMPLE_SIZE else f"all {len(PROPERTIES)}")
     base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    print(f"\033[1mgit-agent-fsm\033[0m  model={model}  base_url={base_url}  cwd={WORK_DIR}{repo_notice}")
-    print(f"Properties: {sample_note} | {len(STATE_APS)} state APs | {len(TRANS_APS)} transition APs")
-    print(
-        "Planning: %s | violations=%s | retries=%d | max_steps=%d"
-        % (config.planning_granularity, config.violation_policy, config.max_retries, config.max_plan_steps)
-    )
-    print("Type /help for commands, /exit to quit.\n")
 
-    while True:
+    def intro_lines() -> list[str]:
+        return [
+            f"\033[1mgit-agent-fsm\033[0m  model={model}  base_url={base_url}  cwd={WORK_DIR}{repo_notice}",
+            f"Properties: {sample_note} | {len(STATE_APS)} state APs | {len(TRANS_APS)} transition APs",
+            "Planning: %s" % format_runtime_config(runtime_config),
+            "Type /help for commands, /exit to quit.",
+        ]
+
+    def help_title() -> str:
+        return "git-agent-fsm commands (model=%s):" % model
+
+    def show_props(_args: str) -> str:
+        return "%d properties | %d state APs | %d transition APs" % (
+            len(PROPERTIES),
+            len(STATE_APS),
+            len(TRANS_APS),
+        )
+
+    def show_cwd(_args: str) -> str:
+        return str(WORK_DIR)
+
+    def set_model(args: str) -> str:
+        nonlocal model
+        if args:
+            model = args.strip()
+        return "Model: %s" % model
+
+    def get_planning_config() -> RuntimePlanningConfig:
+        return runtime_config
+
+    def set_planning_config(next_config: RuntimePlanningConfig) -> RuntimePlanningConfig:
+        nonlocal config, runtime_config
+        runtime_config = next_config
+        config = replace(
+            config,
+            planning_granularity=next_config.planning_granularity,
+            violation_policy=next_config.violation_policy,
+            max_retries=next_config.max_retries,
+        )
+        return runtime_config
+
+    def handle_message(user_input: str) -> str:
         try:
-            user_input = input("\033[1mYou>\033[0m ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nBye.")
-            return
-
-        if not user_input:
-            continue
-        if user_input in ("/exit", "/quit"):
-            print("Bye.")
-            return
-        if user_input == "/help":
-            print(HELP_TEXT.format(model=model))
-            continue
-        if user_input == "/config":
-            print(
-                "planning=%s | violations=%s | retries=%d | max_steps=%d\n"
-                % (
-                    config.planning_granularity,
-                    config.violation_policy,
-                    config.max_retries,
-                    config.max_plan_steps,
-                )
-            )
-            continue
-        if user_input == "/props":
-            print(f"{len(PROPERTIES)} properties | {len(STATE_APS)} state APs | {len(TRANS_APS)} transition APs\n")
-            continue
-        if user_input == "/cwd":
-            print(f"{WORK_DIR}\n")
-            continue
-        if user_input.startswith("/planning-mode"):
-            parts = user_input.split(maxsplit=1)
-            planning_mode = parts[1].strip().lower() if len(parts) == 2 else ""
-            try:
-                mode_config = planning_mode_config(
-                    planning_mode,
-                    retry_default=MAX_RETRIES,
-                    invalid="raise",
-                )
-            except ValueError:
-                print("Usage: /planning-mode <fsm|plan|advisory>\n")
-                continue
-            config = AgentConfig(
-                planning_granularity=str(mode_config["planning_granularity"]),
-                violation_policy=str(mode_config["violation_policy"]),
-                max_plan_steps=config.max_plan_steps,
-                max_retries=int(mode_config["max_retries"]),
-            )
-            print(
-                "Planning: %s | violations=%s | retries=%d\n"
-                % (config.planning_granularity, config.violation_policy, config.max_retries)
-            )
-            continue
-        if user_input.startswith("/planning"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) != 2:
-                print(f"Planning: {config.planning_granularity}\n")
-                continue
-            try:
-                planning = _normalize_planning_granularity(
-                    parts[1],
-                    config.planning_granularity,
-                    invalid="raise",
-                )
-            except ValueError as exc:
-                print("%s\n" % exc)
-                continue
-            config = replace(config, planning_granularity=planning)
-            print(f"Planning: {config.planning_granularity}\n")
-            continue
-        if user_input.startswith("/violations"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) != 2:
-                print(f"Violations: {config.violation_policy}\n")
-                continue
-            try:
-                policy = _normalize_violation_policy(
-                    parts[1],
-                    config.violation_policy,
-                    invalid="raise",
-                )
-            except ValueError as exc:
-                print("%s\n" % exc)
-                continue
-            config = replace(config, violation_policy=policy)
-            print(f"Violations: {config.violation_policy}\n")
-            continue
-        if user_input.startswith("/retries"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) != 2:
-                print(f"Retries: {config.max_retries}\n")
-                continue
-            try:
-                retries = max(0, int(parts[1]))
-            except ValueError:
-                print("Usage: /retries <n>\n")
-                continue
-            config = replace(config, max_retries=retries)
-            print(f"Retries: {config.max_retries}\n")
-            continue
-        if user_input.startswith("/model"):
-            parts = user_input.split(maxsplit=1)
-            model = parts[1].strip() if len(parts) == 2 else model
-            print(f"Model: {model}\n")
-            continue
-        if user_input.startswith("/"):
-            print("Unknown command. Type /help.\n")
-            continue
-
-        try:
-            answer, detail = handle_query(user_input, model, config)
+            answer, _detail = handle_query(user_input, model, config)
         except openai.OpenAIError as e:
-            answer  = f"[openai error] {e}"
-            detail  = {"query": user_input, "response": answer, "llm_log": _llm_log_snapshot()}
+            answer = f"[openai error] {e}"
         except Exception as e:
-            import traceback; traceback.print_exc()
-            answer  = f"[error] {e}"
-            detail  = {"query": user_input, "response": answer, "llm_log": _llm_log_snapshot()}
+            import traceback
+            traceback.print_exc()
+            answer = f"[error] {e}"
+        return answer
 
-        print(f"\n\033[1mAgent>\033[0m {answer}\n")
+    ChatTerminal(
+        name="git-agent-fsm",
+        message_handler=handle_message,
+        intro=intro_lines,
+        help_title=help_title,
+        help_footer="Each query runs: guard -> Phase 3 (observe s0) -> Phase 4 (plan+TLC) -> Phase 5 (execute).",
+        commands=[
+            ChatCommand(("/props",), "show property counts", show_props),
+            ChatCommand(("/model",), "switch OpenAI model", set_model, "<name>"),
+            *build_planning_commands(
+                get_config=get_planning_config,
+                set_config=set_planning_config,
+                retry_default=MAX_RETRIES,
+            ),
+            ChatCommand(("/cwd",), "show working directory", show_cwd),
+        ],
+    ).run()
 
 if __name__ == "__main__":
     repl()

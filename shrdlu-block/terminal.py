@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from utils.chat_terminal import ChatCommand, ChatTerminal
+from utils.planning_terminal import build_planning_commands, format_runtime_config
 
 __all__ = [
     'run_agent_against_simulator',
@@ -12,68 +20,120 @@ __all__ = [
 ]
 
 
-def run_agent_against_simulator(agent, simulator) -> None:
+def run_agent_against_simulator(agent, simulator, launch_lines=None,
+                                planning_retry_default: int | None = None) -> None:
     """Read agent goals from the terminal for an already running simulator."""
-    print('')
+    intro_lines = list(launch_lines or [])
+    if _has_planning_controls(agent):
+        intro_lines.append(
+            'Planning: %s' % format_runtime_config(
+                agent.get_runtime_planning_config(retry_default=planning_retry_default)
+            )
+        )
     if getattr(simulator, 'base_url', None):
-        print('Simulator URL: %s' % simulator.base_url)
-    print('The block-world simulator must already be running.')
+        intro_lines.append('Simulator URL: %s' % simulator.base_url)
+    intro_lines.append('The block-world simulator must already be running.')
     try:
         simulator.snapshot()
     except Exception as exc:
+        print('')
+        for line in intro_lines:
+            print(line)
         print('Could not connect to simulator: %s' % exc)
         return
-    print('Enter natural-language agent goals here; watch execution in the viewer if one is running.')
-    print('Terminal commands: /state, /reset, /events, /quit')
-    print('')
-    run_agent_terminal(agent, simulator)
+    intro_lines.extend([
+        'Enter natural-language agent goals here; watch execution in the viewer if one is running.',
+        'Type /help for commands, /quit to quit.',
+    ])
+    run_agent_terminal(
+        agent,
+        simulator,
+        intro_lines=intro_lines,
+        planning_retry_default=planning_retry_default,
+    )
 
 
-def run_agent_terminal(agent, env, prompt: str = 'goal> ') -> None:
+def run_agent_terminal(agent, env, prompt: str = 'goal> ',
+                       intro_lines=None,
+                       planning_retry_default: int | None = None) -> None:
     """Run an interactive terminal loop for an agent."""
-    while True:
-        try:
-            text = input(prompt)
-        except EOFError:
-            print('')
-            return
-        request = text.strip()
-        if not request:
-            continue
-        lower = request.lower()
-        if lower in {'/quit', 'quit', 'exit'}:
-            return
-        if lower in {'/state', 'state'}:
-            print(env.snapshot_text())
-            continue
-        if lower in {'/reset', 'reset'}:
-            env.reset()
-            print('Environment reset.')
-            continue
-        if lower in {'/events', 'events'}:
-            for event in env.event_log():
-                print('[{revision}] {kind}: {label} ({status}) -> {result}'.format(
-                    revision=event.get('revision'),
-                    kind=event.get('kind'),
-                    label=event.get('label'),
-                    status='OK' if event.get('ok') else 'ERROR',
-                    result=event.get('result'),
-                ))
-            continue
+    def show_state(_args: str) -> str:
+        return env.snapshot_text()
 
-        print('')
-        print('Agent planning...')
-        result = agent.handle_user_input(request)
-        print('')
-        print(result)
+    def reset_environment(_args: str) -> str:
+        env.reset()
+        return 'Environment reset.'
+
+    def show_events(_args: str) -> str:
+        events = list(env.event_log())
+        if not events:
+            return '(no events)'
+        return '\n'.join(_format_event(event) for event in events)
+
+    def handle_goal(request: str) -> str:
+        return agent.handle_user_input(request)
+
+    def after_turn(_request: str, _response: str | None) -> None:
         result_path = (
             getattr(agent, 'last_result_path', None)
             or getattr(agent, 'last_trace_path', None)
         )
         if result_path:
-            print('')
             print_result_conditions(result_path)
-        print('')
+            print('')
+
+    commands = []
+    if _has_planning_controls(agent):
+        commands.extend(
+            build_planning_commands(
+                get_config=lambda: agent.get_runtime_planning_config(
+                    retry_default=planning_retry_default,
+                ),
+                set_config=lambda config: agent.set_runtime_planning_config(
+                    config,
+                    retry_default=planning_retry_default,
+                ),
+                retry_default=(
+                    planning_retry_default
+                    if planning_retry_default is not None
+                    else lambda: agent.get_runtime_planning_config().max_retries
+                ),
+            )
+        )
+    commands.extend([
+        ChatCommand(('/state', 'state'), 'show simulator state', show_state),
+        ChatCommand(('/reset', 'reset'), 'reset the simulator environment', reset_environment),
+        ChatCommand(('/events', 'events'), 'show simulator event log', show_events),
+    ])
+
+    ChatTerminal(
+        name='shrdlu-agent',
+        prompt=prompt,
+        message_handler=handle_goal,
+        intro=intro_lines,
+        help_title='shrdlu-agent commands:',
+        help_footer='Everything else is sent to the agent as a natural-language goal.',
+        thinking_message='Agent planning...',
+        after_turn=after_turn,
+        commands=commands,
+    ).run()
+
+
+def _has_planning_controls(agent) -> bool:
+    return (
+        hasattr(agent, 'get_runtime_planning_config')
+        and hasattr(agent, 'set_runtime_planning_config')
+    )
+
+
+def _format_event(event) -> str:
+    return '[{revision}] {kind}: {label} ({status}) -> {result}'.format(
+        revision=event.get('revision'),
+        kind=event.get('kind'),
+        label=event.get('label'),
+        status='OK' if event.get('ok') else 'ERROR',
+        result=event.get('result'),
+    )
 
 
 def print_result_conditions(result_path: str, max_nodes: int = 12) -> None:

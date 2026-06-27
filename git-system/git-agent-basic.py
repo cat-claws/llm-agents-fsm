@@ -28,6 +28,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from utils.chat_terminal import ChatCommand, ChatTerminal
 from utils.session import make_session, save_session as _save_session_util
 
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -235,20 +236,6 @@ def run_turn(messages: list[dict], user_query: str, model: str, verbose: bool,
 
 SESSIONS_DIR = WORK_DIR / ".git-agent-sessions"
 
-HELP_TEXT = """\
-git-agent commands:
-  /help          show this message
-  /reset         clear conversation history
-  /save          save session to .git-agent-sessions/
-  /model <name>  switch OpenAI model (current: {model})
-  /verbose       toggle verbose tool logging (current: {verbose})
-  /cwd           show working directory
-  /exit  /quit   exit (auto-saves if there are messages)
-
-Everything else is sent to the agent.
-"""
-
-
 def save_session(messages: list[dict], model: str) -> Path:
     session = make_session(
         agent="git-agent",
@@ -282,81 +269,77 @@ def repl() -> None:
     repo_notice = "" if in_repo else "  \033[33m(not a git repo)\033[0m"
 
     base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-    print(f"\033[1mgit-agent\033[0m  model={model}  base_url={base_url}  cwd={WORK_DIR}{repo_notice}")
-    print("Type /help for commands, /exit to quit.\n")
 
-    while True:
-        try:
-            user_input = input("\033[1mYou>\033[0m ").strip()
-        except (EOFError, KeyboardInterrupt):
-            if len(messages) > 1:
-                path = save_session(messages, model)
-                print(f"\nSession saved → {path}")
-            print("\nBye.")
-            return
+    def intro_lines() -> list[str]:
+        return [
+            f"\033[1mgit-agent\033[0m  model={model}  base_url={base_url}  cwd={WORK_DIR}{repo_notice}",
+            "Type /help for commands, /exit to quit.",
+        ]
 
-        if not user_input:
-            continue
+    def help_title() -> str:
+        return "git-agent commands (model=%s, verbose=%s):" % (model, verbose)
 
-        if user_input in ("/exit", "/quit"):
-            if len(messages) > 1:
-                path = save_session(messages, model)
-                print(f"Session saved → {path}")
-            print("Bye.")
-            return
+    def save_if_needed() -> str | None:
+        if len(messages) <= 1:
+            return None
+        path = save_session(messages, model)
+        return "Session saved -> %s" % path
 
-        if user_input == "/help":
-            print(HELP_TEXT.format(model=model, verbose=verbose))
-            continue
+    def save_now(_args: str) -> str:
+        if len(messages) <= 1:
+            return "Nothing to save yet."
+        path = save_session(messages, model)
+        return "Saved -> %s" % path
 
-        if user_input == "/save":
-            if len(messages) > 1:
-                path = save_session(messages, model)
-                print(f"Saved → {path}\n")
-            else:
-                print("Nothing to save yet.\n")
-            continue
+    def reset_conversation(_args: str) -> str:
+        nonlocal messages
+        lines = []
+        if len(messages) > 1:
+            path = save_session(messages, model)
+            lines.append("Session saved -> %s" % path)
+        messages = [{"role": "system", "content": SYSTEM}]
+        lines.append("Conversation reset.")
+        return "\n".join(lines)
 
-        if user_input == "/reset":
-            if len(messages) > 1:
-                path = save_session(messages, model)
-                print(f"Session saved → {path}")
-            messages = [{"role": "system", "content": SYSTEM}]
-            print("Conversation reset.\n")
-            continue
+    def show_cwd(_args: str) -> str:
+        return str(WORK_DIR)
 
-        if user_input == "/cwd":
-            print(f"{WORK_DIR}\n")
-            continue
+    def toggle_verbose(_args: str) -> str:
+        nonlocal verbose
+        verbose = not verbose
+        return "Verbose: %s" % ("on" if verbose else "off")
 
-        if user_input == "/verbose":
-            verbose = not verbose
-            print(f"Verbose: {'on' if verbose else 'off'}\n")
-            continue
+    def set_model(args: str) -> str:
+        nonlocal model
+        if args:
+            model = args.strip()
+            return "Model set to: %s" % model
+        return "Current model: %s" % model
 
-        if user_input.startswith("/model"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) == 2:
-                model = parts[1].strip()
-                print(f"Model set to: {model}\n")
-            else:
-                print(f"Current model: {model}\n")
-            continue
-
-        if user_input.startswith("/"):
-            print(f"Unknown command '{user_input}'. Type /help.\n")
-            continue
-
+    def handle_message(user_input: str) -> str:
         try:
             answer = run_turn(messages, user_input, model, verbose, client)
         except openai.OpenAIError as e:
-            print(f"\033[31m[openai error] {e}\033[0m\n")
-            continue
+            return f"\033[31m[openai error] {e}\033[0m"
         except Exception as e:
-            print(f"\033[31m[error] {e}\033[0m\n")
-            continue
+            return f"\033[31m[error] {e}\033[0m"
+        return answer
 
-        print(f"\n\033[1mAgent>\033[0m {answer}\n")
+    ChatTerminal(
+        name="git-agent",
+        message_handler=handle_message,
+        intro=intro_lines,
+        help_title=help_title,
+        help_footer="Everything else is sent to the agent.",
+        before_exit=save_if_needed,
+        commands=[
+            ChatCommand(("/reset",), "clear conversation history", reset_conversation),
+            ChatCommand(("/save",), "save session to .git-agent-sessions/", save_now),
+            ChatCommand(("/model",), "switch OpenAI model", set_model, "<name>"),
+            ChatCommand(("/verbose",), "toggle verbose tool logging", toggle_verbose),
+            ChatCommand(("/cwd",), "show working directory", show_cwd),
+        ],
+    ).run()
 
 
 if __name__ == "__main__":
