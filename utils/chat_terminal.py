@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 CommandHandler = Callable[[str], str | None]
@@ -56,6 +59,9 @@ class ChatTerminal:
         thinking_message: TextProvider | None = None,
         after_turn: Callable[[str, str | None], None] | None = None,
         before_exit: Callable[[], str | None] | None = None,
+        enable_readline: bool = True,
+        history_path: str | Path | None = None,
+        history_limit: int = 1000,
         exit_names: tuple[str, ...] = ("/exit", "/quit", "exit", "quit"),
         help_names: tuple[str, ...] = ("/help", "help"),
         unknown_command_message: str = "Unknown command. Type /help.",
@@ -72,6 +78,10 @@ class ChatTerminal:
         self.thinking_message = thinking_message
         self.after_turn = after_turn
         self.before_exit = before_exit
+        self.enable_readline = enable_readline
+        self.history_path = Path(history_path) if history_path is not None else self._default_history_path(name)
+        self.history_limit = max(0, int(history_limit))
+        self._readline = None
         self.exit_names = tuple(name.lower() for name in exit_names)
         self.help_names = tuple(name.lower() for name in help_names)
         self.unknown_command_message = unknown_command_message
@@ -87,44 +97,50 @@ class ChatTerminal:
 
     def run(self) -> None:
         """Run the interactive terminal until the user exits."""
+        self._setup_readline()
         self._print_intro()
-        while True:
-            try:
-                raw_text = input(self.prompt)
-            except EOFError:
-                self._finish(prefix="\n")
-                return
-            except KeyboardInterrupt:
-                self._finish(prefix="\n")
-                return
+        try:
+            while True:
+                try:
+                    raw_text = input(self.prompt)
+                except EOFError:
+                    self._finish(prefix="\n")
+                    return
+                except KeyboardInterrupt:
+                    self._finish(prefix="\n")
+                    return
 
-            request = raw_text.strip()
-            if not request:
-                continue
+                request = raw_text.strip()
+                if not request:
+                    continue
 
-            command_name, args = self._split_command(request)
-            if command_name in self.exit_names:
-                self._finish()
-                return
-            if command_name in self.help_names:
-                print(self.render_help())
-                print("")
-                continue
+                command_name, args = self._split_command(request)
+                if command_name in self.exit_names:
+                    self._remove_latest_history(request)
+                    self._finish()
+                    return
+                self._add_history(request)
+                if command_name in self.help_names:
+                    print(self.render_help())
+                    print("")
+                    continue
 
-            command = self._command_map.get(command_name)
-            if command is not None:
-                self._print_command_result(command.handler(args))
-                continue
+                command = self._command_map.get(command_name)
+                if command is not None:
+                    self._print_command_result(command.handler(args))
+                    continue
 
-            if request.startswith("/"):
-                print("%s\n" % self.unknown_command_message)
-                continue
+                if request.startswith("/"):
+                    print("%s\n" % self.unknown_command_message)
+                    continue
 
-            self._print_thinking_message()
-            response = self.message_handler(request)
-            self._print_response(response)
-            if self.after_turn is not None:
-                self.after_turn(request, response)
+                self._print_thinking_message()
+                response = self.message_handler(request)
+                self._print_response(response)
+                if self.after_turn is not None:
+                    self.after_turn(request, response)
+        finally:
+            self._save_readline_history()
 
     def render_help(self) -> str:
         rows = [
@@ -195,6 +211,68 @@ class ChatTerminal:
     def _print_goodbye(self) -> None:
         if self.goodbye:
             print(self.goodbye)
+
+    def _setup_readline(self) -> None:
+        if not self.enable_readline or not sys.stdin.isatty():
+            return
+        try:
+            import readline
+        except ImportError:
+            return
+        self._readline = readline
+        try:
+            readline.parse_and_bind("set editing-mode emacs")
+            readline.parse_and_bind("set enable-keypad on")
+            if self.history_limit:
+                readline.set_history_length(self.history_limit)
+            if self.history_path is not None:
+                self.history_path.parent.mkdir(parents=True, exist_ok=True)
+                if self.history_path.exists():
+                    readline.read_history_file(str(self.history_path))
+        except (OSError, ValueError):
+            return
+
+    def _add_history(self, request: str) -> None:
+        if self._readline is None:
+            return
+        try:
+            current_length = self._readline.get_current_history_length()
+            if current_length:
+                previous = self._readline.get_history_item(current_length)
+                if previous == request:
+                    return
+            self._readline.add_history(request)
+        except (OSError, ValueError):
+            return
+
+    def _remove_latest_history(self, request: str) -> None:
+        if self._readline is None:
+            return
+        try:
+            current_length = self._readline.get_current_history_length()
+            if not current_length:
+                return
+            latest = self._readline.get_history_item(current_length)
+            if latest == request:
+                self._readline.remove_history_item(current_length - 1)
+        except (AttributeError, OSError, ValueError):
+            return
+
+    def _save_readline_history(self) -> None:
+        if self._readline is None or self.history_path is None:
+            return
+        try:
+            self.history_path.parent.mkdir(parents=True, exist_ok=True)
+            self._readline.write_history_file(str(self.history_path))
+        except OSError:
+            return
+
+    @staticmethod
+    def _default_history_path(name: str) -> Path:
+        state_root = os.environ.get("XDG_STATE_HOME")
+        root = Path(state_root) if state_root else Path.home() / ".local" / "state"
+        safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name)
+        return root / "llm-agents-fsm" / ("%s_history" % safe_name)
 
     @staticmethod
     def _split_command(request: str) -> tuple[str, str]:

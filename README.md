@@ -4,7 +4,7 @@ Research/prototype agents that combine LLM tool use with explicit planning
 traces and finite-state property checks. The repository currently contains two
 agent domains:
 
-- `git-system/`: terminal Git agents with basic and merged FSM variants.
+- `git-system/`: terminal Git agents with basic and FSM variants.
 - `shrdlu-block/`: OpenAI-compatible agents for a standalone SHRDLU
   blocks-world simulator.
 - `utils/`: shared session serialization, planning-tree helpers, and TLA+/TLC
@@ -67,30 +67,36 @@ export TLA2TOOLS_JAR=/path/to/tla2tools.jar
 
 ## Launching Agents
 
-After `pip install -e`, use `run-agents` to launch the canonical agents and
-planning-mode shorthands:
+After `pip install -e`, use `run-agents` to launch the four canonical agents:
 
 ```bash
 # Run these from the Git repository the agent should operate on.
 run-agents git-basic
 run-agents git-fsm
-run-agents git-plan
-run-agents git-advisory
 
 # Run these with SHRDLU_SIMULATOR_URL pointing at a running simulator.
 run-agents shrdlu-basic -- --result-dir "$PWD/results"
 run-agents shrdlu-fsm -- --result-dir "$PWD/results"
+```
+
+Both domains also expose planning-mode targets:
+
+```bash
+run-agents git-plan
+run-agents git-advisory
+
 run-agents shrdlu-plan -- --result-dir "$PWD/results"
 run-agents shrdlu-advisory -- --result-dir "$PWD/results"
 ```
 
-The same targets are available through option form:
+The same choices are available through option form:
 
 ```bash
 run-agents --domain git --agent basic
 run-agents --domain git --agent fsm
 run-agents --domain git --agent plan
 run-agents --domain git --agent advisory
+
 run-agents --domain shrdlu --agent basic -- --result-dir "$PWD/results"
 run-agents --domain shrdlu --agent fsm -- --result-dir "$PWD/results"
 run-agents --domain shrdlu --agent plan -- --result-dir "$PWD/results"
@@ -101,6 +107,27 @@ Use `run-agents --list` to print the supported targets. Arguments after `--`
 are passed through to the selected agent. `run_agents` with an underscore is
 installed as the same command for shells/scripts that prefer that spelling.
 No separate SHRDLU launcher command is installed.
+
+## Interactive Terminal
+
+The Git and SHRDLU interactive agents share the same terminal loop. In a real
+TTY, normal line editing is enabled through Python `readline`: left/right arrows
+move within the current line, up/down arrows recall previous entries, and
+history is saved per terminal under
+`$XDG_STATE_HOME/llm-agents-fsm/` or `~/.local/state/llm-agents-fsm/`.
+
+Common commands:
+
+- `/help`: show available commands.
+- `/exit`, `/quit`, `exit`, or `quit`: exit the terminal.
+- `/config`: show runtime planning settings for FSM agents.
+- `/mode <fsm|plan|advisory>`: switch FSM planning mode.
+- `/granularity <step|batch>`: switch planning granularity.
+- `/violations <retry|ignore|advisory>`: switch violation handling.
+- `/retries <n>`: switch planning retries.
+
+Compatibility aliases are kept: `/planning-mode` is the same as `/mode`, and
+`/planning` is the same as `/granularity`.
 
 ## Git Agents
 
@@ -122,25 +149,13 @@ Variants:
   checks finite traces against property resources, then executes the accepted
   plan.
 
-The merged FSM can emulate the old plan-first behavior through the launcher:
+`git-plan` and `git-advisory` run the Git FSM implementation with the selected
+planning mode.
 
-```bash
-run-agents git-plan
-run-agents git-advisory
-```
-
-The same modes are available by changing parameters directly:
-
-```bash
-GIT_AGENT_FSM_PLANNING_MODE=plan \
-python3 /home/robot/llm-agents-fsm/git-system/git-agent-fsm.py
-```
-
-Interactive commands include `/help`, `/model <name>`, `/config`,
-`/planning-mode <fsm|plan|advisory>`, `/planning <step|batch>`,
-`/violations <retry|ignore|advisory>`, `/retries <n>`, and `/quit`.
-Saved sessions are written to `.git-agent-sessions/` in the target working
-directory.
+Git-specific commands include `/model <name>` and `/cwd`. The FSM variant also
+adds `/props`. The basic Git agent adds `/reset`, `/save`, and `/verbose`.
+Saved basic-agent sessions are written to `.git-agent-sessions/` in the target
+working directory.
 
 ## SHRDLU Block Agents
 
@@ -168,33 +183,37 @@ run-agents shrdlu-basic -- --result-dir "$PWD/results"
 run-agents shrdlu-fsm -- --result-dir "$PWD/results"
 ```
 
-The merged FSM uses the same planning modes as the Git FSM:
+The SHRDLU FSM supports the same planning modes as the Git FSM:
 
 ```bash
-# FSM-style: plan a suffix and retry/backtrack on property violations.
+# FSM mode: plan toward the goal and retry/backtrack on property violations.
 run-agents shrdlu-fsm -- \
   --planning-mode fsm \
   --max-branch-retries 3
 
-# Plan-style: plan a suffix, record property violations, and continue.
+# Plan mode: plan toward the goal, record property violations, and continue.
 run-agents shrdlu-fsm -- \
   --planning-mode plan
 
-# Advisory-style: tell the planner about properties, record violations, and continue.
+# Advisory mode: include properties in the planning prompt, record violations,
+# and continue.
 run-agents shrdlu-fsm -- \
   --planning-mode advisory
-
 ```
 
 The unified launcher also exposes these as `run-agents shrdlu-plan` and
 `run-agents shrdlu-advisory`, matching Git's `run-agents git-plan` and
-`run-agents git-advisory` targets.
+`run-agents git-advisory`.
 
 Runtime controls:
 
+- `/help`: print the current command list.
 - `/state`: print the current simulator snapshot.
 - `/reset`: reset the simulator.
 - `/events`: print recent simulator action events.
+- `/config`, `/mode`, `/granularity`, `/violations`, `/retries`: adjust live
+  FSM planning settings when running `shrdlu-fsm`, `shrdlu-plan`, or
+  `shrdlu-advisory`.
 - `/quit`: exit.
 
 Useful SHRDLU settings:
@@ -204,8 +223,7 @@ export SHRDLU_OPENAI_TEMPERATURE=0.2
 export SHRDLU_OPENAI_MAX_TOKENS=512
 export SHRDLU_AGENT_MAX_STEPS=50
 export SHRDLU_AGENT_MAX_BRANCH_RETRIES=3
-export SHRDLU_AGENT_FSM_PLANNING_GRANULARITY=batch
-export SHRDLU_AGENT_FSM_VIOLATION_POLICY=retry  # retry | ignore | advisory
+export SHRDLU_AGENT_FSM_PLANNING_MODE=fsm  # fsm | plan | advisory
 export SHRDLU_AGENT_RESULT_DIR=/path/to/results
 ```
 
@@ -216,18 +234,21 @@ Set `SHRDLU_AGENT_RESULT_DIR=` to disable result writing.
 ```text
 git-system/
   git-agent-basic.py        Basic Git terminal agent
-  git-agent-fsm.py          Merged plan/FSM Git agent
+  git-agent-fsm.py          FSM Git planning agent
   resources/                Git atomic-proposition and property catalogs
 
 shrdlu-block/                 Installed as the shrdlu_agents package
   __main__.py               Package module entry point
   shrdlu_agent_basic.py     Basic agent
-  shrdlu_agent_fsm.py       Merged planning/FSM agent
+  shrdlu_agent_fsm.py       FSM SHRDLU planning agent
   property_verifier.py      SHRDLU property checks
   resources/                SHRDLU atomic-proposition and property catalogs
 
 utils/
+  chat_terminal.py          Shared interactive terminal loop
+  planning_terminal.py      Shared runtime planning-mode commands
   run_agents.py             Unified launcher for Git and SHRDLU agents
+  planning_modes.py         Shared planning-mode vocabulary
   session.py                Shared JSON session schema
   planning_tree.py          Planning-tree helpers
   tla_verifier.py           TLA+/TLC spec generation and runner
