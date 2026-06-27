@@ -27,18 +27,17 @@ class GitFsmPlanningTreeShapeTest(unittest.TestCase):
         agent = load_git_agent_module()
         captured: dict[str, int | None] = {}
 
-        def fake_llm(messages, model, tools=None, tag="", max_tokens=None):
-            del messages, model, tools, tag
+        def fake_llm(client, messages, model, tools=None, tag="", max_tokens=None):
+            del client, messages, model, tools, tag
             captured["max_tokens"] = max_tokens
             return '{"plan": [], "finish_response": "done"}', []
 
-        original_llm = agent._llm
+        original_llm = agent._llm_call
         try:
-            agent._llm = fake_llm
+            agent._llm_call = fake_llm
             with patch.dict(os.environ, {}, clear=True):
                 plan = agent.prompt4a_propose_batch(
                     "test goal",
-                    {},
                     [],
                     [],
                     10,
@@ -51,7 +50,7 @@ class GitFsmPlanningTreeShapeTest(unittest.TestCase):
                     ),
                 )
         finally:
-            agent._llm = original_llm
+            agent._llm_call = original_llm
 
         self.assertEqual({"plan": [], "finish_response": "done"}, plan)
         self.assertEqual(
@@ -59,6 +58,66 @@ class GitFsmPlanningTreeShapeTest(unittest.TestCase):
             captured["max_tokens"],
         )
         self.assertGreater(captured["max_tokens"], agent.DEFAULT_OPENAI_MAX_TOKENS)
+
+    def test_ap_predictor_checks_false_to_true_transitions_with_context(self) -> None:
+        agent = load_git_agent_module()
+        captured_messages: list[str] = []
+
+        def fake_llm(client, messages, model, tools=None, tag="", max_tokens=None):
+            del client, model, tools, tag, max_tokens
+            user_text = messages[-1]["content"]
+            captured_messages.append(user_text)
+            if "Atomic proposition: false_ap" in user_text:
+                return '{"value": true, "reason": "became true"}', []
+            return '{"value": false, "reason": "unchanged"}', []
+
+        original_llm = agent._llm_call
+        original_aps = agent.ALL_APS
+        original_specs = agent._AP_SPEC_BY_NAME
+        try:
+            agent._llm_call = fake_llm
+            agent.ALL_APS = ["true_ap", "false_ap"]
+            agent._AP_SPEC_BY_NAME = {
+                "true_ap": {
+                    "description": "A currently true proposition.",
+                    "git_commands": ["git status --short --branch"],
+                },
+                "false_ap": {
+                    "description": "A proposition that may become true.",
+                    "git_commands": ["git branch -vv"],
+                },
+            }
+
+            predicted = agent.prompt4b_predict(
+                "check_status",
+                "shell_cmd",
+                {"command": "git", "args": ["status"]},
+                {"true_ap": True, "false_ap": False},
+                "fake-model",
+                trace=[
+                    {
+                        "action_label": "fetch",
+                        "tool": "git_cmd",
+                        "args": {"command": "fetch origin"},
+                    }
+                ],
+            )
+        finally:
+            agent._llm_call = original_llm
+            agent.ALL_APS = original_aps
+            agent._AP_SPEC_BY_NAME = original_specs
+
+        self.assertFalse(predicted["true_ap"])
+        self.assertTrue(predicted["false_ap"])
+        self.assertEqual("check_status", predicted["last_action"])
+        self.assertEqual(2, len(captured_messages))
+        joined = "\n".join(captured_messages)
+        self.assertIn("FALSE APs:", joined)
+        self.assertIn("- false_ap", joined)
+        self.assertIn("Recently accepted planning steps:", joined)
+        self.assertIn("shell_cmd allowed programs", joined)
+        self.assertIn("attempts to run git", joined)
+        self.assertIn("Observer evidence commands: git branch -vv", joined)
 
     def test_batch_retry_keeps_one_root(self) -> None:
         agent = load_git_agent_module()

@@ -10,7 +10,7 @@ import re
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable
 
 import openai
 
@@ -163,9 +163,6 @@ def _write_result(record: dict[str, Any], result_path: str | None = None) -> str
     return result_path
 
 
-def _append_result_notice(message: str, result_path: str | None) -> str:
-    return _shared_append_result_notice(message, result_path)
-
 
 def last_result_path() -> str | None:
     return _last_result_path
@@ -176,6 +173,14 @@ _ALL_PROPS: list[dict] = load_property_catalog(_PROPERTIES_FILE)
 PROPERTIES = select_properties(_ALL_PROPS, sample_size=PROPERTY_SAMPLE_SIZE)
 
 ALL_APS = sorted(set(ap for part in aps_from_properties(PROPERTIES) for ap in part))
+
+_AP_SPEC_BY_NAME: dict[str, dict[str, Any]] = {
+    spec.get("name", ""): spec
+    for spec in json.loads(
+        (_RESOURCES_DIR / "GIT_AP_CANDIDATES.json").read_text(encoding="utf-8")
+    ).get("current_state_aps", [])
+    if spec.get("name")
+}
 
 DEFAULT_OPENAI_MAX_TOKENS = 512
 DEFAULT_OPENAI_PLANNING_MAX_TOKENS = 2048
@@ -263,8 +268,7 @@ def _feedback_json(value: list[dict] | None) -> str:
     return json.dumps(value[-5:], indent=2, sort_keys=True)
 
 
-def prompt4a_propose(goal: str, s_current: dict[str, bool],
-                     trace: list[dict], tried: list[str], model: str,
+def prompt4a_propose(goal: str, trace: list[dict], tried: list[str], model: str,
                      config: AgentConfig | None = None,
                      failed_attempts: list[dict] | None = None) -> dict | None:
     config = config or default_config_from_env()
@@ -308,12 +312,10 @@ def _normalise_proposal(item: Any) -> dict | None:
     return proposal
 
 
-def prompt4a_propose_batch(goal: str, s_current: dict[str, bool],
-                           trace: list[dict], tried: list[str],
+def prompt4a_propose_batch(goal: str, trace: list[dict], tried: list[str],
                            max_actions: int, model: str,
                            config: AgentConfig | None = None,
                            failed_attempts: list[dict] | None = None) -> dict | None:
-    del s_current
     config = config or default_config_from_env()
     done_steps = "\n".join(
         f"  {i+1}. {s['action_label']}: {s['tool']}({json.dumps(s['args'])})"
@@ -351,25 +353,142 @@ def prompt4a_propose_batch(goal: str, s_current: dict[str, bool],
     return {"plan": plan, "finish_response": finish_response}
 
 PROMPT_4B_SYSTEM = """\
-You are predicting the value of one atomic proposition after a git action completes.
-You are given the proposition, its current value, and the exact git command being run.
+You are predicting the value of one atomic proposition after a git action is executed
+by the local tool wrapper.
 
-Reason about what the command does and whether it would change this proposition.
+Predict the post-action value the live AP observer would read from the repository,
+not the value that would hold if the user's intended workflow succeeded.
+
+Important:
+- The command may fail. Account for non-zero exits, rejected pushes, merge/rebase
+  conflicts, missing editor state, detached HEAD, stale remotes, and tool-denied
+  commands.
+- shell_cmd can only run its allowed shell programs. It cannot run git.
+- git_cmd runs git directly, but git itself can still reject an operation.
+- A failed or denied command usually leaves repository-state APs unchanged, except
+  APs about the most recent action or partially-started git operations.
+- Consider false-to-true transitions. Do not assume APs that are currently FALSE
+  stay FALSE.
 
 Output ONLY valid JSON:
 {"value": true, "reason": "one sentence"}
 {"value": false, "reason": "one sentence"}"""
 
+
+def _ap_definition(ap: str) -> str:
+    spec = _AP_SPEC_BY_NAME.get(ap) or {}
+    description = str(spec.get("description") or ap)
+    commands = spec.get("git_commands") or []
+    if not commands:
+        return description
+    command_text = "; ".join(str(command) for command in commands[:4])
+    if len(commands) > 4:
+        command_text += "; ..."
+    return f"{description}\nObserver evidence commands: {command_text}"
+
+
+def _format_ap_state_for_prompt(state: dict[str, bool]) -> str:
+    true_aps = [ap for ap in ALL_APS if state.get(ap, False)]
+    false_aps = [ap for ap in ALL_APS if not state.get(ap, False)]
+    return (
+        "TRUE APs:\n"
+        + ("\n".join(f"- {ap}" for ap in true_aps) or "- (none)")
+        + "\n\nFALSE APs:\n"
+        + ("\n".join(f"- {ap}" for ap in false_aps) or "- (none)")
+    )
+
+
+def _command_prediction_notes(tool: str, args: dict) -> str:
+    command = str(args.get("command", "") if isinstance(args, dict) else "").strip()
+    notes: list[str] = []
+    if tool == "shell_cmd":
+        notes.append(
+            "shell_cmd allowed programs are: %s. Any other command returns an error and does not mutate git state."
+            % _SHELL_NAMES
+        )
+        if command == "git":
+            notes.append(
+                "This exact shell_cmd attempts to run git, which is denied by the shell tool; predict no git repository mutation."
+            )
+    elif tool == "git_cmd":
+        notes.append(
+            "git_cmd executes git subcommands directly; shell metacharacters are denied before git runs."
+        )
+        subcommand = command.split()[0] if command else ""
+        if subcommand == "fetch":
+            notes.append(
+                "fetch may update remote-tracking refs and can change ahead/behind/divergence APs without changing the current branch tip."
+            )
+        elif subcommand == "pull":
+            notes.append(
+                "pull can fail on divergent branches unless merge/rebase/ff-only is configured; if it fails, unresolved divergence usually remains."
+            )
+        elif subcommand == "push":
+            notes.append(
+                "push can be rejected for non-fast-forward, stale force-with-lease, authentication, permissions, or protected branch policy."
+            )
+        elif subcommand == "rebase":
+            notes.append(
+                "rebase can fail with conflicts and leave an in-progress rebase until continue/abort/skip resolves it."
+            )
+            if "-i" in command.split():
+                notes.append(
+                    "interactive rebase may fail in this terminal when EDITOR is unset or the terminal is non-interactive."
+                )
+        elif subcommand in {"cherry-pick", "revert", "merge"}:
+            notes.append(
+                f"{subcommand} can stop with conflicts and leave an in-progress operation."
+            )
+        elif subcommand == "reset":
+            notes.append(
+                "reset --hard can move the current branch backward and discard working-tree changes."
+            )
+        elif subcommand in {"switch", "checkout"}:
+            notes.append(
+                f"{subcommand} can fail if the target ref does not exist or local changes would be overwritten."
+            )
+        elif subcommand == "commit":
+            notes.append(
+                "commit can fail if there is nothing staged, identity is missing, or an in-progress operation still needs resolution."
+            )
+        elif subcommand == "stash":
+            notes.append(
+                "stash push reports 'No local changes to save' and leaves stash-related state unchanged when the tree is clean."
+            )
+    elif tool == "none":
+        notes.append("No command runs; repository-state APs should remain unchanged.")
+    else:
+        notes.append("Unknown tool; execution will produce an error and should not mutate git state.")
+    return "\n".join(f"- {note}" for note in notes)
+
 def prompt4b_predict_ap(ap: str, current_val: bool,
                         action_label: str, tool: str, args: dict,
-                        model: str) -> tuple[bool, str]:
+                        model: str,
+                        *,
+                        current_state: dict[str, bool] | None = None,
+                        trace: list[dict] | None = None) -> tuple[bool, str]:
+    recent_steps = trace[-3:] if trace else []
+    recent_text = "\n".join(
+        f"- {step.get('action_label', 'unknown')}: "
+        f"{step.get('tool', 'none')}({json.dumps(step.get('args') or {})})"
+        for step in recent_steps
+    ) or "- (none)"
+    state_text = (
+        _format_ap_state_for_prompt(current_state)
+        if current_state is not None
+        else f"- {ap}: {'TRUE' if current_val else 'FALSE'}"
+    )
     content, _ = _llm_call(_CLIENT, [
         {"role": "system", "content": PROMPT_4B_SYSTEM},
         {"role": "user",   "content":
             f"Atomic proposition: {ap}\n"
+            f"Definition: {_ap_definition(ap)}\n"
             f"Current value: {'TRUE' if current_val else 'FALSE'}\n\n"
+            f"Full current AP state before this action:\n{state_text}\n\n"
+            f"Recently accepted planning steps:\n{recent_text}\n\n"
             f"Action: {action_label}\n"
-            f"Command: {tool}({json.dumps(args)})"},
+            f"Command: {tool}({json.dumps(args)})\n\n"
+            f"Execution/tool notes:\n{_command_prediction_notes(tool, args)}"},
     ], model)
     result = _extract_json(content)
     if isinstance(result, dict) and "value" in result:
@@ -378,13 +497,23 @@ def prompt4b_predict_ap(ap: str, current_val: bool,
 
 
 def prompt4b_predict(action_label: str, tool: str, args: dict,
-                     s_current: dict[str, bool], model: str) -> dict[str, bool]:
+                     s_current: dict[str, bool], model: str,
+                     trace: list[dict] | None = None) -> dict[str, bool]:
     s_after = dict(s_current)
 
     for ap in ALL_APS:
-        if s_current.get(ap, False):
-            new_val, _ = prompt4b_predict_ap(ap, True, action_label, tool, args, model)
-            s_after[ap] = new_val
+        current_val = bool(s_current.get(ap, False))
+        new_val, _ = prompt4b_predict_ap(
+            ap,
+            current_val,
+            action_label,
+            tool,
+            args,
+            model,
+            current_state=s_current,
+            trace=trace,
+        )
+        s_after[ap] = new_val
 
     s_after["last_action"] = action_label
     return s_after
@@ -490,7 +619,6 @@ def _request_plan_bundle(
         max_actions = max(1, config.max_plan_steps - depth)
         return prompt4a_propose_batch(
             goal,
-            current_state,
             accepted_trace,
             banned_first_actions,
             max_actions,
@@ -501,7 +629,6 @@ def _request_plan_bundle(
 
     proposal = prompt4a_propose(
         goal,
-        current_state,
         accepted_trace,
         banned_first_actions,
         model,
@@ -535,7 +662,7 @@ def _verify_candidate(
     args = proposal.get("args") or {}
 
     print(f"    -> {action_label}: {tool}({json.dumps(args)})")
-    s_after = prompt4b_predict(action_label, tool, args, s_current, model)
+    s_after = prompt4b_predict(action_label, tool, args, s_current, model, trace=trace)
     candidate = {
         "action_label": action_label,
         "tool": tool,
@@ -1159,11 +1286,10 @@ def handle_query(goal: str, model: str,
     planning_tree["tree_summary"] = build_tree_summary(planning_tree)
     turn["final_message"] = response
     result_path = _write_result(turn, result_path)
-    return _append_result_notice(response, result_path), turn
+    return _shared_append_result_notice(response, result_path), turn
 
 def save_session(turns: list[dict], model: str,
                  config: AgentConfig | None = None) -> Path:
-    """Compatibility wrapper: persist the latest turn using SHRDLU result files."""
     config = config or default_config_from_env()
     latest_turn = turns[-1] if turns else None
     planning_mode = "%s_%s" % (config.planning_granularity, config.violation_policy)
