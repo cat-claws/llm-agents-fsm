@@ -2,15 +2,18 @@
   "metadata": {
     "purpose": "Primitive atomic propositions for git-agent-fsm verification",
     "design_rule": [
-      "State APs are evaluated from live git repository state at observation time.",
-      "Transition APs have names prefixed with '(transition)' and are set by matching the action_label of each step.",
+      "All APs are evaluated from live git repository state at observation time via LLM.",
+      "APs starting with 'The most recent action' describe the immediately preceding step's action type.",
       "Use natural-language names that are unambiguous given the git workflow context.",
       "Do not invent APs not grounded in observable git state or explicit action types.",
-      "Each AP name is used verbatim in property ASTs — changes here require updating GIT_PROPERTIES_AST.json."
+      "Each AP name is used verbatim in property ASTs \u2014 changes here require updating GIT_PROPERTIES_AST.json."
     ],
     "source_context": [
       "git-agent-fsm.py phase 3 (observation)",
       "git-agent-fsm.py phase 4 (planning / state prediction)"
+    ],
+    "notes": [
+      "APs starting with 'The most recent action' describe the immediately preceding step's action type and are evaluated by the LLM like all other APs."
     ]
   },
   "current_state_aps": [
@@ -223,48 +226,96 @@
         "git ls-remote origin 2>&1 | head -5 || echo 'UNREACHABLE'",
         "git status"
       ]
-    }
-  ],
-  "transition_aps": [
-    {
-      "name": "(transition) A force-push action is just performed.",
-      "description": "A 'git push --force' or 'git push --force-with-lease' is executed (distinct from the bare label variant)."
     },
     {
-      "name": "(transition) A merge action is just performed.",
-      "description": "A 'git merge' is executed to combine two branch histories."
+      "name": "The most recent action is a force push.",
+      "description": "A 'git push --force' or 'git push --force-with-lease' is executed (distinct from the bare label variant).",
+      "git_commands": [
+        "git reflog show --format='%gs' -5",
+        "git log --oneline --decorate -5",
+        "git remote -v"
+      ]
     },
     {
-      "name": "(transition) A mutating git action is just performed.",
-      "description": "A pending mutating operation (write/modify) is dequeued from the workflow operation queue."
+      "name": "The most recent action is a merge.",
+      "description": "A 'git merge' is executed to combine two branch histories.",
+      "git_commands": [
+        "git reflog show --format='%gs' -5",
+        "git log --oneline --merges --decorate -5",
+        "git log --oneline --decorate -5"
+      ]
     },
     {
-      "name": "(transition) A normal push action to the remote repository is just performed.",
-      "description": "A 'git push' without force flags is executed (distinct from the bare label variant)."
+      "name": "The most recent action is a mutating git operation.",
+      "description": "A pending mutating operation (write/modify) is dequeued from the workflow operation queue.",
+      "git_commands": [
+        "git reflog show --format='%gs' -5",
+        "git log --oneline --decorate -5",
+        "git status --short --branch"
+      ]
     },
     {
-      "name": "(transition) A public-history rewrite operation is just performed.",
-      "description": "A rewrite of already-published (remote) commit history is executed, e.g. amending a pushed commit."
+      "name": "The most recent action is a normal push to the remote repository.",
+      "description": "A 'git push' without force flags is executed (distinct from the bare label variant).",
+      "git_commands": [
+        "git reflog show --format='%gs' -5",
+        "git log --oneline --decorate -5",
+        "git remote -v"
+      ]
     },
     {
-      "name": "(transition) A rebase action that fails due to branch divergence is just performed.",
-      "description": "A 'git rebase' invocation exits with a conflict or rejection error caused by branch divergence."
+      "name": "The most recent action is a public-history rewrite.",
+      "description": "A rewrite of already-published (remote) commit history is executed, e.g. amending a pushed commit.",
+      "git_commands": [
+        "git reflog show --format='%gs' -5",
+        "git log --oneline --decorate -5",
+        "git log --oneline --decorate origin/HEAD..HEAD 2>/dev/null || git log --oneline -5"
+      ]
     },
     {
-      "name": "(transition) A rebase action is just performed.",
-      "description": "A 'git rebase' command is initiated (may or may not complete successfully)."
+      "name": "The most recent action is a rebase that failed due to branch divergence.",
+      "description": "A 'git rebase' invocation exits with a conflict or rejection error caused by branch divergence.",
+      "git_commands": [
+        "git reflog show --format='%gs' -5",
+        "git status --short --branch",
+        "git rebase --show-current-patch 2>/dev/null || echo no patch"
+      ]
     },
     {
-      "name": "(transition) A rebase action that rewrites published commits is just performed.",
-      "description": "The rebase replays commits that were previously pushed; this constitutes a public history rewrite."
+      "name": "The most recent action is a rebase.",
+      "description": "A 'git rebase' command is initiated (may or may not complete successfully).",
+      "git_commands": [
+        "git reflog show --format='%gs' -5",
+        "git log --oneline --decorate -5",
+        "git status --short --branch"
+      ]
     },
     {
-      "name": "(transition) A rebase operation that fails and leaves divergence unresolved is just performed.",
-      "description": "A rebase exits in a failed state (conflict, abort) and the branch remains diverged."
+      "name": "The most recent action is a rebase that rewrites published commits.",
+      "description": "The rebase replays commits that were previously pushed; this constitutes a public history rewrite.",
+      "git_commands": [
+        "git reflog show --format='%gs' -5",
+        "git log --oneline --decorate -5",
+        "git log --oneline --decorate origin/HEAD..HEAD 2>/dev/null || git log --oneline -5"
+      ]
     },
     {
-      "name": "(transition) An immediate force-push action to publish rewritten history is just performed.",
-      "description": "After a rebase or reset, a force-push is executed immediately as the mandatory follow-up to publish the rewritten history."
+      "name": "The most recent action is a rebase that failed and left divergence unresolved.",
+      "description": "A rebase exits in a failed state (conflict, abort) and the branch remains diverged.",
+      "git_commands": [
+        "git reflog show --format='%gs' -5",
+        "git status --short --branch",
+        "git branch -vv"
+      ]
+    },
+    {
+      "name": "The most recent action is an immediate force push to publish rewritten history.",
+      "description": "After a rebase or reset, a force-push is executed immediately as the mandatory follow-up to publish the rewritten history.",
+      "git_commands": [
+        "git reflog show --format='%gs' -5",
+        "git log --oneline --decorate -5",
+        "git remote -v"
+      ]
     }
   ]
 }

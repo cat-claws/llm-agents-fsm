@@ -5,7 +5,7 @@
     "ap_vocabulary": "GIT_AP_CANDIDATES.json",
     "notes": [
       "Each property uses only the APs defined in GIT_AP_CANDIDATES.json.",
-      "AP names prefixed with '(transition)' are transition APs matched against the action_label of each step.",
+      "APs starting with 'The most recent action' describe the immediately preceding step's action type.",
       "All other APs are state APs evaluated from the live git repository at observation time.",
       "Liveness properties (finally/until operators) have been removed; all remaining properties use only globally/next/and/or/not/implies/ap nodes."
     ]
@@ -24,14 +24,14 @@
               "type": "not",
               "operand": {
                 "type": "ap",
-                "name": "(transition) A rebase action that rewrites published commits is just performed."
+                "name": "The most recent action is a rebase that rewrites published commits."
               }
             },
             {
               "type": "implies",
               "left": {
                 "type": "ap",
-                "name": "(transition) A rebase action is just performed."
+                "name": "The most recent action is a rebase."
               },
               "right": {
                 "type": "ap",
@@ -58,7 +58,7 @@
             "type": "not",
             "operand": {
               "type": "ap",
-              "name": "(transition) A merge action is just performed."
+              "name": "The most recent action is a merge."
             }
           }
         }
@@ -83,14 +83,14 @@
                 "type": "not",
                 "operand": {
                   "type": "ap",
-                  "name": "(transition) A normal push action to the remote repository is just performed."
+                  "name": "The most recent action is a normal push to the remote repository."
                 }
               },
               {
                 "type": "not",
                 "operand": {
                   "type": "ap",
-                  "name": "(transition) A force-push action is just performed."
+                  "name": "The most recent action is a force push."
                 }
               }
             ]
@@ -117,14 +117,14 @@
                 "type": "not",
                 "operand": {
                   "type": "ap",
-                  "name": "(transition) A normal push action to the remote repository is just performed."
+                  "name": "The most recent action is a normal push to the remote repository."
                 }
               },
               {
                 "type": "not",
                 "operand": {
                   "type": "ap",
-                  "name": "(transition) A force-push action is just performed."
+                  "name": "The most recent action is a force push."
                 }
               }
             ]
@@ -142,7 +142,7 @@
           "type": "implies",
           "left": {
             "type": "ap",
-            "name": "(transition) A normal push action to the remote repository is just performed."
+            "name": "The most recent action is a normal push to the remote repository."
           },
           "right": {
             "type": "and",
@@ -177,7 +177,7 @@
           "type": "implies",
           "left": {
             "type": "ap",
-            "name": "(transition) A rebase action that fails due to branch divergence is just performed."
+            "name": "The most recent action is a rebase that failed due to branch divergence."
           },
           "right": {
             "type": "next",
@@ -188,14 +188,14 @@
                   "type": "not",
                   "operand": {
                     "type": "ap",
-                    "name": "(transition) A normal push action to the remote repository is just performed."
+                    "name": "The most recent action is a normal push to the remote repository."
                   }
                 },
                 {
                   "type": "not",
                   "operand": {
                     "type": "ap",
-                    "name": "(transition) A force-push action is just performed."
+                    "name": "The most recent action is a force push."
                   }
                 }
               ]
@@ -223,7 +223,7 @@
               "args": [
                 {
                   "type": "ap",
-                  "name": "(transition) A force-push action is just performed."
+                  "name": "The most recent action is a force push."
                 },
                 {
                   "type": "not",
@@ -248,7 +248,7 @@
           "type": "implies",
           "left": {
             "type": "ap",
-            "name": "(transition) A force-push action is just performed."
+            "name": "The most recent action is a force push."
           },
           "right": {
             "type": "and",
@@ -276,7 +276,7 @@
           "type": "implies",
           "left": {
             "type": "ap",
-            "name": "(transition) A force-push action is just performed."
+            "name": "The most recent action is a force push."
           },
           "right": {
             "type": "and",
@@ -314,7 +314,7 @@
                   },
                   {
                     "type": "ap",
-                    "name": "(transition) A force-push action is just performed."
+                    "name": "The most recent action is a force push."
                   }
                 ]
               }
@@ -323,7 +323,7 @@
               "type": "implies",
               "left": {
                 "type": "ap",
-                "name": "(transition) A force-push action is just performed."
+                "name": "The most recent action is a force push."
               },
               "right": {
                 "type": "not",
@@ -347,7 +347,7 @@
           "type": "implies",
           "left": {
             "type": "ap",
-            "name": "(transition) A normal push action to the remote repository is just performed."
+            "name": "The most recent action is a normal push to the remote repository."
           },
           "right": {
             "type": "and",
@@ -393,14 +393,14 @@
                   "type": "not",
                   "operand": {
                     "type": "ap",
-                    "name": "(transition) A normal push action to the remote repository is just performed."
+                    "name": "The most recent action is a normal push to the remote repository."
                   }
                 },
                 {
                   "type": "not",
                   "operand": {
                     "type": "ap",
-                    "name": "(transition) A force-push action is just performed."
+                    "name": "The most recent action is a force push."
                   }
                 }
               ]
@@ -428,7 +428,7 @@
                 "type": "not",
                 "operand": {
                   "type": "ap",
-                  "name": "(transition) A mutating git action is just performed."
+                  "name": "The most recent action is a mutating git operation."
                 }
               },
               {
@@ -456,7 +456,7 @@
             "type": "not",
             "operand": {
               "type": "ap",
-              "name": "(transition) A normal push action to the remote repository is just performed."
+              "name": "The most recent action is a normal push to the remote repository."
             }
           }
         }
@@ -472,7 +472,7 @@
           "type": "implies",
           "left": {
             "type": "ap",
-            "name": "(transition) A normal push action to the remote repository is just performed."
+            "name": "The most recent action is a normal push to the remote repository."
           },
           "right": {
             "type": "ap",
@@ -497,7 +497,7 @@
             "type": "not",
             "operand": {
               "type": "ap",
-              "name": "(transition) A rebase operation that fails and leaves divergence unresolved is just performed."
+              "name": "The most recent action is a rebase that failed and left divergence unresolved."
             }
           }
         }
@@ -528,7 +528,7 @@
           "type": "implies",
           "left": {
             "type": "ap",
-            "name": "(transition) A force-push action is just performed."
+            "name": "The most recent action is a force push."
           },
           "right": {
             "type": "ap",
@@ -547,13 +547,13 @@
           "type": "implies",
           "left": {
             "type": "ap",
-            "name": "(transition) A public-history rewrite operation is just performed."
+            "name": "The most recent action is a public-history rewrite."
           },
           "right": {
             "type": "next",
             "operand": {
               "type": "ap",
-              "name": "(transition) An immediate force-push action to publish rewritten history is just performed."
+              "name": "The most recent action is an immediate force push to publish rewritten history."
             }
           }
         }

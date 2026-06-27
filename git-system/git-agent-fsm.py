@@ -7,8 +7,6 @@ import copy
 import json
 import os
 import re
-import shlex
-import subprocess
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -73,18 +71,14 @@ from utils.planning_terminal import (
     runtime_config_from_values,
 )
 
-from property_verifier import TransitionPropertyVerifier as GitPropertyVerifier
+from property_verifier import PropertyVerifier as GitPropertyVerifier
+from git_shell_tools import (
+    ALLOWED_GIT_SUBCOMMANDS, SHELL_COMMANDS, TOOL_IMPL, WORK_DIR, _SHELL_NAMES,
+    is_git_repo, tool_git, tool_shell,
+)
+from utils.llm_client import llm as _llm_call, make_client
 
-DEFAULT_OPENAI_BASE_URL = "http://127.0.0.1:30000/v1/"
-DEFAULT_OPENAI_API_KEY = "EMPTY"
-DEFAULT_OPENAI_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
-DEFAULT_OPENAI_TEMPERATURE = 0.2
-DEFAULT_OPENAI_MAX_TOKENS = 512
-DEFAULT_OPENAI_PLANNING_MAX_TOKENS = 2048
-DEFAULT_OPENAI_ENABLE_THINKING = True
-DEFAULT_OPENAI_SEPARATE_REASONING = True
-
-DEFAULT_MODEL    = DEFAULT_OPENAI_MODEL
+DEFAULT_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 MAX_PLAN_STEPS   = 10
 MAX_RETRIES      = 3
 MAX_OUTPUT_CHARS = 4000
@@ -120,26 +114,6 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _normalize_planning_granularity(
-    value: str | None,
-    default: str = PLANNING_BATCH,
-    *,
-    invalid: Literal["default", "raise"] = "default",
-) -> str:
-    return normalize_planning_granularity(
-        value,
-        default=default,
-        invalid=invalid,
-    )
-
-
-def _normalize_violation_policy(
-    value: str | None,
-    default: str = VIOLATION_RETRY,
-    *,
-    invalid: Literal["default", "raise"] = "default",
-) -> str:
-    return normalize_violation_policy(value, default=default, invalid=invalid)
 
 
 def default_config_from_env() -> AgentConfig:
@@ -152,13 +126,13 @@ def default_config_from_env() -> AgentConfig:
     default_policy = str(mode_config["violation_policy"])
     default_retries = int(mode_config["max_retries"])
     return AgentConfig(
-        planning_granularity=_normalize_planning_granularity(
+        planning_granularity=normalize_planning_granularity(
             os.environ.get("GIT_AGENT_FSM_PLANNING_GRANULARITY")
             or os.environ.get("GIT_AGENT_FSM_PLANNING"),
             default_granularity,
             invalid="raise",
         ),
-        violation_policy=_normalize_violation_policy(
+        violation_policy=normalize_violation_policy(
             os.environ.get("GIT_AGENT_FSM_VIOLATION_POLICY")
             or os.environ.get("GIT_AGENT_FSM_VIOLATIONS"),
             default_policy,
@@ -196,209 +170,21 @@ def _append_result_notice(message: str, result_path: str | None) -> str:
 def last_result_path() -> str | None:
     return _last_result_path
 
-ALLOWED_GIT = {
-    "status", "log", "diff", "show", "branch", "checkout", "switch",
-    "add", "commit", "restore", "reset", "rebase", "merge", "fetch",
-    "pull", "push", "remote", "rev-parse", "stash", "tag", "blame",
-    "shortlog", "describe", "reflog", "cherry-pick", "revert", "clean",
-    "ls-files", "ls-remote", "submodule", "config", "init", "clone",
-}
-
-SHELL_BINS: dict[str, str] = {
-    "ls":   "/bin/ls",    "pwd":  "/bin/pwd",   "cat":  "/bin/cat",
-    "echo": "/bin/echo",  "find": "/usr/bin/find", "grep": "/usr/bin/grep",
-    "wc":   "/usr/bin/wc", "head": "/usr/bin/head", "tail": "/usr/bin/tail",
-    "stat": "/usr/bin/stat",
-}
-_SHELL_NAMES = ", ".join(sorted(SHELL_BINS))
-
 PROPERTY_SAMPLE_SIZE: int | None = None
 
 _ALL_PROPS: list[dict] = load_property_catalog(_PROPERTIES_FILE)
 PROPERTIES = select_properties(_ALL_PROPS, sample_size=PROPERTY_SAMPLE_SIZE)
 
-STATE_APS, TRANS_APS = aps_from_properties(PROPERTIES)
-ALL_APS = STATE_APS + TRANS_APS
+ALL_APS = sorted(set(ap for part in aps_from_properties(PROPERTIES) for ap in part))
 
-def _clip(s: str) -> str:
-    return s if len(s) <= MAX_OUTPUT_CHARS else s[:MAX_OUTPUT_CHARS] + "\n...[truncated]"
+DEFAULT_OPENAI_MAX_TOKENS = 512
+DEFAULT_OPENAI_PLANNING_MAX_TOKENS = 2048
 
-def _run(argv: list[str]) -> str:
-    try:
-        p = subprocess.run(argv, cwd=str(WORK_DIR), capture_output=True,
-                           text=True, timeout=CMD_TIMEOUT, check=False)
-        merged = "\n".join(filter(None, [(p.stdout or "").strip(), (p.stderr or "").strip()]))
-        return _clip(merged or "(no output)") + f"\n[exit {p.returncode}]"
-    except subprocess.TimeoutExpired:
-        return f"[error] timed out after {CMD_TIMEOUT}s"
-    except Exception as e:
-        return f"[error] {e}"
+_CLIENT = make_client()
+_MAX_TOKENS = int(os.environ.get("GIT_AGENT_FSM_OPENAI_MAX_TOKENS", str(DEFAULT_OPENAI_MAX_TOKENS)))
+_PLANNING_MAX_TOKENS = int(os.environ.get("GIT_AGENT_FSM_OPENAI_PLANNING_MAX_TOKENS", str(max(_MAX_TOKENS, DEFAULT_OPENAI_PLANNING_MAX_TOKENS))))
 
-def _has_shell_meta(s: str) -> bool:
-    return any(c in s for c in ("|", ";", "&", ">", "<", "`", "$"))
 
-def tool_git(command: str) -> str:
-    if _has_shell_meta(command):
-        return "[error] shell metacharacters (|;&><`$) not allowed in git_cmd"
-    try:
-        parts = shlex.split(command.strip())
-    except ValueError as e:
-        return f"[error] {e}"
-    if not parts or parts[0] not in ALLOWED_GIT:
-        return f"[error] '{parts[0] if parts else ''}' not allowed"
-    return _run(["git"] + parts)
-
-def tool_shell(command: str, args: list[str] | None = None) -> str:
-    if _has_shell_meta(command):
-        return "[error] shell metacharacters not allowed in command name — pass separate args list"
-    binary = SHELL_BINS.get(command)
-    if not binary:
-        return f"[error] '{command}' not allowed. Allowed: {_SHELL_NAMES}"
-    return _run([binary] + [str(a) for a in (args or [])])
-
-TOOL_IMPL = {"git_cmd": tool_git, "shell_cmd": tool_shell}
-
-# These APs describe organizational/remote policies that have no local git
-# equivalent. They are still observed for s0 through property_verifier, but
-# the planner does not try to predict their changes from local git actions.
-
-UNOBSERVABLE_APS: frozenset[str] = frozenset({
-    "A maintainer-level role.",
-    "A non-fast-forward update approval token is present for this action.",
-    "A protected-branch classification.",
-    "A protected branch requires linear history.",
-    "A queue-drain or operator-intervention state is required before execution resumes.",
-    "A remote write-protection or permission-denied status is active.",
-    "A required immediate force push was missed.",
-    "A workflow state in which an immediate force push is required.",
-    "An authorized/authenticated status allowing the guarded action.",
-    "The action is executed under an approved protected-branch override policy.",
-    "The actor is authenticated and authorized for force-push on the target branch.",
-    "The current depth of pending git workflow operations in the processing queue exceeds 64.",
-    "The number of retry attempts used by the workflow operation exceeds 3.",
-    "The repository workflow state indicates that a force push is required before normal publishing can continue.",
-    "A network status indicating remote connectivity is available.",
-    "Authentication credentials for remote write are valid.",
-})
-
-# These APs are structural invariants guaranteed by git's object model or
-# desired liveness goals. The planner does not try to predict their changes
-# from local git actions.
-ALWAYS_TRUE_APS: frozenset[str] = frozenset({
-    "The commit graph remains acyclic and does not introduce reference cycles.",
-    "The repository repeatedly returns to a clean synchronized state over time.",
-    "The workflow repeatedly reaches a state with no unpublished local commit debt.",
-    "Those detached commits are eventually anchored to a named branch reference.",
-})
-
-OBSERVABLE_APS  = [ap for ap in ALL_APS
-                   if ap not in UNOBSERVABLE_APS and ap not in ALWAYS_TRUE_APS]
-
-_LLM_LOG: list[dict] = []
-
-def _llm_log_reset() -> None:
-    _LLM_LOG.clear()
-
-def _llm_log_snapshot() -> list[dict]:
-    return list(_LLM_LOG)
-
-_CLIENT: openai.OpenAI | None = None
-
-def _openai_base_url() -> str:
-    return os.environ.get("SHRDLU_OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL)
-
-def _openai_api_key() -> str:
-    return os.environ.get("SHRDLU_OPENAI_API_KEY", DEFAULT_OPENAI_API_KEY)
-
-def _openai_model() -> str:
-    return os.environ.get("SHRDLU_OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
-
-def _openai_temperature() -> float:
-    return float(os.environ.get("SHRDLU_OPENAI_TEMPERATURE", str(DEFAULT_OPENAI_TEMPERATURE)))
-
-def _openai_max_tokens() -> int:
-    return int(os.environ.get(
-        "GIT_AGENT_FSM_OPENAI_MAX_TOKENS",
-        os.environ.get("SHRDLU_OPENAI_MAX_TOKENS", str(DEFAULT_OPENAI_MAX_TOKENS)),
-    ))
-
-def _openai_planning_max_tokens() -> int:
-    configured = os.environ.get("GIT_AGENT_FSM_OPENAI_PLANNING_MAX_TOKENS")
-    if configured is None:
-        configured = os.environ.get("SHRDLU_OPENAI_PLANNING_MAX_TOKENS")
-    if configured is not None:
-        return int(configured)
-    return max(_openai_max_tokens(), DEFAULT_OPENAI_PLANNING_MAX_TOKENS)
-
-def _openai_extra_body() -> dict[str, Any]:
-    return {
-        "chat_template_kwargs": {"enable_thinking": DEFAULT_OPENAI_ENABLE_THINKING},
-        "separate_reasoning": DEFAULT_OPENAI_SEPARATE_REASONING,
-    }
-
-def _get_client() -> openai.OpenAI:
-    global _CLIENT
-    if _CLIENT is None:
-        _CLIENT = openai.OpenAI(
-            base_url=_openai_base_url(),
-            api_key=_openai_api_key(),
-        )
-    return _CLIENT
-
-def _make_git_property_verifier(model: str) -> GitPropertyVerifier:
-    return GitPropertyVerifier(
-        str(WORK_DIR),
-        model=model,
-        client=_get_client(),
-    )
-
-def _llm(messages: list[dict], model: str,
-         tools: list | None = None, tag: str = "",
-         max_tokens: int | None = None) -> tuple[str, list]:
-    kwargs: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "temperature": _openai_temperature(),
-        "max_tokens": _openai_max_tokens() if max_tokens is None else max_tokens,
-        "extra_body": _openai_extra_body(),
-    }
-    if tools:
-        kwargs["tools"] = tools
-    try:
-        response = _get_client().chat.completions.create(**kwargs)
-    except Exception as exc:
-        raise RuntimeError(
-            "OpenAI-compatible chat error at %s: %s" % (_openai_base_url(), exc)
-        ) from exc
-    try:
-        msg = response.choices[0].message
-    except (AttributeError, IndexError, TypeError) as exc:
-        raise RuntimeError("Unexpected OpenAI-compatible response: %r" % response) from exc
-    content = (msg.content or "").strip()
-
-    tool_calls = []
-    for tc in msg.tool_calls or []:
-        try:
-            arguments = json.loads(tc.function.arguments)
-        except (json.JSONDecodeError, TypeError):
-            arguments = {}
-        tool_calls.append({
-            "id": tc.id,
-            "function": {
-                "name": tc.function.name,
-                "arguments": arguments,
-            },
-        })
-
-    _LLM_LOG.append({
-        "tag":             tag,
-        "messages_in":     messages,
-        "content_out":     content,
-        "finish_reason":   getattr(response.choices[0], "finish_reason", None),
-        "max_tokens":      kwargs["max_tokens"],
-        "tool_calls_out":  tool_calls,
-    })
-    return content, tool_calls
 
 def _extract_json(text: str) -> Any:
     m = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
@@ -414,7 +200,7 @@ def phase3_build_s0(model: str) -> dict[str, bool]:
     Phase 3: observe every AP extracted from the selected property ASTs.
     """
     print(f"  \033[36m[Phase 3] Observing {len(ALL_APS)} APs extracted from properties...\033[0m")
-    verifier = _make_git_property_verifier(model)
+    verifier = GitPropertyVerifier(str(WORK_DIR), model=model, client=_CLIENT)
     s0 = observe_ap_values(ALL_APS, verifier.observe_ap)
     for ap in ALL_APS:
         val = s0[ap]
@@ -428,7 +214,7 @@ Working directory: {WORK_DIR}
 
 Tool call signatures:
   git_cmd(command)         — subcommand + flags as one string, e.g. "add ." or "commit -m 'msg'"
-                             Allowed: {", ".join(sorted(ALLOWED_GIT))}
+                             Allowed: {", ".join(sorted(ALLOWED_GIT_SUBCOMMANDS))}
   shell_cmd(command, args) — bare program name + args list, e.g. command="ls", args=["-la"]
                              Allowed programs: {_SHELL_NAMES}
 
@@ -449,7 +235,7 @@ Working directory: {WORK_DIR}
 
 Tool call signatures:
   git_cmd(command)         — subcommand + flags as one string, e.g. "add ." or "commit -m 'msg'"
-                             Allowed: {", ".join(sorted(ALLOWED_GIT))}
+                             Allowed: {", ".join(sorted(ALLOWED_GIT_SUBCOMMANDS))}
   shell_cmd(command, args) — bare program name + args list, e.g. command="ls", args=["-la"]
                              Allowed programs: {_SHELL_NAMES}
 
@@ -487,7 +273,7 @@ def prompt4a_propose(goal: str, s_current: dict[str, bool],
         for i, s in enumerate(trace)
     ) or "  (none yet)"
 
-    content, _ = _llm([
+    content, _ = _llm_call(_CLIENT, [
         {"role": "system", "content": PROMPT_4A_SYSTEM},
         {"role": "user",   "content":
             f"Goal: {goal}\n\n"
@@ -496,7 +282,7 @@ def prompt4a_propose(goal: str, s_current: dict[str, bool],
             f"Failed plan attempts and backtrack feedback:\n{_feedback_json(failed_attempts)}\n\n"
             f"Banned first actions at this planning point: {tried or 'none'}\n\n"
             f"What is the next action?"},
-    ], model, tag="4A_propose", max_tokens=_openai_planning_max_tokens())
+    ], model, max_tokens=_PLANNING_MAX_TOKENS)
 
     result = _extract_json(content)
     return _normalise_proposal(result) if isinstance(result, dict) else None
@@ -534,7 +320,7 @@ def prompt4a_propose_batch(goal: str, s_current: dict[str, bool],
         for i, s in enumerate(trace)
     ) or "  (none yet)"
 
-    content, _ = _llm([
+    content, _ = _llm_call(_CLIENT, [
         {"role": "system", "content": PROMPT_4A_BATCH_SYSTEM},
         {"role": "user",   "content":
             f"Goal: {goal}\n\n"
@@ -543,7 +329,7 @@ def prompt4a_propose_batch(goal: str, s_current: dict[str, bool],
             f"Failed plan attempts and backtrack feedback:\n{_feedback_json(failed_attempts)}\n\n"
             f"Banned first actions at this planning point: {tried or 'none'}\n\n"
             f"Return at most {max_actions} remaining action(s)."},
-    ], model, tag="4A_propose_batch", max_tokens=_openai_planning_max_tokens())
+    ], model, max_tokens=_PLANNING_MAX_TOKENS)
 
     result = _extract_json(content)
     if isinstance(result, list):
@@ -577,69 +363,34 @@ Output ONLY valid JSON:
 def prompt4b_predict_ap(ap: str, current_val: bool,
                         action_label: str, tool: str, args: dict,
                         model: str) -> tuple[bool, str]:
-    content, _ = _llm([
+    content, _ = _llm_call(_CLIENT, [
         {"role": "system", "content": PROMPT_4B_SYSTEM},
         {"role": "user",   "content":
             f"Atomic proposition: {ap}\n"
             f"Current value: {'TRUE' if current_val else 'FALSE'}\n\n"
             f"Action: {action_label}\n"
             f"Command: {tool}({json.dumps(args)})"},
-    ], model, tag="4B_predict_ap")
+    ], model)
     result = _extract_json(content)
     if isinstance(result, dict) and "value" in result:
         return bool(result["value"]), result.get("reason", "")
     return current_val, "parse error — unchanged"
 
 
-def _label_is(label: str, *words: str) -> bool:
-    return any(w in label.split("_") for w in words)
-
-
-def _set_transition_ap_values(ap_state: dict[str, bool], action_label: str) -> None:
-    al = action_label.lower()
-    for ap in TRANS_APS:
-        apl = ap.lower()
-        if "force" in apl and "push" in apl:
-            ap_state[ap] = _label_is(al, "force", "forcepush", "force_push")
-        elif "rebase" in apl:
-            ap_state[ap] = _label_is(al, "rebase")
-        elif "merge" in apl:
-            ap_state[ap] = _label_is(al, "merge")
-        elif "push" in apl:
-            ap_state[ap] = _label_is(al, "push") and "force" not in al
-        elif "direct commit" in apl or ("commit" in apl and "rebase" not in apl and "push" not in apl):
-            ap_state[ap] = _label_is(al, "commit", "stage", "add")
-        elif "destructive" in apl or "rewrite" in apl:
-            ap_state[ap] = _label_is(al, "force", "rebase", "reset", "amend")
-        elif "mutating" in apl:
-            ap_state[ap] = _label_is(al, "commit", "push", "merge", "rebase", "reset", "force")
-        else:
-            ap_state[ap] = False
-
-
 def prompt4b_predict(action_label: str, tool: str, args: dict,
                      s_current: dict[str, bool], model: str) -> dict[str, bool]:
-    """
-    Predict state_after by evaluating each observable state AP independently.
-    Only APs currently TRUE are checked (they might flip to FALSE).
-    Transition APs are set deterministically by Python from action_label.
-    """
     s_after = dict(s_current)
 
-    for ap in OBSERVABLE_APS:
-        if ap.startswith("(transition)"):
-            continue
+    for ap in ALL_APS:
         if s_current.get(ap, False):
             new_val, _ = prompt4b_predict_ap(ap, True, action_label, tool, args, model)
             s_after[ap] = new_val
 
-    _set_transition_ap_values(s_after, action_label)
     s_after["last_action"] = action_label
     return s_after
 
 def _observe_execution_ap_state(verifier: GitPropertyVerifier, action_label: str) -> dict[str, bool]:
     ap_state = observe_ap_values(ALL_APS, verifier.observe_ap)
-    _set_transition_ap_values(ap_state, action_label)
     ap_state["last_action"] = action_label
     return ap_state
 
@@ -1230,7 +981,7 @@ def phase5_execute(
     if not trace:
         return results
     executed_nodes = accepted_nodes(planning_tree) if planning_tree is not None else []
-    verifier = _make_git_property_verifier(model)
+    verifier = GitPropertyVerifier(str(WORK_DIR), model=model, client=_CLIENT)
     observed_trace: list[dict] = []
     previous_ap_state = s0
 
@@ -1300,11 +1051,11 @@ def prompt5_summary(goal: str, trace: list[dict],
         f"\n     result: {exec_results[i-1][:200] if i <= len(exec_results) else 'N/A'}"
         for i, s in enumerate(trace, 1)
     )
-    content, _ = _llm([
+    content, _ = _llm_call(_CLIENT, [
         {"role": "system", "content": PROMPT_5_SYSTEM},
         {"role": "user",   "content":
             f"Goal: {goal}\n\nExecuted steps:\n{trace_text}"},
-    ], model, tag="5_summary")
+    ], model)
     return content
 
 PROMPT_7_SYSTEM = """\
@@ -1316,19 +1067,18 @@ Be direct and specific: name the property that blocked the plan, and suggest a s
 def prompt7_blocked(goal: str, s0: dict[str, bool],
                     tried_actions: list[str], model: str) -> str:
     s0_text = "\n".join(f"  {'T' if v else 'F'}  {ap}" for ap, v in s0.items())
-    content, _ = _llm([
+    content, _ = _llm_call(_CLIENT, [
         {"role": "system", "content": PROMPT_7_SYSTEM},
         {"role": "user",   "content":
             f"Goal: {goal}\n\n"
             f"Initial state:\n{s0_text}\n\n"
             f"Actions tried and rejected: {tried_actions}"},
-    ], model, tag="7_blocked")
+    ], model)
     return content
 
 def handle_query(goal: str, model: str,
                  config: AgentConfig | None = None) -> tuple[str, dict]:
     """Run one query. Returns (response_text, session_turn_dict)."""
-    _llm_log_reset()
     config = config or default_config_from_env()
 
     planning_mode = "%s_%s" % (config.planning_granularity, config.violation_policy)
@@ -1408,7 +1158,6 @@ def handle_query(goal: str, model: str,
 
     planning_tree["tree_summary"] = build_tree_summary(planning_tree)
     turn["final_message"] = response
-    turn["llm_log"]       = _llm_log_snapshot()
     result_path = _write_result(turn, result_path)
     return _append_result_notice(response, result_path), turn
 
@@ -1447,13 +1196,8 @@ def save_session(turns: list[dict], model: str,
         raise RuntimeError("Result saving is disabled")
     return Path(path)
 
-def _is_git_repo() -> bool:
-    r = subprocess.run(["git", "rev-parse", "--git-dir"],
-                       cwd=str(WORK_DIR), capture_output=True, text=True)
-    return r.returncode == 0
-
 def repl() -> None:
-    model = _openai_model()
+    model = os.environ.get("SHRDLU_OPENAI_MODEL", DEFAULT_MODEL)
     config = default_config_from_env()
     runtime_config = runtime_config_from_values(
         planning_granularity=config.planning_granularity,
@@ -1463,16 +1207,15 @@ def repl() -> None:
         max_steps=config.max_plan_steps,
     )
 
-    in_repo = _is_git_repo()
+    in_repo = is_git_repo()
     repo_notice = "" if in_repo else "  \033[33m(not a git repo)\033[0m"
     sample_note = (f"sampled {len(PROPERTIES)}/{len(_ALL_PROPS)}"
                    if PROPERTY_SAMPLE_SIZE else f"all {len(PROPERTIES)}")
-    base_url = _openai_base_url()
 
     def intro_lines() -> list[str]:
         return [
-            f"\033[1mgit-agent-fsm\033[0m  model={model}  base_url={base_url}  cwd={WORK_DIR}{repo_notice}",
-            f"Properties: {sample_note} | {len(STATE_APS)} state APs | {len(TRANS_APS)} transition APs",
+            f"\033[1mgit-agent-fsm\033[0m  model={model}  cwd={WORK_DIR}{repo_notice}",
+            f"Properties: {sample_note} | {len(ALL_APS)} APs",
             "Planning: %s" % format_runtime_config(runtime_config),
             "Type /help for commands, /exit to quit.",
         ]
@@ -1481,11 +1224,7 @@ def repl() -> None:
         return "git-agent-fsm commands (model=%s):" % model
 
     def show_props(_args: str) -> str:
-        return "%d properties | %d state APs | %d transition APs" % (
-            len(PROPERTIES),
-            len(STATE_APS),
-            len(TRANS_APS),
-        )
+        return "%d properties | %d APs" % (len(PROPERTIES), len(ALL_APS))
 
     def show_cwd(_args: str) -> str:
         return str(WORK_DIR)

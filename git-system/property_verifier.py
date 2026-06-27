@@ -2,14 +2,12 @@
 
 AP evaluation strategy
 ----------------------
-State APs: each AP entry in GIT_AP_CANDIDATES.json carries a list of
-``git_commands`` that gather raw text evidence from the repository.  That
-evidence is fed to an OpenAI-compatible LLM (SGLang on localhost:30000) with
-a yes/no question to determine the boolean truth value of the AP.
-
-Transition APs: truth values are supplied directly by the caller (the FSM
-agent) as a ``Dict[str, bool]`` keyed on the AP's natural-language name.
-No shell commands or LLM calls are needed for transition APs.
+Every AP in GIT_AP_CANDIDATES.json carries a list of ``git_commands`` that
+gather raw text evidence from the repository.  That evidence is fed to an
+OpenAI-compatible LLM with a yes/no question to determine the boolean truth
+value of the AP.  APs starting with "The most recent action" describe the
+immediately preceding step's action type and are evaluated by the LLM like
+all other APs.
 
 Property evaluation
 -------------------
@@ -17,10 +15,8 @@ Properties are evaluated by walking the LTL AST from GIT_PROPERTIES_AST.json
 recursively.  All remaining properties use only the node types:
   globally, next, implies, and, or, not, ap
 
-verify_transition  — evaluates every property against a single (state, action)
-                     step; G(φ) is satisfied iff φ holds at this step.
-verify_trace       — evaluates full finite-trace LTL semantics over a sequence
-                     of steps, including the ``next`` operator.
+verify_trace  — evaluates full finite-trace LTL semantics over a sequence
+                of steps, including the ``next`` operator.
 """
 
 from __future__ import annotations
@@ -34,7 +30,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 __all__ = [
     'PROPERTY_FILE',
     'AP_FILE',
-    'TransitionPropertyVerifier',
+    'PropertyVerifier',
 ]
 
 PROPERTY_FILE = Path(__file__).resolve().parent / 'resources' / 'GIT_PROPERTIES_AST.json'
@@ -56,9 +52,9 @@ def _load_properties(path: Path) -> List[Dict]:
     return list(payload['properties'])
 
 
-def _load_ap_specs(path: Path) -> Tuple[List[Dict], List[Dict]]:
+def _load_ap_specs(path: Path) -> List[Dict]:
     payload = json.loads(path.read_text(encoding='utf-8'))
-    return payload['current_state_aps'], payload['transition_aps']
+    return payload['current_state_aps']
 
 
 def _run_commands(commands: List[str], repo_path: str) -> str:
@@ -183,7 +179,7 @@ def _eval_ast_trace(
     raise ValueError(f'Unsupported AST node type: {t!r}')
 
 
-class TransitionPropertyVerifier:
+class PropertyVerifier:
     """Verify git-agent FSM properties against live repository state.
 
     Parameters
@@ -210,9 +206,9 @@ class TransitionPropertyVerifier:
         self._client = client or self._make_client(base_url, api_key)
         self._model = model or _DEFAULT_MODEL
         self._properties = _load_properties(PROPERTY_FILE)
-        self._state_aps, self._transition_aps = _load_ap_specs(AP_FILE)
-        self._state_ap_by_name: Dict[str, Dict] = {
-            a['name']: a for a in self._state_aps
+        self._aps = _load_ap_specs(AP_FILE)
+        self._ap_by_name: Dict[str, Dict] = {
+            a['name']: a for a in self._aps
         }
 
     @staticmethod
@@ -225,12 +221,8 @@ class TransitionPropertyVerifier:
         return list(self._properties)
 
     @property
-    def state_aps(self) -> List[Dict]:
-        return list(self._state_aps)
-
-    @property
-    def transition_aps(self) -> List[Dict]:
-        return list(self._transition_aps)
+    def aps(self) -> List[Dict]:
+        return list(self._aps)
 
     @staticmethod
     def _default_commands_for_ap(ap_name: str) -> List[str]:
@@ -244,9 +236,7 @@ class TransitionPropertyVerifier:
 
     def observe_ap(self, name: str) -> bool:
         """Return one AP truth value from the current repository state."""
-        if name.startswith('(transition)'):
-            return False
-        spec = self._state_ap_by_name.get(name)
+        spec = self._ap_by_name.get(name)
         description = spec.get('description', '') if spec else name
         commands = (
             spec.get('git_commands', [])
@@ -256,49 +246,38 @@ class TransitionPropertyVerifier:
         evidence = _run_commands(commands, self._repo_path) if commands else '(no commands defined)'
         return _ask_llm(name, description, evidence, self._client, self._model)
 
-    def evaluate_state_aps(self, ap_names: Optional[Iterable[str]] = None) -> Dict[str, bool]:
-        """Run git commands and call LLM to evaluate all state APs.
+    def evaluate_aps(self, ap_names: Optional[Iterable[str]] = None) -> Dict[str, bool]:
+        """Run git commands and call LLM to evaluate all APs.
 
-        Returns a mapping ``{ap_name: bool}`` for every state AP.
+        Returns a mapping ``{ap_name: bool}`` for every AP.
         """
-        results: Dict[str, bool] = {}
         names = (
-            [spec['name'] for spec in self._state_aps]
+            [spec['name'] for spec in self._aps]
             if ap_names is None
             else list(ap_names)
         )
-        for name in names:
-            if name.startswith('(transition)'):
-                continue
-            results[name] = self.observe_ap(name)
-        return results
+        return {name: self.observe_ap(name) for name in names}
 
     def verify_transition(
         self,
-        transition_aps: Dict[str, bool],
         *,
-        state_aps: Optional[Dict[str, bool]] = None,
+        ap_values: Optional[Dict[str, bool]] = None,
     ) -> Dict:
-        """Evaluate all properties against a single FSM transition step.
+        """Evaluate all properties against a single FSM step.
 
         Parameters
         ----------
-        transition_aps:
-            Boolean values for every transition AP (keyed by natural-language
-            name).  The caller (FSM agent) sets these based on the action taken.
-        state_aps:
-            Pre-evaluated state AP booleans.  If ``None``, ``evaluate_state_aps``
+        ap_values:
+            Pre-evaluated AP booleans.  If ``None``, ``evaluate_aps``
             is called automatically to read the current repository state.
 
         Returns
         -------
         dict with keys: all_satisfied, violations, property_results, derived_aps
         """
-        if state_aps is None:
-            state_aps = self.evaluate_state_aps()
-        all_transition_aps = {a['name']: False for a in self._transition_aps}
-        all_transition_aps.update(transition_aps)
-        merged: Dict[str, bool] = {**state_aps, **all_transition_aps}
+        if ap_values is None:
+            ap_values = self.evaluate_aps()
+        merged: Dict[str, bool] = dict(ap_values)
 
         property_results = []
         for prop in self._properties:
@@ -320,26 +299,22 @@ class TransitionPropertyVerifier:
 
     def verify_trace(
         self,
-        steps: List[Tuple[Dict[str, bool], Dict[str, bool]]],
+        steps: List[Dict[str, bool]],
     ) -> Dict:
         """Evaluate properties over a finite trace of FSM steps.
 
         Parameters
         ----------
         steps:
-            Sequence of ``(state_aps, transition_aps)`` pairs, one per step.
-            Each ``state_aps`` dict should be pre-evaluated (e.g. via
-            ``evaluate_state_aps`` called at observation time for that step).
-            ``transition_aps`` is supplied by the FSM agent.
+            Sequence of ``ap_values`` dicts, one per step, each mapping AP
+            name to boolean.  Pre-evaluate via ``evaluate_aps`` at observation
+            time for each step.
 
         Returns
         -------
         dict with keys: all_satisfied, violations, property_results, ap_trace
         """
-        ap_trace = [
-            {**state_aps, **transition_aps}
-            for state_aps, transition_aps in steps
-        ]
+        ap_trace = list(steps)
 
         property_results = []
         for prop in self._properties:
@@ -366,10 +341,19 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description='Evaluate git-agent-fsm properties against a live repository.',
     )
+    try:
+        cwd = os.getcwd()
+    except FileNotFoundError:
+        print(
+            'error: current working directory does not exist. '
+            'Please cd to a valid directory or pass repo_path explicitly.',
+            file=__import__('sys').stderr,
+        )
+        return 2
     parser.add_argument(
         'repo_path',
         nargs='?',
-        default=os.getcwd(),
+        default=cwd,
         help='path to the git repository to inspect (default: cwd)',
     )
     parser.add_argument('--base-url', default=_DEFAULT_BASE_URL)
@@ -377,25 +361,24 @@ def main(argv=None) -> int:
     parser.add_argument('--model', default=None, help='model id (default: SHRDLU-compatible Qwen model)')
     args = parser.parse_args(argv)
 
-    verifier = TransitionPropertyVerifier(
+    verifier = PropertyVerifier(
         args.repo_path,
         base_url=args.base_url,
         api_key=args.api_key,
         model=args.model,
     )
 
-    print(f'Evaluating {len(verifier.state_aps)} state APs in {args.repo_path} ...')
-    state_aps = verifier.evaluate_state_aps()
+    print(f'Evaluating {len(verifier.aps)} APs in {args.repo_path} ...')
+    ap_values = verifier.evaluate_aps()
 
-    print('\nSTATE_AP_VALUES')
-    for name, value in sorted(state_aps.items()):
+    print('\nAP_VALUES')
+    for name, value in sorted(ap_values.items()):
         flag = 'TRUE ' if value else 'FALSE'
         print(f'  {flag}  {name}')
 
-    transition_aps: Dict[str, bool] = {}
-    result = verifier.verify_transition(transition_aps, state_aps=state_aps)
+    result = verifier.verify_transition(ap_values=ap_values)
 
-    print('\nPROPERTY_RESULTS (no active transition)')
+    print('\nPROPERTY_RESULTS')
     for item in result['property_results']:
         flag = 'PASS' if item['satisfied'] else 'FAIL'
         print(f'  {flag}  {item["id"]}  {item["ltl"]}')

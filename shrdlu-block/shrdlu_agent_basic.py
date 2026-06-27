@@ -7,12 +7,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import openai
-
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from utils.llm_client import llm as _llm_call, make_client as _make_client
 from utils.session import (
     SCHEMA_VERSION,
     append_result_notice as _shared_append_result_notice,
@@ -31,8 +30,8 @@ __all__ = [
 DEFAULT_MAX_STEPS = 50
 DEFAULT_RESULT_DIR = str(Path(__file__).resolve().parents[2] / 'playground-llm-agents-fsm' / 'results')
 DEFAULT_TRACE_DIR = DEFAULT_RESULT_DIR
-DEFAULT_OPENAI_BASE_URL = 'http://127.0.0.1:30000/v1/'
-DEFAULT_OPENAI_API_KEY = 'EMPTY'
+DEFAULT_OPENAI_BASE_URL = 'http://127.0.0.1:30000/v1/'  # re-exported for callers
+DEFAULT_OPENAI_API_KEY = 'EMPTY'                         # re-exported for callers
 DEFAULT_OPENAI_MODEL = 'Qwen/Qwen3-30B-A3B-Instruct-2507'
 
 
@@ -257,87 +256,24 @@ class _ShrdluAgentBase:
             action_help,
             observation,
             "Latest simulator result:\n%s" % last_result,
-            'JSON schema: {"response": "...", "action": {"name": "...", "args": {...}}}',
-            'Use {"response": "...", "action": {"name": "finish", "args": {}}} when done.',
-            "Return strict JSON only.",
+            'Use action name "finish" with empty args when done.',
         ])
 
-    @staticmethod
-    def _parse_decision(content: str) -> Dict[str, str]:
-        content = _ShrdluAgentBase._extract_json_object(content)
-        try:
-            decision = json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise ValueError("Model did not return valid JSON: %s" % content) from exc
-        if not isinstance(decision, dict):
-            raise ValueError("Model reply must be a JSON object.")
+    def _request_decision(self, history: List[Dict[str, str]]):
+        content = self._chat(list(history)).strip()
+        decision = json.loads(content)
         action = _ShrdluAgentBase._normalize_action(decision)
-        return {
+        decision = {
             'response': str(decision.get('response', '')),
             'action': {
                 'name': str(action.get('name', '')).strip(),
                 'args': action.get('args', {}) if isinstance(action.get('args', {}), dict) else {},
             },
         }
-
-    def _request_decision(self, history: List[Dict[str, str]]):
-        attempts = list(history)
-        errors = []
-        attempt_log = []
-        for attempt_index in range(2):
-            content = self._chat(attempts).strip()
-            try:
-                decision = self._parse_decision(content)
-            except ValueError as exc:
-                errors.append(str(exc))
-                attempt_log.append({
-                    'attempt_index': attempt_index,
-                    'raw_content': content,
-                    'error': str(exc),
-                })
-                if attempt_index == 1:
-                    break
-                attempts.extend([
-                    {'role': 'assistant', 'content': content},
-                    {
-                        'role': 'user',
-                        'content': (
-                            "Your previous reply was invalid: %s\n"
-                            "Rewrite it as strict JSON only using this schema:\n"
-                            '{"response": "...", "action": {"name": "...", "args": {...}}}'
-                        ) % exc,
-                    },
-                ])
-                continue
-            action_name = decision['action']['name']
-            if not action_name:
-                errors.append('Model reply must include a non-empty action name.')
-                attempt_log.append({
-                    'attempt_index': attempt_index,
-                    'raw_content': content,
-                    'error': 'Model reply must include a non-empty action name.',
-                    'parsed_decision': decision,
-                })
-                if attempt_index == 1:
-                    break
-                attempts.extend([
-                    {'role': 'assistant', 'content': content},
-                    {
-                        'role': 'user',
-                        'content': (
-                            "Your previous reply used an empty action name.\n"
-                            "Return strict JSON only and choose a valid action name or finish."
-                        ),
-                    },
-                ])
-                continue
-            attempt_log.append({
-                'attempt_index': attempt_index,
-                'raw_content': content,
-                'parsed_decision': decision,
-            })
-            return content, decision, attempt_log
-        raise ValueError("Invalid model reply after retry: %s" % errors[-1])
+        if not decision['action']['name']:
+            raise ValueError("Model reply must include a non-empty action name.")
+        attempt_log = [{'attempt_index': 0, 'raw_content': content, 'parsed_decision': decision}]
+        return content, decision, attempt_log
 
     @staticmethod
     def _format_reply(response_text: str, command_result: Optional[str]) -> str:
@@ -504,7 +440,7 @@ class OpenAICompatibleShrdluAgent(_ShrdluAgentBase):
             trace_dir=trace_dir,
         )
         if client is None:
-            client = openai.OpenAI(base_url=base_url, api_key=api_key)
+            client = _make_client()
         self._client = client
         self._temperature = float(temperature)
         self._max_tokens = int(max_tokens)
@@ -512,23 +448,14 @@ class OpenAICompatibleShrdluAgent(_ShrdluAgentBase):
         self._separate_reasoning = bool(separate_reasoning)
 
     def _chat(self, messages: List[Dict[str, str]], schema: Dict[str, object] = DECISION_SCHEMA) -> str:
-        del schema
-        try:
-            response = self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                temperature=self._temperature,
-                max_tokens=self._max_tokens,
-                extra_body={
-                    'chat_template_kwargs': {'enable_thinking': self._enable_thinking},
-                    'separate_reasoning': self._separate_reasoning,
-                },
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "OpenAI-compatible chat error at %s: %s" % (self._host, exc)
-            ) from exc
-        try:
-            return response.choices[0].message.content or ''
-        except (AttributeError, IndexError, TypeError) as exc:
-            raise RuntimeError("Unexpected OpenAI-compatible response: %r" % response) from exc
+        tool_name = "respond"
+        tools = [{"type": "function", "function": {"name": tool_name, "parameters": schema}}]
+        content, tool_calls = _llm_call(
+            self._client, messages, self._model,
+            tools=tools,
+            max_tokens=self._max_tokens,
+            temperature=self._temperature,
+        )
+        if tool_calls:
+            return json.dumps(tool_calls[0]["function"]["arguments"])
+        return content
