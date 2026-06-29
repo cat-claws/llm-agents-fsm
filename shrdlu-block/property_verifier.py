@@ -61,6 +61,11 @@ class TransitionPropertyVerifier:
     def __init__(self, properties: Iterable[Dict[str, object]]):
         del properties
         self._aps = self._load_ap_specs(PROPERTY_FILE)
+        self._ap_by_name = {
+            str(spec.get('name')): spec
+            for spec in self._aps
+            if spec.get('name')
+        }
         self._properties = [spec for spec in PROPERTY_SPECS if spec['id'] in ACTIVE_PROPERTY_IDS]
 
     @classmethod
@@ -124,27 +129,25 @@ class TransitionPropertyVerifier:
         }
 
     def _eval_ap(self, name: str, state: Dict[str, object]) -> bool:
-        if name == 'some_object_resting_on_4':
-            return any(obj.get('resting_on') == 4 for obj in state.get('objects', []))
-        if name == 'some_object_resting_on_8':
-            return any(obj.get('resting_on') == 8 for obj in state.get('objects', []))
-        if name == 'some_object_resting_on_10':
-            return any(obj.get('resting_on') == 10 for obj in state.get('objects', []))
-        if name == 'object_5_resting_on_2':
-            return self._object_resting_on(state, 5, 2)
-        if name == 'object_4_resting_on_3':
-            return self._object_resting_on(state, 4, 3)
-        if name == 'object_8_resting_on_7':
-            return self._object_resting_on(state, 8, 7)
-        if name == 'object_10_resting_on_9':
-            return self._object_resting_on(state, 10, 9)
-        if name == 'grasper_closed':
-            return state.get('grasper_closed') is True
-        if name == 'grasper_lowered':
-            return state.get('grasper_lowered') is True
-        if name == 'object_4_resting_on_6':
-            return self._object_resting_on(state, 4, 6)
-        raise ValueError('Unsupported atomic proposition: %s' % name)
+        spec = self._ap_by_name.get(name)
+        if spec is None:
+            raise ValueError('Unsupported atomic proposition: %s' % name)
+        evaluation = spec.get('evaluation')
+        if not isinstance(evaluation, dict):
+            raise ValueError('Atomic proposition has no evaluation metadata: %s' % name)
+        eval_type = evaluation.get('type')
+        if eval_type == 'some_object_resting_on':
+            support_id = evaluation.get('support_id')
+            return any(obj.get('resting_on') == support_id for obj in state.get('objects', []))
+        if eval_type == 'object_resting_on':
+            return self._object_resting_on(
+                state,
+                int(evaluation['object_id']),
+                int(evaluation['support_id']),
+            )
+        if eval_type == 'field_true':
+            return state.get(str(evaluation['field'])) is True
+        raise ValueError('Unsupported AP evaluation type for %s: %s' % (name, eval_type))
 
     def observe_ap(self, name: str, state: Dict[str, object]) -> bool:
         """Return one AP truth value from a SHRDLU world-state snapshot."""

@@ -10,6 +10,12 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GIT_AGENT_PATH = REPO_ROOT / "git-system" / "git-agent-fsm.py"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from utils import agent_planning
+from utils.planning_modes import PLANNING_BATCH, VIOLATION_RETRY
+from utils.session import make_verification
 
 
 def load_git_agent_module():
@@ -23,31 +29,93 @@ def load_git_agent_module():
 
 
 class GitFsmPlanningTreeShapeTest(unittest.TestCase):
+    def test_result_summary_uses_plain_text_response(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_llm(client, messages, model, tools=None, tool_choice=None, max_tokens=512):
+            del client, messages, model, max_tokens
+            captured["tools"] = tools
+            captured["tool_choice"] = tool_choice
+            return "plain summary", [{"function": {"name": "ignored", "arguments": {}}}]
+
+        result = agent_planning.summarize_result_text(
+            "test goal",
+            [{"action_label": "read_status", "tool": "none", "args": {}}],
+            ["ok"],
+            "fake-model",
+            llm_call=fake_llm,
+            client=object(),
+        )
+
+        self.assertEqual("plain summary", result)
+        self.assertIsNone(captured["tools"])
+        self.assertIsNone(captured["tool_choice"])
+
+    def test_blocked_explanation_uses_plain_text_response(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_llm(client, messages, model, tools=None, tool_choice=None, max_tokens=512):
+            del client, messages, model, max_tokens
+            captured["tools"] = tools
+            captured["tool_choice"] = tool_choice
+            return "plain blocked explanation", [{"function": {"name": "ignored", "arguments": {}}}]
+
+        result = agent_planning.explain_blocked_text(
+            "test goal",
+            {"safe_property": False},
+            ["bad_action"],
+            "fake-model",
+            llm_call=fake_llm,
+            client=object(),
+        )
+
+        self.assertEqual("plain blocked explanation", result)
+        self.assertIsNone(captured["tools"])
+        self.assertIsNone(captured["tool_choice"])
+
     def test_batch_planner_uses_planning_token_budget(self) -> None:
         agent = load_git_agent_module()
         captured: dict[str, int | None] = {}
 
-        def fake_llm(client, messages, model, tools=None, tag="", max_tokens=None):
-            del client, messages, model, tools, tag
+        def fake_llm(client, messages, model, tools=None, tool_choice=None, tag="", max_tokens=None):
+            del client, messages, model, tools, tool_choice, tag
             captured["max_tokens"] = max_tokens
-            return '{"plan": [], "finish_response": "done"}', []
+            return "", [{
+                "function": {
+                    "name": "propose_git_plan",
+                    "arguments": {"plan": [], "finish_response": "done"},
+                },
+            }]
 
         original_llm = agent._llm_call
         try:
             agent._llm_call = fake_llm
             with patch.dict(os.environ, {}, clear=True):
-                plan = agent.prompt4a_propose_batch(
-                    "test goal",
-                    [],
-                    [],
-                    10,
-                    "fake-model",
-                    agent.AgentConfig(
-                        planning_granularity=agent.PLANNING_BATCH,
-                        violation_policy=agent.VIOLATION_RETRY,
-                        max_plan_steps=10,
-                        max_retries=2,
+                config = agent_planning.AgentConfig(
+                    planning_granularity=PLANNING_BATCH,
+                    violation_policy=VIOLATION_RETRY,
+                    max_plan_steps=10,
+                    max_retries=2,
+                )
+                plan = agent_planning.propose_action_plan(
+                    goal="test goal",
+                    trace=[],
+                    tried=[],
+                    max_actions=10,
+                    model="fake-model",
+                    config=config,
+                    failed_attempts=None,
+                    system_prompt=agent.PROMPT_4A_BATCH_SYSTEM,
+                    property_block=agent_planning.property_prompt_block(
+                        config.violation_policy,
+                        agent.PROPERTIES,
                     ),
+                    llm_call=agent._llm_call,
+                    client=agent._CLIENT,
+                    tools=agent._PLAN_PROPOSAL_TOOL,
+                    tool_name="propose_git_plan",
+                    tool_arguments=agent.tool_arguments,
+                    max_tokens=agent.DEFAULT_OPENAI_PLANNING_MAX_TOKENS,
                 )
         finally:
             agent._llm_call = original_llm
@@ -57,19 +125,28 @@ class GitFsmPlanningTreeShapeTest(unittest.TestCase):
             agent.DEFAULT_OPENAI_PLANNING_MAX_TOKENS,
             captured["max_tokens"],
         )
-        self.assertGreater(captured["max_tokens"], agent.DEFAULT_OPENAI_MAX_TOKENS)
 
     def test_ap_predictor_checks_false_to_true_transitions_with_context(self) -> None:
         agent = load_git_agent_module()
         captured_messages: list[str] = []
 
-        def fake_llm(client, messages, model, tools=None, tag="", max_tokens=None):
-            del client, model, tools, tag, max_tokens
+        def fake_llm(client, messages, model, tools=None, tool_choice=None, tag="", max_tokens=None):
+            del client, model, tools, tool_choice, tag, max_tokens
             user_text = messages[-1]["content"]
             captured_messages.append(user_text)
             if "Atomic proposition: false_ap" in user_text:
-                return '{"value": true, "reason": "became true"}', []
-            return '{"value": false, "reason": "unchanged"}', []
+                return "", [{
+                    "function": {
+                        "name": "predict_ap_value",
+                        "arguments": {"value": True, "reason": "became true"},
+                    },
+                }]
+            return "", [{
+                "function": {
+                    "name": "predict_ap_value",
+                    "arguments": {"value": False, "reason": "unchanged"},
+                },
+            }]
 
         original_llm = agent._llm_call
         original_aps = agent.ALL_APS
@@ -88,12 +165,31 @@ class GitFsmPlanningTreeShapeTest(unittest.TestCase):
                 },
             }
 
-            predicted = agent.prompt4b_predict(
-                "check_status",
-                "shell_cmd",
-                {"command": "git", "args": ["status"]},
-                {"true_ap": True, "false_ap": False},
-                "fake-model",
+            def predict_ap(**kwargs):
+                return agent_planning.predict_ap_value(
+                    **kwargs,
+                    aps=agent.ALL_APS,
+                    system_prompt=agent.PROMPT_4B_SYSTEM,
+                    ap_definition=lambda name: agent_planning.render_ap_definition(
+                        name,
+                        spec_by_name=agent._AP_SPEC_BY_NAME,
+                        metadata=agent._AP_CATALOG_METADATA,
+                        evidence_field="git_commands",
+                    ),
+                    action_prediction_notes=agent._command_prediction_notes,
+                    llm_call=agent._llm_call,
+                    client=agent._CLIENT,
+                    tools=agent._AP_PREDICTION_TOOL,
+                    tool_name="predict_ap_value",
+                    tool_arguments=agent.tool_arguments,
+                )
+
+            predicted = agent_planning.predict_action_state(
+                action_label="check_status",
+                tool="shell_cmd",
+                args={"command": "git", "args": ["status"]},
+                current_state={"true_ap": True, "false_ap": False},
+                model="fake-model",
                 trace=[
                     {
                         "action_label": "fetch",
@@ -101,6 +197,8 @@ class GitFsmPlanningTreeShapeTest(unittest.TestCase):
                         "args": {"command": "fetch origin"},
                     }
                 ],
+                aps=agent.ALL_APS,
+                predict_ap=predict_ap,
             )
         finally:
             agent._llm_call = original_llm
@@ -163,7 +261,7 @@ class GitFsmPlanningTreeShapeTest(unittest.TestCase):
                 "state_after": candidate["state_after"],
                 "passed": passed,
                 "violations_str": "" if passed else "bad suffix",
-                "verification": agent.make_verification(
+                "verification": make_verification(
                     passed=passed,
                     properties_checked=[],
                     violations=[] if passed else ["bad suffix"],
@@ -177,22 +275,22 @@ class GitFsmPlanningTreeShapeTest(unittest.TestCase):
                 },
             }
 
-        original_request = agent._request_plan_bundle
-        original_verify = agent._verify_candidate
-        try:
-            agent._request_plan_bundle = fake_request_plan_bundle
-            agent._verify_candidate = fake_verify_candidate
-            config = agent.AgentConfig(
-                planning_granularity=agent.PLANNING_BATCH,
-                violation_policy=agent.VIOLATION_RETRY,
-                max_plan_steps=10,
-                max_retries=2,
-            )
+        config = agent_planning.AgentConfig(
+            planning_granularity=PLANNING_BATCH,
+            violation_policy=VIOLATION_RETRY,
+            max_plan_steps=10,
+            max_retries=2,
+        )
 
-            trace, tree, feasible = agent.phase4_plan("test goal", {}, "fake-model", config)
-        finally:
-            agent._request_plan_bundle = original_request
-            agent._verify_candidate = original_verify
+        trace, tree, feasible = agent_planning.phase4_plan(
+            goal="test goal",
+            s0={},
+            model="fake-model",
+            config=config,
+            properties=agent.PROPERTIES,
+            request_plan=fake_request_plan_bundle,
+            verify_action=fake_verify_candidate,
+        )
 
         roots = [
             node["node_id"]

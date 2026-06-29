@@ -57,6 +57,11 @@ def _load_ap_specs(path: Path) -> List[Dict]:
     return payload['current_state_aps']
 
 
+def _load_ap_metadata(path: Path) -> Dict:
+    payload = json.loads(path.read_text(encoding='utf-8'))
+    return dict(payload.get('metadata', {}))
+
+
 def _run_commands(commands: List[str], repo_path: str) -> str:
     """Run each shell command in ``repo_path`` and concatenate stdout+stderr."""
     parts = []
@@ -207,6 +212,7 @@ class PropertyVerifier:
         self._model = model or _DEFAULT_MODEL
         self._properties = _load_properties(PROPERTY_FILE)
         self._aps = _load_ap_specs(AP_FILE)
+        self._ap_metadata = _load_ap_metadata(AP_FILE)
         self._ap_by_name: Dict[str, Dict] = {
             a['name']: a for a in self._aps
         }
@@ -224,15 +230,9 @@ class PropertyVerifier:
     def aps(self) -> List[Dict]:
         return list(self._aps)
 
-    @staticmethod
-    def _default_commands_for_ap(ap_name: str) -> List[str]:
+    def _default_commands_for_ap(self, ap_name: str) -> List[str]:
         del ap_name
-        return [
-            'git status --short --branch',
-            'git branch -vv',
-            'git log --oneline --decorate -20',
-            'git remote -v',
-        ]
+        return [str(command) for command in self._ap_metadata.get('default_git_commands', [])]
 
     def observe_ap(self, name: str) -> bool:
         """Return one AP truth value from the current repository state."""

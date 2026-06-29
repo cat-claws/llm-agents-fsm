@@ -161,10 +161,6 @@ Git FSM startup settings are read from environment variables:
 
 ```bash
 export GIT_AGENT_FSM_PLANNING_MODE=fsm      # fsm | plan | advisory
-export GIT_AGENT_FSM_PLANNING_GRANULARITY=batch
-export GIT_AGENT_FSM_VIOLATION_POLICY=retry # retry | ignore | advisory
-export GIT_AGENT_FSM_MAX_PLAN_STEPS=10
-export GIT_AGENT_FSM_MAX_RETRIES=3
 export GIT_AGENT_FSM_RESULT_DIR=/path/to/results
 ```
 

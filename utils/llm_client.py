@@ -23,6 +23,7 @@ def llm(
     model: str,
     *,
     tools: list | None = None,
+    tool_choice: dict | str | None = None,
     max_tokens: int = 512,
     temperature: float = 0.2,
 ) -> tuple[str, list]:
@@ -40,6 +41,8 @@ def llm(
     }
     if tools:
         kwargs["tools"] = tools
+    if tool_choice is not None:
+        kwargs["tool_choice"] = tool_choice
     try:
         response = client.chat.completions.create(**kwargs)
     except Exception as exc:
@@ -63,3 +66,14 @@ def llm(
             },
         })
     return content, tool_calls
+
+
+def tool_arguments(tool_calls: list, name: str) -> dict | None:
+    """Return arguments for the first tool call with the requested function name."""
+    for tool_call in tool_calls:
+        function = tool_call.get("function") if isinstance(tool_call, dict) else None
+        if not isinstance(function, dict) or function.get("name") != name:
+            continue
+        arguments = function.get("arguments")
+        return arguments if isinstance(arguments, dict) else {}
+    return None

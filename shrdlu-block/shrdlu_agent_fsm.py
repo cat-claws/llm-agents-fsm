@@ -22,7 +22,7 @@ from utils.planning_modes import (
     VIOLATION_RETRY,
     normalize_planning_granularity,
     normalize_violation_policy,
-    property_guidance_text as _property_guidance_text,
+    property_guidance_text,
     property_policy_text as _shared_property_policy_text,
 )
 from utils.planning_terminal import RuntimePlanningConfig, runtime_config_from_values
@@ -61,8 +61,17 @@ from shrdlu_agents.shrdlu_agent_basic import (
 from shrdlu_agents.simulator_api import ALLOWED_SIMULATOR_ACTION_NAMES, SimulatorAPI
 from shrdlu_blocks.simulator.state_pred import predict_world_state_after_actions
 
-_TLA_PROPERTIES_FILE = Path(__file__).resolve().parent / 'resources' / 'SHRDLU_PROPERTIES_AST.json'
+_RESOURCES_DIR = Path(__file__).resolve().parent / 'resources'
+_TLA_PROPERTIES_FILE = _RESOURCES_DIR / 'SHRDLU_PROPERTIES_AST.json'
+_AP_CANDIDATES_FILE = _RESOURCES_DIR / 'SHRDLU_AP_CANDIDATES.json'
 _TLA_PROPERTIES = load_property_catalog(_TLA_PROPERTIES_FILE)
+_AP_CATALOG: Dict[str, object] = json.loads(_AP_CANDIDATES_FILE.read_text(encoding='utf-8'))
+_AP_CATALOG_METADATA: Dict[str, object] = dict(_AP_CATALOG.get('metadata', {}))
+_AP_SPEC_BY_NAME: Dict[str, Dict[str, object]] = {
+    str(spec.get('name')): spec
+    for spec in _AP_CATALOG.get('current_state_aps', [])
+    if isinstance(spec, dict) and spec.get('name')
+}
 _STATE_AP_NAMES, _TRANSITION_AP_NAMES = aps_from_properties(_TLA_PROPERTIES)
 _AP_NAMES: List[str] = _STATE_AP_NAMES + _TRANSITION_AP_NAMES
 
@@ -184,87 +193,9 @@ Rewrite it as strict JSON only using this schema:
 {{"response": "...", "plan": [{{"name": "...", "args": {{...}}}}], "finish_response": "..."}}
 Return the complete remaining action sequence from the current state to goal completion."""
 
-AP_STATE_PREDICTION_SYSTEM_PROMPT = """You are predicting atomic proposition (AP) truth values in a SHRDLU blocks-world simulator after one action.
-
-## Simulator action effects (exact rules)
-
-move_grasper(x, y):
-  Precondition: grasper_lowered == false.
-  Effect: grasper moves to (x, y). If an object is grasped, it moves with the grasper.
-  resting_on is unchanged (it only changes via lower_grasper / raise_grasper / open_grasper).
-
-lower_grasper:
-  Precondition: grasper_lowered == false.
-  Effect: grasper_lowered = true.
-  If NOT holding: grasper descends to the highest object directly below (x, y), or the table.
-    No object's resting_on changes.
-  If holding (grasped_object != null): held object descends to the highest object directly below (x, y).
-    held_object.resting_on = that support object (or null if table). No other resting_on changes.
-  If precondition fails: no state change.
-
-raise_grasper:
-  Precondition: grasper_lowered == true.
-  Effect: grasper_lowered = false.
-  If NOT holding: no object resting_on changes.
-  If holding: held_object.resting_on = null (object is now airborne).
-  If precondition fails: no state change.
-
-close_grasper:
-  Precondition: grasper_closed == false.
-  Effect: grasper_closed = true.
-  If lowered AND grasper.resting_on is a graspable object: grasped_object = that object id.
-  Otherwise: grasped_object stays null. No resting_on changes.
-  If precondition fails: no state change.
-
-open_grasper:
-  Precondition: grasper_closed == true.
-  If holding: further precondition: grasper_lowered == true AND held_object.resting_on != null AND support is valid.
-    On success: grasped_object = null, grasper_closed = false. held_object.resting_on stays as set by lower_grasper.
-    If further precondition fails: raises error, no state change.
-  If NOT holding: grasper_closed = false. No other change.
-
-## Constraints
-
-- Work from the initial world state + action history delta, not from the AP booleans alone.
-- resting_on changes only via: lower_grasper (when holding), raise_grasper (clears to null), open_grasper (held object released, resting_on stays).
-- grasper_lowered changes only via lower_grasper / raise_grasper.
-- grasper_closed changes only via close_grasper / open_grasper.
-- If an action fails its precondition: no state changes — copy all current AP values unchanged.
-- Every AP must appear in ap_results exactly once as a boolean (true or false). No strings, no nulls.
-
-## Output
-
-Fill the "reasoning" field in this order before writing ap_results:
-  1. object_positions   — for every object in the world, state its current (x, y) position. Start from the initial world state and apply any move_grasper actions that moved a held object to derive the current position of each object.
-  2. grasped_object    — what object (if any) is currently held, from the action history delta.
-  3. precondition_check — does this action pass its precondition? If not, state no-change.
-  4. world_delta        — which fields change (grasper_lowered, grasper_closed, grasped_object, which resting_on)?
-  5. ap_derivation      — evaluate each AP formula against the resulting world state.
-
-Required JSON shape:
-{"reasoning": {"object_positions": "...", "grasped_object": "...", "precondition_check": "...", "world_delta": "...", "ap_derivation": "..."}, "response": "...", "ap_results": {"<ap_name>": true, ...}}
-Return strict JSON only."""
-
-AP_STATE_PREDICTION_PROMPT_TEMPLATE = """\
-Initial world state (authoritative — object positions, resting_on, grasped_object at t=0):
-{init_world_state_json}
-
-Accepted actions so far (applied in order to the initial world state):
-{accepted_trace_json}
-
-Accumulated world-state delta from accepted actions:
-{world_state_delta}
-
-Current AP truth values (derived from the predicted state after accepted actions):
-{current_ap_bools_json}
-
-Next action to predict:
-{action_json}
-
-Atomic propositions (name: evaluation rule):
-{ap_catalog_text}
-
-Return strict JSON only."""
+_AP_STATE_PREDICTION_METADATA = _AP_CATALOG_METADATA['ap_state_prediction']
+AP_STATE_PREDICTION_SYSTEM_PROMPT = str(_AP_STATE_PREDICTION_METADATA['system_prompt'])
+AP_STATE_PREDICTION_PROMPT_TEMPLATE = str(_AP_STATE_PREDICTION_METADATA['prompt_template'])
 
 AP_STATE_SCHEMA = {
     'type': 'object',
@@ -297,7 +228,7 @@ class _FsmShrdluAgentMixin:
 
     def _init_fsm_planner(self, max_branch_retries: int = 3):
         self._max_branch_retries = int(max_branch_retries)
-        self._property_text = self._build_property_text()
+        self._property_text = property_guidance_text(_TLA_PROPERTIES)
 
     def get_runtime_planning_config(self, retry_default: int | None = None) -> RuntimePlanningConfig:
         """Return the live planning settings for terminal mode controls."""
@@ -666,9 +597,6 @@ class _FsmShrdluAgentMixin:
                     continue
             matches.append(item)
         return matches
-
-    def _build_property_text(self) -> str:
-        return _property_guidance_text(_TLA_PROPERTIES)
 
     def _property_monitoring_metadata(self) -> Dict[str, object]:
         return {
@@ -1422,15 +1350,19 @@ class _FsmShrdluAgentMixin:
 
     @staticmethod
     def _ap_formula(name: str) -> str:
-        """Return a Python-style formula string for each AP name."""
-        if name.startswith('object_') and '_resting_on_' in name:
-            tail = name[len('object_'):]
-            obj_id, support = tail.split('_resting_on_')
-            return '%s: (object with obj_id==%s).resting_on == %s' % (name, obj_id, support)
-        if name.startswith('some_object_resting_on_'):
-            support = name[len('some_object_resting_on_'):]
-            return '%s: any object has resting_on == %s' % (name, support)
-        return '%s: world-state field %s is true' % (name, name)
+        """Return the catalog-defined evaluation rule for one AP."""
+        spec = _AP_SPEC_BY_NAME.get(name)
+        if not isinstance(spec, dict):
+            raise ValueError('AP is missing from SHRDLU_AP_CANDIDATES.json: %s' % name)
+        evaluation = spec.get('evaluation')
+        if not isinstance(evaluation, dict):
+            raise ValueError('AP has no evaluation metadata: %s' % name)
+        templates = _AP_CATALOG_METADATA['ap_formula_templates']
+        eval_type = str(evaluation.get('type', ''))
+        template = templates.get(eval_type) if isinstance(templates, dict) else None
+        if not isinstance(template, str):
+            raise ValueError('Unsupported AP evaluation type for %s: %s' % (name, eval_type))
+        return template.format(name=name, **evaluation)
 
     @staticmethod
     def _world_state_delta_summary(

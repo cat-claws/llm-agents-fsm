@@ -482,28 +482,6 @@
       }
     },
     {
-      "id": "prop.git.diverged_rebase_must_not_fail_unresolved",
-      "natural_language": "When branch histories are diverged, a rebase operation must not fail and leave divergence unresolved.",
-      "ltl": "G(diverged => !rebase_fail_unresolved)",
-      "ast": {
-        "type": "globally",
-        "operand": {
-          "type": "implies",
-          "left": {
-            "type": "ap",
-            "name": "Branch histories are diverged and require reconciliation."
-          },
-          "right": {
-            "type": "not",
-            "operand": {
-              "type": "ap",
-              "name": "The most recent action is a rebase that failed and left divergence unresolved."
-            }
-          }
-        }
-      }
-    },
-    {
       "id": "prop.git.no_backward_ref_move",
       "natural_language": "A branch reference never moves backward to exclude previously reachable commits.",
       "ltl": "G(!backward_ref_move)",

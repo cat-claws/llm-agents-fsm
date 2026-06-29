@@ -14,7 +14,41 @@
     ],
     "notes": [
       "APs starting with 'The most recent action' describe the immediately preceding step's action type and are evaluated by the LLM like all other APs."
-    ]
+    ],
+    "observer_evidence_label": "Observer evidence commands",
+    "observer_evidence_limit": 4,
+    "default_git_commands": [
+      "git status --short --branch",
+      "git branch -vv",
+      "git log --oneline --decorate -20",
+      "git remote -v"
+    ],
+    "tool_prediction_notes": {
+      "shell_cmd": {
+        "base": "shell_cmd allowed programs are: {allowed_programs}. Any other command returns an error and does not mutate git state.",
+        "git_denied": "This exact shell_cmd attempts to run git, which is denied by the shell tool; predict no git repository mutation."
+      },
+      "git_cmd": {
+        "base": "git_cmd executes git subcommands directly; shell metacharacters are denied before git runs.",
+        "subcommands": {
+          "fetch": "fetch may update remote-tracking refs and can change ahead/behind/divergence APs without changing the current branch tip.",
+          "pull": "pull can fail on divergent branches unless merge/rebase/ff-only is configured; if it fails, unresolved divergence usually remains.",
+          "push": "push can be rejected for non-fast-forward, stale force-with-lease, authentication, permissions, or protected branch policy.",
+          "rebase": "rebase can fail with conflicts and leave an in-progress rebase until continue/abort/skip resolves it.",
+          "rebase_interactive": "interactive rebase may fail in this terminal when EDITOR is unset or the terminal is non-interactive.",
+          "cherry-pick": "{subcommand} can stop with conflicts and leave an in-progress operation.",
+          "revert": "{subcommand} can stop with conflicts and leave an in-progress operation.",
+          "merge": "{subcommand} can stop with conflicts and leave an in-progress operation.",
+          "reset": "reset --hard can move the current branch backward and discard working-tree changes.",
+          "switch": "{subcommand} can fail if the target ref does not exist or local changes would be overwritten.",
+          "checkout": "{subcommand} can fail if the target ref does not exist or local changes would be overwritten.",
+          "commit": "commit can fail if there is nothing staged, identity is missing, or an in-progress operation still needs resolution.",
+          "stash": "stash push reports 'No local changes to save' and leaves stash-related state unchanged when the tree is clean."
+        }
+      },
+      "none": "No command runs; repository-state APs should remain unchanged.",
+      "unknown": "Unknown tool; execution will produce an error and should not mutate git state."
+    }
   },
   "current_state_aps": [
     {

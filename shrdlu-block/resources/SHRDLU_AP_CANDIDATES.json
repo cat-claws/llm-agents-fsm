@@ -12,48 +12,67 @@
       "shrdlu_blocks/scenes.py",
       "shrdlu_blocks/control.py",
       "shrdlu_blocks/env.py"
-    ]
+    ],
+    "ap_formula_templates": {
+      "object_resting_on": "{name}: (object with obj_id=={object_id}).resting_on == {support_id}",
+      "some_object_resting_on": "{name}: any object has resting_on == {support_id}",
+      "field_true": "{name}: world-state field {field} is true"
+    },
+    "ap_state_prediction": {
+      "system_prompt": "You are predicting atomic proposition (AP) truth values in a SHRDLU blocks-world simulator after one action.\n\n## Simulator action effects (exact rules)\n\nmove_grasper(x, y):\n  Precondition: grasper_lowered == false.\n  Effect: grasper moves to (x, y). If an object is grasped, it moves with the grasper.\n  resting_on is unchanged (it only changes via lower_grasper / raise_grasper / open_grasper).\n\nlower_grasper:\n  Precondition: grasper_lowered == false.\n  Effect: grasper_lowered = true.\n  If NOT holding: grasper descends to the highest object directly below (x, y), or the table.\n    No object's resting_on changes.\n  If holding (grasped_object != null): held object descends to the highest object directly below (x, y).\n    held_object.resting_on = that support object (or null if table). No other resting_on changes.\n  If precondition fails: no state change.\n\nraise_grasper:\n  Precondition: grasper_lowered == true.\n  Effect: grasper_lowered = false.\n  If NOT holding: no object resting_on changes.\n  If holding: held_object.resting_on = null (object is now airborne).\n  If precondition fails: no state change.\n\nclose_grasper:\n  Precondition: grasper_closed == false.\n  Effect: grasper_closed = true.\n  If lowered AND grasper.resting_on is a graspable object: grasped_object = that object id.\n  Otherwise: grasped_object stays null. No resting_on changes.\n  If precondition fails: no state change.\n\nopen_grasper:\n  Precondition: grasper_closed == true.\n  If holding: further precondition: grasper_lowered == true AND held_object.resting_on != null AND support is valid.\n    On success: grasped_object = null, grasper_closed = false. held_object.resting_on stays as set by lower_grasper.\n    If further precondition fails: raises error, no state change.\n  If NOT holding: grasper_closed = false. No other change.\n\n## Constraints\n\n- Work from the initial world state + action history delta, not from the AP booleans alone.\n- resting_on changes only via: lower_grasper (when holding), raise_grasper (clears to null), open_grasper (held object released, resting_on stays).\n- grasper_lowered changes only via lower_grasper / raise_grasper.\n- grasper_closed changes only via close_grasper / open_grasper.\n- If an action fails its precondition: no state changes — copy all current AP values unchanged.\n- Every AP must appear in ap_results exactly once as a boolean (true or false). No strings, no nulls.\n\n## Output\n\nFill the \"reasoning\" field in this order before writing ap_results:\n  1. object_positions   — for every object in the world, state its current (x, y) position. Start from the initial world state and apply any move_grasper actions that moved a held object to derive the current position of each object.\n  2. grasped_object    — what object (if any) is currently held, from the action history delta.\n  3. precondition_check — does this action pass its precondition? If not, state no-change.\n  4. world_delta        — which fields change (grasper_lowered, grasper_closed, grasped_object, which resting_on)?\n  5. ap_derivation      — evaluate each AP formula against the resulting world state.\n\nRequired JSON shape:\n{\"reasoning\": {\"object_positions\": \"...\", \"grasped_object\": \"...\", \"precondition_check\": \"...\", \"world_delta\": \"...\", \"ap_derivation\": \"...\"}, \"response\": \"...\", \"ap_results\": {\"<ap_name>\": true, ...}}\nReturn strict JSON only.",
+      "prompt_template": "Initial world state (authoritative — object positions, resting_on, grasped_object at t=0):\n{init_world_state_json}\n\nAccepted actions so far (applied in order to the initial world state):\n{accepted_trace_json}\n\nAccumulated world-state delta from accepted actions:\n{world_state_delta}\n\nCurrent AP truth values (derived from the predicted state after accepted actions):\n{current_ap_bools_json}\n\nNext action to predict:\n{action_json}\n\nAtomic propositions (name: evaluation rule):\n{ap_catalog_text}\n\nReturn strict JSON only."
+    }
   },
   "current_state_aps": [
     {
       "name": "some_object_resting_on_4",
-      "description": "There exists some object whose resting_on field is 4."
+      "description": "There exists some object whose resting_on field is 4.",
+      "evaluation": {"type": "some_object_resting_on", "support_id": 4}
     },
     {
       "name": "some_object_resting_on_8",
-      "description": "There exists some object whose resting_on field is 8."
+      "description": "There exists some object whose resting_on field is 8.",
+      "evaluation": {"type": "some_object_resting_on", "support_id": 8}
     },
     {
       "name": "some_object_resting_on_10",
-      "description": "There exists some object whose resting_on field is 10."
+      "description": "There exists some object whose resting_on field is 10.",
+      "evaluation": {"type": "some_object_resting_on", "support_id": 10}
     },
     {
       "name": "object_5_resting_on_2",
-      "description": "Object 5 has resting_on == 2."
+      "description": "Object 5 has resting_on == 2.",
+      "evaluation": {"type": "object_resting_on", "object_id": 5, "support_id": 2}
     },
     {
       "name": "object_4_resting_on_3",
-      "description": "Object 4 has resting_on == 3."
+      "description": "Object 4 has resting_on == 3.",
+      "evaluation": {"type": "object_resting_on", "object_id": 4, "support_id": 3}
     },
     {
       "name": "object_8_resting_on_7",
-      "description": "Object 8 has resting_on == 7."
+      "description": "Object 8 has resting_on == 7.",
+      "evaluation": {"type": "object_resting_on", "object_id": 8, "support_id": 7}
     },
     {
       "name": "object_10_resting_on_9",
-      "description": "Object 10 has resting_on == 9."
+      "description": "Object 10 has resting_on == 9.",
+      "evaluation": {"type": "object_resting_on", "object_id": 10, "support_id": 9}
     },
     {
       "name": "grasper_closed",
-      "description": "The world-state field grasper_closed is true."
+      "description": "The world-state field grasper_closed is true.",
+      "evaluation": {"type": "field_true", "field": "grasper_closed"}
     },
     {
       "name": "grasper_lowered",
-      "description": "The world-state field grasper_lowered is true."
+      "description": "The world-state field grasper_lowered is true.",
+      "evaluation": {"type": "field_true", "field": "grasper_lowered"}
     },
     {
       "name": "object_4_resting_on_6",
-      "description": "Object 4 has resting_on == 6."
+      "description": "Object 4 has resting_on == 6.",
+      "evaluation": {"type": "object_resting_on", "object_id": 4, "support_id": 6}
     }
   ]
 }
