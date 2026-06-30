@@ -49,7 +49,6 @@ _JAR_SEARCH = [
     "/usr/lib/tla2tools.jar",
     str(Path.home() / "tla2tools.jar"),
     str(Path(__file__).resolve().parent.parent / "tla2tools.jar"),
-    "/common/home/users/r/rhzhang/tools/tla/tla2tools.jar",
 ]
 
 
@@ -67,9 +66,6 @@ def _find_java() -> str:
     env = os.environ.get("JAVA_BIN")
     if env:
         return env
-    legacy = "/common/home/users/r/rhzhang/.conda/envs/rh1/bin/java"
-    if os.path.isfile(legacy):
-        return legacy
     return "java"
 
 def _ap_slug(name: str, index: int) -> str:
