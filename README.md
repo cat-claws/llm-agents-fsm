@@ -22,8 +22,9 @@ maps the `shrdlu_agents` import name to the `shrdlu-block/` source directory.
 - Optional: Java plus `tla2tools.jar` for TLC verification. Set
   `TLA2TOOLS_JAR` to the jar path. If it is unavailable, the TLC runner reports
   verification as skipped.
-- For SHRDLU agents: an already-running `shrdlu_blocks` simulator. If the
-  simulator package is not installed, keep its checkout on `PYTHONPATH`.
+- For SHRDLU agents: an already-running `shrdlu_blocks` simulator from
+  `shrdlu-world` (https://pypi.org/project/shrdlu-world/). Installing it with
+  `pip install shrdlu-world` is fine.
 
 Basic local setup:
 
@@ -234,17 +235,21 @@ to `.git-agent-sessions/` in the target working directory.
 
 ## SHRDLU Block Agents
 
-The SHRDLU agents talk to an already-running simulator HTTP service. Start the
-simulator from the simulator project, for example:
+The SHRDLU agents talk to an already-running simulator HTTP service. The
+simulator comes from `shrdlu-world` on PyPI:
 
 ```bash
-cd /path/to/shrdlu-block-world
+python3 -m pip install shrdlu-world
+```
+
+Then start it, for example:
+
+```bash
 python3 -m shrdlu_blocks.simulator --headless
 ```
 
 This checkout stores the SHRDLU source in `shrdlu-block/`. The editable install
-exposes that directory as the `shrdlu_agents` Python package. If the sibling
-simulator package is not installed, keep its checkout on `PYTHONPATH`.
+exposes that directory as the `shrdlu_agents` Python package.
 
 Then run one of the canonical agent strategies through `run-agents`:
 
