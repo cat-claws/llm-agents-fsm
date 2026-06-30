@@ -6,7 +6,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 CommandHandler = Callable[[str], str | None]
 MessageHandler = Callable[[str], str | None]
@@ -287,3 +287,9 @@ class ChatTerminal:
         if isinstance(value, str):
             return value.splitlines() or [""]
         return [str(line) for line in value]
+
+
+def set_state_model(state: dict[str, Any], args: str, *, key: str = "model") -> str:
+    if args:
+        state[key] = args.strip()
+    return "Model: %s" % state[key]

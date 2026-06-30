@@ -105,14 +105,14 @@ class GitFsmPlanningTreeShapeTest(unittest.TestCase):
                     model="fake-model",
                     config=config,
                     failed_attempts=None,
-                    system_prompt=agent.PROMPT_4A_BATCH_SYSTEM,
+                    system_prompt=agent.ACTION_PLAN_PROPOSAL_SYSTEM_PROMPT,
                     property_block=agent_planning.property_prompt_block(
                         config.violation_policy,
-                        agent.PROPERTIES,
+                        agent.properties,
                     ),
                     llm_call=agent._llm_call,
-                    client=agent._CLIENT,
-                    tools=agent._PLAN_PROPOSAL_TOOL,
+                    client=agent._client,
+                    tools=agent._plan_proposal_tool,
                     tool_name="propose_git_plan",
                     tool_arguments=agent.tool_arguments,
                     max_tokens=agent.DEFAULT_OPENAI_PLANNING_MAX_TOKENS,
@@ -149,12 +149,12 @@ class GitFsmPlanningTreeShapeTest(unittest.TestCase):
             }]
 
         original_llm = agent._llm_call
-        original_aps = agent.ALL_APS
-        original_specs = agent._AP_SPEC_BY_NAME
+        original_aps = agent.all_aps
+        original_specs = agent._ap_spec_by_name
         try:
             agent._llm_call = fake_llm
-            agent.ALL_APS = ["true_ap", "false_ap"]
-            agent._AP_SPEC_BY_NAME = {
+            agent.all_aps = ["true_ap", "false_ap"]
+            agent._ap_spec_by_name = {
                 "true_ap": {
                     "description": "A currently true proposition.",
                     "git_commands": ["git status --short --branch"],
@@ -168,18 +168,18 @@ class GitFsmPlanningTreeShapeTest(unittest.TestCase):
             def predict_ap(**kwargs):
                 return agent_planning.predict_ap_value(
                     **kwargs,
-                    aps=agent.ALL_APS,
-                    system_prompt=agent.PROMPT_4B_SYSTEM,
+                    aps=agent.all_aps,
+                    system_prompt=agent.AP_PREDICTION_AFTER_ACTION_SYSTEM_PROMPT,
                     ap_definition=lambda name: agent_planning.render_ap_definition(
                         name,
-                        spec_by_name=agent._AP_SPEC_BY_NAME,
-                        metadata=agent._AP_CATALOG_METADATA,
+                        spec_by_name=agent._ap_spec_by_name,
+                        metadata=agent._ap_catalog_metadata,
                         evidence_field="git_commands",
                     ),
                     action_prediction_notes=agent._command_prediction_notes,
                     llm_call=agent._llm_call,
-                    client=agent._CLIENT,
-                    tools=agent._AP_PREDICTION_TOOL,
+                    client=agent._client,
+                    tools=agent._ap_prediction_tool,
                     tool_name="predict_ap_value",
                     tool_arguments=agent.tool_arguments,
                 )
@@ -197,13 +197,13 @@ class GitFsmPlanningTreeShapeTest(unittest.TestCase):
                         "args": {"command": "fetch origin"},
                     }
                 ],
-                aps=agent.ALL_APS,
+                aps=agent.all_aps,
                 predict_ap=predict_ap,
             )
         finally:
             agent._llm_call = original_llm
-            agent.ALL_APS = original_aps
-            agent._AP_SPEC_BY_NAME = original_specs
+            agent.all_aps = original_aps
+            agent._ap_spec_by_name = original_specs
 
         self.assertFalse(predicted["true_ap"])
         self.assertTrue(predicted["false_ap"])
@@ -282,12 +282,12 @@ class GitFsmPlanningTreeShapeTest(unittest.TestCase):
             max_retries=2,
         )
 
-        trace, tree, feasible = agent_planning.phase4_plan(
+        trace, tree, feasible = agent_planning.plan_with_verification(
             goal="test goal",
             s0={},
             model="fake-model",
             config=config,
-            properties=agent.PROPERTIES,
+            properties=agent.properties,
             request_plan=fake_request_plan_bundle,
             verify_action=fake_verify_candidate,
         )

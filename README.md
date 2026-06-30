@@ -161,7 +161,6 @@ Git FSM startup settings are read from environment variables:
 
 ```bash
 export GIT_AGENT_FSM_PLANNING_MODE=fsm      # fsm | plan | advisory
-export GIT_AGENT_FSM_RESULT_DIR=/path/to/results
 ```
 
 At startup, the Git FSM currently reads OpenAI-compatible endpoint settings from

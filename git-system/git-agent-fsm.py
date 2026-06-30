@@ -6,33 +6,31 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from typing import Any
 
-import openai
-
-_SCRIPT_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-if str(_SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPT_DIR))
+_script_dir = Path(__file__).resolve().parent
+_repo_root = Path(__file__).resolve().parents[1]
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+if str(_script_dir) not in sys.path:
+    sys.path.insert(0, str(_script_dir))
 
 from utils.property_catalog import (
     aps_from_properties,
     load_property_catalog,
-    observe_ap_values,
-    select_properties,
 )
 from utils.agent_planning import (
     AgentFlowSpec,
     default_config_from_env as planning_config_from_env,
     execute_tool_step,
-    run_agent_flow,
+    handle_agent_flow_message,
+    make_final_response_handlers,
+    render_template_note,
+    set_runtime_config_in_state,
 )
-from utils.chat_terminal import ChatCommand, ChatTerminal
+from utils.chat_terminal import ChatCommand, ChatTerminal, set_state_model
 from utils.git_learning_reset import reset_git_learning_lab
 from utils.planning_terminal import (
     build_planning_commands,
@@ -50,55 +48,29 @@ DEFAULT_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 MAX_PLAN_STEPS   = 10
 MAX_RETRIES      = 3
 
-_RESOURCES_DIR      = Path(__file__).resolve().parent / "resources"
+_resources_dir = Path(__file__).resolve().parent / "resources"
+_result_dir = _repo_root.parent / "playground-llm-agents-fsm" / "results"
 
-RESULT_DIR = (
-    None
-    if os.environ.get("GIT_AGENT_FSM_RESULT_DIR") == ""
-    else Path(
-        os.environ.get("GIT_AGENT_FSM_RESULT_DIR")
-        or (_REPO_ROOT.parent / "playground-llm-agents-fsm" / "results")
-    )
+
+properties: list[dict] = load_property_catalog(_resources_dir / "GIT_PROPERTIES_AST.json")
+
+all_aps = sorted(set(ap for part in aps_from_properties(properties) for ap in part))
+
+_ap_catalog: dict[str, Any] = json.loads(
+    (_resources_dir / "GIT_AP_CANDIDATES.json").read_text(encoding="utf-8")
 )
-
-
-PROPERTY_SAMPLE_SIZE: int | None = None
-
-_ALL_PROPS: list[dict] = load_property_catalog(_RESOURCES_DIR / "GIT_PROPERTIES_AST.json")
-PROPERTIES = select_properties(_ALL_PROPS, sample_size=PROPERTY_SAMPLE_SIZE)
-
-ALL_APS = sorted(set(ap for part in aps_from_properties(PROPERTIES) for ap in part))
-
-_AP_CATALOG: dict[str, Any] = json.loads(
-    (_RESOURCES_DIR / "GIT_AP_CANDIDATES.json").read_text(encoding="utf-8")
-)
-_AP_CATALOG_METADATA: dict[str, Any] = _AP_CATALOG.get("metadata", {})
-_AP_SPEC_BY_NAME: dict[str, dict[str, Any]] = {
+_ap_catalog_metadata: dict[str, Any] = _ap_catalog.get("metadata", {})
+_ap_spec_by_name: dict[str, dict[str, Any]] = {
     spec.get("name", ""): spec
-    for spec in _AP_CATALOG.get("current_state_aps", [])
+    for spec in _ap_catalog.get("current_state_aps", [])
     if spec.get("name")
 }
 
 DEFAULT_OPENAI_PLANNING_MAX_TOKENS = 2048
 
-_CLIENT = make_client()
+_client = make_client()
 
-
-
-def phase3_build_s0(model: str) -> dict[str, bool]:
-    """
-    Phase 3: observe every AP extracted from the selected property ASTs.
-    """
-    print(f"  \033[36m[Phase 3] Observing {len(ALL_APS)} APs extracted from properties...\033[0m")
-    verifier = GitPropertyVerifier(str(WORK_DIR), model=model, client=_CLIENT)
-    s0 = observe_ap_values(ALL_APS, verifier.observe_ap)
-    for ap in ALL_APS:
-        val = s0[ap]
-        mark = "✓" if val else "✗"
-        print(f"    {mark} {ap[:70]}")
-    return s0
-
-PROMPT_4A_SYSTEM = f"""\
+SINGLE_ACTION_PROPOSAL_SYSTEM_PROMPT = f"""\
 You are proposing the next single git action toward a goal.
 Working directory: {WORK_DIR}
 
@@ -119,7 +91,7 @@ Call propose_git_action with:
 }}
 If the goal is already achieved, call propose_git_action with {{"action_label": "goal_satisfied", "tool": "none", "args": {{}}, "rationale": "done"}}"""
 
-PROMPT_4A_BATCH_SYSTEM = f"""\
+ACTION_PLAN_PROPOSAL_SYSTEM_PROMPT = f"""\
 You are proposing a complete git action plan toward a goal.
 Working directory: {WORK_DIR}
 
@@ -146,7 +118,7 @@ Call propose_git_plan with:
 }}
 If the goal is already achieved, call propose_git_plan with {{"plan": [], "finish_response": "done"}}"""
 
-_ACTION_PROPOSAL_SCHEMA: dict[str, Any] = {
+_action_proposal_schema: dict[str, Any] = {
     "type": "object",
     "properties": {
         "action_label": {"type": "string"},
@@ -169,18 +141,18 @@ _ACTION_PROPOSAL_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-_ACTION_PROPOSAL_TOOL: list[dict[str, Any]] = [
+_action_proposal_tool: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
             "name": "propose_git_action",
             "description": "Return the next single git workflow action.",
-            "parameters": _ACTION_PROPOSAL_SCHEMA,
+            "parameters": _action_proposal_schema,
         },
     }
 ]
 
-_PLAN_PROPOSAL_TOOL: list[dict[str, Any]] = [
+_plan_proposal_tool: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
@@ -191,7 +163,7 @@ _PLAN_PROPOSAL_TOOL: list[dict[str, Any]] = [
                 "properties": {
                     "plan": {
                         "type": "array",
-                        "items": _ACTION_PROPOSAL_SCHEMA,
+                        "items": _action_proposal_schema,
                     },
                     "finish_response": {"type": "string"},
                 },
@@ -202,7 +174,7 @@ _PLAN_PROPOSAL_TOOL: list[dict[str, Any]] = [
     }
 ]
 
-_AP_PREDICTION_TOOL: list[dict[str, Any]] = [
+_ap_prediction_tool: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
@@ -221,7 +193,7 @@ _AP_PREDICTION_TOOL: list[dict[str, Any]] = [
     }
 ]
 
-PROMPT_4B_SYSTEM = """\
+AP_PREDICTION_AFTER_ACTION_SYSTEM_PROMPT = """\
 You are predicting the value of one atomic proposition after a git action is executed
 by the local tool wrapper.
 
@@ -250,27 +222,21 @@ If the workflow was blocked or infeasible, explain why it could not be safely ex
 Be direct, specific, and concise."""
 
 
-def _render_prediction_note(template: Any, **values: object) -> str:
-    if not isinstance(template, str):
-        return ""
-    return template.format(**values)
-
-
 def _command_prediction_notes(tool: str, args: dict) -> str:
     command = str(args.get("command", "") if isinstance(args, dict) else "").strip()
-    note_specs = _AP_CATALOG_METADATA.get("tool_prediction_notes", {})
+    note_specs = _ap_catalog_metadata.get("tool_prediction_notes", {})
     notes: list[str] = []
     if tool == "shell_cmd":
         shell_notes = note_specs.get("shell_cmd", {})
-        notes.append(_render_prediction_note(shell_notes.get("base"), allowed_programs=_SHELL_NAMES))
+        notes.append(render_template_note(shell_notes.get("base"), allowed_programs=_SHELL_NAMES))
         if command == "git":
-            notes.append(_render_prediction_note(shell_notes.get("git_denied")))
+            notes.append(render_template_note(shell_notes.get("git_denied")))
     elif tool == "git_cmd":
         git_notes = note_specs.get("git_cmd", {})
-        notes.append(_render_prediction_note(git_notes.get("base")))
+        notes.append(render_template_note(git_notes.get("base")))
         subcommand_notes = git_notes.get("subcommands", {})
         subcommand = command.split()[0] if command else ""
-        subcommand_note = _render_prediction_note(
+        subcommand_note = render_template_note(
             subcommand_notes.get(subcommand),
             subcommand=subcommand,
         )
@@ -278,143 +244,12 @@ def _command_prediction_notes(tool: str, args: dict) -> str:
             notes.append(subcommand_note)
         if subcommand == "rebase":
             if "-i" in command.split():
-                notes.append(_render_prediction_note(subcommand_notes.get("rebase_interactive")))
+                notes.append(render_template_note(subcommand_notes.get("rebase_interactive")))
     elif tool == "none":
-        notes.append(_render_prediction_note(note_specs.get("none")))
+        notes.append(render_template_note(note_specs.get("none")))
     else:
-        notes.append(_render_prediction_note(note_specs.get("unknown")))
+        notes.append(render_template_note(note_specs.get("unknown")))
     return "\n".join(f"- {note}" for note in notes if note)
-
-
-def _format_final_trace(trace: list[dict], exec_results: list[str]) -> str:
-    if not trace:
-        return "(none)"
-    lines = []
-    for i, step in enumerate(trace, 1):
-        result = exec_results[i - 1][:200] if i <= len(exec_results) else "N/A"
-        lines.append(
-            f"  {i}. {step['action_label']}: {step['tool']}({json.dumps(step['args'])})"
-            f"\n     result: {result}"
-        )
-    return "\n".join(lines)
-
-
-def _format_final_state(state: dict[str, bool] | None) -> str:
-    if not state:
-        return "(not provided)"
-    return "\n".join(
-        f"  {'T' if value else 'F'}  {ap}"
-        for ap, value in state.items()
-    )
-
-
-def _final_response_text(
-    *,
-    goal: str,
-    status: str,
-    model: str,
-    trace_text: str = "(none)",
-    exec_results_text: str = "(none)",
-    initial_state_text: str = "(not provided)",
-    tried_actions_text: str = "(none)",
-    blocking_feedback: str = "(none)",
-    llm_call,
-    client,
-) -> str:
-    content, _tool_calls = llm_call(client, [
-        {"role": "system", "content": FINAL_RESPONSE_SYSTEM},
-        {"role": "user", "content":
-            f"Goal: {goal}\n"
-            f"Status: {status}\n\n"
-            f"Executed steps:\n{trace_text}\n\n"
-            f"Execution results:\n{exec_results_text}\n\n"
-            f"Initial state:\n{initial_state_text}\n\n"
-            f"Actions tried and rejected:\n{tried_actions_text}\n\n"
-            f"Blocking feedback:\n{blocking_feedback}"},
-    ], model)
-    return content.strip()
-
-
-def summarize_final_response(
-    goal: str,
-    trace: list[dict],
-    exec_results: list[str],
-    model: str,
-    *,
-    llm_call,
-    client,
-) -> str:
-    exec_results_text = "\n".join(
-        f"  {i}. {result[:200]}"
-        for i, result in enumerate(exec_results, 1)
-    ) or "(none)"
-    return _final_response_text(
-        goal=goal,
-        status="success",
-        model=model,
-        trace_text=_format_final_trace(trace, exec_results),
-        exec_results_text=exec_results_text,
-        llm_call=llm_call,
-        client=client,
-    )
-
-
-def explain_blocked_final_response(
-    goal: str,
-    initial_state: dict[str, bool],
-    tried_actions: list[str],
-    model: str,
-    *,
-    llm_call,
-    client,
-) -> str:
-    return _final_response_text(
-        goal=goal,
-        status="blocked",
-        model=model,
-        initial_state_text=_format_final_state(initial_state),
-        tried_actions_text=json.dumps(tried_actions),
-        blocking_feedback=(
-            "No feasible property-satisfying plan was found after the listed actions "
-            "were rejected or retries were exhausted."
-        ),
-        llm_call=llm_call,
-        client=client,
-    ) or "No feasible property-satisfying plan found."
-
-
-def _set_runtime_config(state: dict[str, Any], next_config):
-    state["runtime_config"] = next_config
-    state["config"] = replace(
-        state["config"],
-        planning_granularity=next_config.planning_granularity,
-        violation_policy=next_config.violation_policy,
-        max_retries=next_config.max_retries,
-    )
-    return next_config
-
-
-def _handle_message(state: dict[str, Any], spec: AgentFlowSpec, user_input: str) -> str:
-    try:
-        answer, _detail = run_agent_flow(
-            goal=user_input,
-            model=str(state["model"]),
-            config=state["config"],
-            spec=spec,
-        )
-    except openai.OpenAIError as e:
-        answer = f"[openai error] {e}"
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        answer = f"[error] {e}"
-    return answer
-
-
-def _set_model(state: dict[str, Any], args: str) -> str:
-    if args:
-        state["model"] = args.strip()
-    return "Model: %s" % state["model"]
 
 
 def repl() -> None:
@@ -423,49 +258,45 @@ def repl() -> None:
         retry_default=MAX_RETRIES,
         max_plan_steps=MAX_PLAN_STEPS,
     )
+    summarize_result, explain_blocked = make_final_response_handlers(
+        system_prompt=FINAL_RESPONSE_SYSTEM,
+        llm_call=_llm_call,
+        client=_client,
+    )
     spec = AgentFlowSpec(
         agent="git-agent-fsm",
         domain="git",
         work_dir=str(WORK_DIR),
-        properties=PROPERTIES,
-        aps=ALL_APS,
-        result_dir=RESULT_DIR,
+        properties=properties,
+        aps=all_aps,
+        result_dir=_result_dir,
         verification_module_name="GitTrace",
         verification_timeout=CMD_TIMEOUT,
-        observe_initial_state=phase3_build_s0,
-        execute_step=lambda step: execute_tool_step(step, tool_impl=TOOL_IMPL),
-        summarize_result=partial(
-            summarize_final_response,
-            llm_call=_llm_call,
-            client=_CLIENT,
-        ),
-        explain_blocked=partial(
-            explain_blocked_final_response,
-            llm_call=_llm_call,
-            client=_CLIENT,
-        ),
-        llm_call=_llm_call,
-        client=_CLIENT,
-        tool_arguments=tool_arguments,
-        max_planning_tokens=DEFAULT_OPENAI_PLANNING_MAX_TOKENS,
-        propose_step_prompt=PROMPT_4A_SYSTEM,
-        propose_batch_prompt=PROMPT_4A_BATCH_SYSTEM,
-        predict_ap_prompt=PROMPT_4B_SYSTEM,
-        action_proposal_tool=_ACTION_PROPOSAL_TOOL,
-        action_proposal_tool_name="propose_git_action",
-        plan_proposal_tool=_PLAN_PROPOSAL_TOOL,
-        plan_proposal_tool_name="propose_git_plan",
-        ap_prediction_tool=_AP_PREDICTION_TOOL,
-        ap_prediction_tool_name="predict_ap_value",
-        ap_spec_by_name=_AP_SPEC_BY_NAME,
-        ap_catalog_metadata=_AP_CATALOG_METADATA,
-        ap_evidence_field="git_commands",
-        action_prediction_notes=_command_prediction_notes,
-        observe_execution_ap=lambda model: GitPropertyVerifier(
+        observe_ap_for_model=lambda model: GitPropertyVerifier(
             str(WORK_DIR),
             model=model,
-            client=_CLIENT,
+            client=_client,
         ).observe_ap,
+        execute_step=lambda step: execute_tool_step(step, tool_impl=TOOL_IMPL),
+        summarize_result=summarize_result,
+        explain_blocked=explain_blocked,
+        llm_call=_llm_call,
+        client=_client,
+        tool_arguments=tool_arguments,
+        max_planning_tokens=DEFAULT_OPENAI_PLANNING_MAX_TOKENS,
+        propose_step_prompt=SINGLE_ACTION_PROPOSAL_SYSTEM_PROMPT,
+        propose_batch_prompt=ACTION_PLAN_PROPOSAL_SYSTEM_PROMPT,
+        predict_ap_prompt=AP_PREDICTION_AFTER_ACTION_SYSTEM_PROMPT,
+        action_proposal_tool=_action_proposal_tool,
+        action_proposal_tool_name="propose_git_action",
+        plan_proposal_tool=_plan_proposal_tool,
+        plan_proposal_tool_name="propose_git_plan",
+        ap_prediction_tool=_ap_prediction_tool,
+        ap_prediction_tool_name="predict_ap_value",
+        ap_spec_by_name=_ap_spec_by_name,
+        ap_catalog_metadata=_ap_catalog_metadata,
+        ap_evidence_field="git_commands",
+        action_prediction_notes=_command_prediction_notes,
         already_satisfied_response=(
             "The request appears already satisfied; no git action was executed."
         ),
@@ -482,20 +313,19 @@ def repl() -> None:
         ),
     }
     repo_notice = "" if is_git_repo() else "  \033[33m(not a git repo)\033[0m"
-    sample_note = (f"sampled {len(PROPERTIES)}/{len(_ALL_PROPS)}"
-                   if PROPERTY_SAMPLE_SIZE else f"all {len(PROPERTIES)}")
+    sample_note = f"all {len(properties)}"
 
     ChatTerminal(
         name="git-agent-fsm",
-        message_handler=partial(_handle_message, state, spec),
+        message_handler=partial(handle_agent_flow_message, state, spec),
         intro=lambda: [
             f"\033[1mgit-agent-fsm\033[0m  model={state['model']}  cwd={WORK_DIR}{repo_notice}",
-            f"Properties: {sample_note} | {len(ALL_APS)} APs",
+            f"Properties: {sample_note} | {len(all_aps)} APs",
             "Planning: %s" % format_runtime_config(state["runtime_config"]),
             "Type /help for commands, /exit to quit.",
         ],
         help_title=lambda: "git-agent-fsm commands (model=%s):" % state["model"],
-        help_footer="Each query runs: Phase 3 (observe s0) -> Phase 4 (plan+TLC) -> Phase 5 (execute).",
+        help_footer="Each query runs: observe s0 -> plan+TLC -> execute.",
         commands=[
             ChatCommand(
                 ("/reset", "reset"),
@@ -505,12 +335,12 @@ def repl() -> None:
             ChatCommand(
                 ("/props",),
                 "show property counts",
-                lambda _args: "%d properties | %d APs" % (len(PROPERTIES), len(ALL_APS)),
+                lambda _args: "%d properties | %d APs" % (len(properties), len(all_aps)),
             ),
-            ChatCommand(("/model",), "switch OpenAI model", partial(_set_model, state), "<name>"),
+            ChatCommand(("/model",), "switch OpenAI model", partial(set_state_model, state), "<name>"),
             *build_planning_commands(
                 get_config=lambda: state["runtime_config"],
-                set_config=partial(_set_runtime_config, state),
+                set_config=partial(set_runtime_config_in_state, state),
                 retry_default=MAX_RETRIES,
             ),
             ChatCommand(("/cwd",), "show working directory", lambda _args: str(WORK_DIR)),

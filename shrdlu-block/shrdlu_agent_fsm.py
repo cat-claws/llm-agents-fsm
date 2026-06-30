@@ -6,7 +6,6 @@ import copy
 import json
 import re
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
@@ -31,22 +30,14 @@ from utils.property_catalog import (
     load_property_catalog,
     observe_ap_values,
 )
-from utils.session import (
-    accepted_nodes_by_depth,
-    annotate_node_executed,
-    append_node,
-    build_tree_summary,
-    extract_property_ids_from_violations,
-    make_action,
-    make_planning_node,
-    make_planning_tree,
-    make_session,
-    make_state_path_entry,
-    make_verification,
-    set_node_outcome,
+from utils.agent_planning import (
+    AgentConfig,
+    AgentFlowSpec,
+    run_verification,
+    run_agent_flow,
 )
-from utils.tla_verifier import (
-    verify_fsm_trace as _verify_tla_fsm_trace,
+from utils.session import (
+    make_verification,
 )
 
 from shrdlu_agents.shrdlu_agent_basic import (
@@ -80,26 +71,35 @@ __all__ = [
 ]
 
 
-def _verify_fsm_trace(
-    initial_state: Dict[str, bool],
-    action_labels: List[str],
-    states_after: List[Dict[str, bool]],
-    ap_names: List[str],
-    *,
-    module_name: str = 'ShrdluTrace',
-    timeout: int = 60,
-    is_complete_trace: bool = True,
-) -> Dict:
-    return _verify_tla_fsm_trace(
-        initial_state,
-        action_labels,
-        states_after,
-        ap_names,
-        _TLA_PROPERTIES,
-        module_name=module_name,
-        timeout=timeout,
-        is_complete_trace=is_complete_trace,
-    )
+def _noop_llm_call(*_args, **_kwargs):
+    return '', []
+
+
+def _noop_tool_arguments(*_args, **_kwargs):
+    return None
+
+
+def _empty_action_prediction_notes(_tool: str, _args: dict) -> str:
+    return ''
+
+
+def _shared_action_to_simulator(step: Dict[str, object]) -> Dict[str, object]:
+    return {
+        'name': str(step.get('action_label') or step.get('label') or 'unknown'),
+        'args': step.get('args', {}) if isinstance(step.get('args'), dict) else {},
+    }
+
+
+def _simulator_action_to_shared(action: Dict[str, object]) -> Dict[str, object]:
+    return {
+        'action_label': str(action.get('name', 'unknown')),
+        'tool': 'simulator_action',
+        'args': action.get('args', {}) if isinstance(action.get('args'), dict) else {},
+    }
+
+
+def _shared_trace_to_simulator(trace: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    return [_shared_action_to_simulator(step) for step in trace]
 
 
 def _normalize_planning_granularity(
@@ -192,36 +192,6 @@ Your previous reply was invalid: {error}
 Rewrite it as strict JSON only using this schema:
 {{"response": "...", "plan": [{{"name": "...", "args": {{...}}}}], "finish_response": "..."}}
 Return the complete remaining action sequence from the current state to goal completion."""
-
-_AP_STATE_PREDICTION_METADATA = _AP_CATALOG_METADATA['ap_state_prediction']
-AP_STATE_PREDICTION_SYSTEM_PROMPT = str(_AP_STATE_PREDICTION_METADATA['system_prompt'])
-AP_STATE_PREDICTION_PROMPT_TEMPLATE = str(_AP_STATE_PREDICTION_METADATA['prompt_template'])
-
-AP_STATE_SCHEMA = {
-    'type': 'object',
-    'properties': {
-        'reasoning': {
-            'type': 'object',
-            'properties': {
-                'object_positions': {'type': 'string'},
-                'grasped_object': {'type': 'string'},
-                'precondition_check': {'type': 'string'},
-                'world_delta': {'type': 'string'},
-                'ap_derivation': {'type': 'string'},
-            },
-            'required': ['object_positions', 'grasped_object', 'precondition_check', 'world_delta', 'ap_derivation'],
-        },
-        'response': {
-            'type': 'string',
-        },
-        'ap_results': {
-            'type': 'object',
-            'additionalProperties': {'type': 'boolean'},
-        },
-    },
-    'required': ['reasoning', 'response', 'ap_results'],
-}
-
 
 class _FsmShrdluAgentMixin:
     """Plan before execution with configurable granularity and property policy."""
@@ -608,464 +578,222 @@ class _FsmShrdluAgentMixin:
         }
 
     def _run_agent_loop(self, request: str) -> str:
-        initial_world_state = self._env.snapshot()
-        initial_state = self._build_initial_ap_state(initial_world_state)
-        planning_mode = "%s_%s" % (self._planning_granularity, self._violation_policy)
-        action_help = self._env.action_help()
-        trace = make_session(
-            agent='shrdlu-agent-fsm',
+        response, _turn = run_agent_flow(
+            goal=request,
             model=self._model,
-            domain='shrdlu',
-            request=request,
-            properties=_TLA_PROPERTIES,
-            planning_config={
-                'host': self._host,
-                'planning_mode': planning_mode,
-                'planning_granularity': self._planning_granularity,
-                'violation_policy': self._violation_policy,
-                'max_steps': self._max_steps,
-                'max_branch_retries': self._max_branch_retries,
-                'property_monitoring': self._property_monitoring_metadata(),
-            },
+            config=self._agent_config(),
+            spec=self._agent_flow_spec(),
         )
-        trace['planning_tree'] = make_planning_tree(
-            mode=planning_mode,
-            max_steps=self._max_steps,
-            max_branch_retries=self._max_branch_retries,
+        return response
+
+    def _agent_config(self) -> AgentConfig:
+        return AgentConfig(
             planning_granularity=self._planning_granularity,
             violation_policy=self._violation_policy,
+            max_plan_steps=self._max_steps,
+            max_retries=self._max_branch_retries,
+        )
+
+    def _agent_flow_spec(self) -> AgentFlowSpec:
+        self._shared_initial_world_state = self._env.snapshot()
+        self._shared_action_help = self._env.action_help()
+        self._last_planning_response = ''
+        self._last_finish_response = ''
+        return AgentFlowSpec(
+            agent='shrdlu-agent-fsm',
+            domain='shrdlu',
+            work_dir=self._host,
             properties=_TLA_PROPERTIES,
-            initial_state=initial_state,
-            initial_world_state=initial_world_state,
-            action_help=action_help,
-        )
-        trace['status'] = 'planning'
-        result_path = self._start_result_session(trace)
-
-        result = self._search_plan(
-            request=request,
-            current_state=initial_state,
-            init_world_state=initial_world_state,
-            preceding_ap_trace=[initial_state],
-            accepted_trace=[],
-            depth=0,
-            planning_tree=trace['planning_tree'],
-            action_help=action_help,
-            parent_node_id=None,
-            inherited_failures=[],
-            hint_plan=None,
-            trace=trace,
-            result_path=result_path,
-        )
-
-        trace['planning_tree']['feasible'] = bool(result.get('success'))
-        trace['planning_tree']['accepted_plan'] = result.get('plan', []) if result.get('success') else []
-        trace['planning_tree']['finish_response'] = result.get('finish_response')
-        trace['planning_tree']['planning_response'] = result.get('planning_response')
-        if result.get('failure'):
-            trace['planning_tree']['failure'] = result['failure']
-
-        if not result.get('success'):
-            base_message = self._normalize_response_text(
-                result.get('finish_response', 'No feasible property-satisfying plan found.'),
-                is_finish=True,
-            )
-            violated = self._collect_violated_properties(result.get('failure'))
-            if violated:
-                violated_text = 'Properties violated: ' + ', '.join(sorted(violated))
-                final_message = base_message + '\n' + violated_text
-            else:
-                final_message = base_message
-            trace['status'] = 'infeasible'
-            trace['final_message'] = final_message
-            trace['planning_tree']['tree_summary'] = self._build_tree_summary(trace['planning_tree'])
-            result_path = self._write_result(trace, result_path)
-            return self._append_result_notice(final_message, result_path)
-
-        plan = result['plan']
-        response_text = self._normalize_response_text(
-            result.get('planning_response', 'Verified plan ready.'),
-            is_finish=not plan,
-        )
-        finish_response = self._normalize_response_text(
-            result.get('finish_response', 'Done.'),
-            is_finish=True,
+            aps=_AP_NAMES,
+            result_dir=self._result_dir,
+            verification_module_name='ShrdluTrace',
+            verification_timeout=60,
+            observe_ap_for_model=lambda _model: self._observe_live_ap,
+            execute_step=self._execute_shared_step,
+            summarize_result=self._summarize_shared_result,
+            explain_blocked=self._explain_shared_blocked,
+            llm_call=_noop_llm_call,
+            client=None,
+            tool_arguments=_noop_tool_arguments,
+            max_planning_tokens=self._max_tokens,
+            propose_step_prompt=STEP_PREDICTIVE_PLAN_SYSTEM_PROMPT,
+            propose_batch_prompt=BATCH_PLAN_SYSTEM_PROMPT,
+            predict_ap_prompt='',
+            action_proposal_tool=[],
+            action_proposal_tool_name='propose_shrdlu_action',
+            plan_proposal_tool=[],
+            plan_proposal_tool_name='propose_shrdlu_plan',
+            ap_prediction_tool=[],
+            ap_prediction_tool_name='predict_shrdlu_ap',
+            ap_spec_by_name=_AP_SPEC_BY_NAME,
+            ap_catalog_metadata=_AP_CATALOG_METADATA,
+            ap_evidence_field='evaluation',
+            action_prediction_notes=_empty_action_prediction_notes,
+            already_satisfied_response='Done.',
+            initial_world_state=lambda: copy.deepcopy(self._shared_initial_world_state),
+            action_help=lambda: self._shared_action_help,
+            planning_config_extra=self._shared_planning_config_extra,
+            request_plan_override=self._request_shared_plan,
+            verify_action_override=self._verify_shared_action,
+            after_execute=self._execute_grasper_cleanup,
+            result_path_callback=self._remember_result_path,
         )
 
-        if not plan:
-            trace['status'] = 'finished'
-            trace['final_message'] = finish_response
-            trace['planning_tree']['tree_summary'] = self._build_tree_summary(trace['planning_tree'])
-            result_path = self._write_result(trace, result_path)
-            return finish_response if response_text == finish_response else self._format_reply(
-                response_text,
-                finish_response,
-            )
+    def _shared_planning_config_extra(self) -> Dict[str, object]:
+        return {
+            'host': self._host,
+            'max_steps': self._max_steps,
+            'max_branch_retries': self._max_branch_retries,
+            'property_monitoring': self._property_monitoring_metadata(),
+        }
 
-        executed_ap_trace = [initial_state]
-        executed_action_labels: List[str] = []
-        trace['status'] = 'executing'
-        accepted_by_depth = accepted_nodes_by_depth(
-            trace['planning_tree'],
-            include_finish=True,
-        )
-        self._checkpoint_result(trace, result_path)
-        for step_index, action in enumerate(plan):
-            try:
-                result_text = self._env.execute_action(action)
-            except Exception as exc:
-                result_text = "ERROR: %s" % exc
-            post_state = self._env.snapshot()
-            ap_state = self._build_initial_ap_state(post_state)
-            executed_ap_trace.append(ap_state)
-            executed_action_labels.append(str(action.get('name', 'unknown')))
-            tla_result = _verify_fsm_trace(
-                initial_state,
-                executed_action_labels,
-                executed_ap_trace[1:],
-                _AP_NAMES,
-                is_complete_trace=(step_index == len(plan) - 1),
-            )
-            node = accepted_by_depth.get(step_index)
-            if node is not None:
-                annotate_node_executed(
-                    node,
-                    execution_step=step_index,
-                    execution_result=result_text,
-                    ap_state=ap_state,
-                    ap_changes=self._diff_ap_states(executed_ap_trace[-2], ap_state),
-                    tla_verification=tla_result,
-                    observation_after=self._env.snapshot_text(),
-                )
-            self._checkpoint_result(trace, result_path)
-            if isinstance(result_text, str) and result_text.startswith('ERROR:'):
-                final_message = self._format_reply(
-                    response_text + "\n\nPlan execution failed.",
-                    "Executed %s.\nResult: %s" % (self._format_action(action), result_text),
-                )
-                trace['status'] = 'error'
-                trace['final_message'] = final_message
-                trace['planning_tree']['tree_summary'] = self._build_tree_summary(trace['planning_tree'])
-                result_path = self._write_result(trace, result_path)
-                return self._append_result_notice(final_message, result_path)
+    def _remember_result_path(self, result_path: Optional[str]) -> None:
+        if result_path is not None:
+            self._last_result_path = result_path
 
-        # Post-execution grasper cleanup: if the grasper is not already raised and
-        # open, bring it to a clean state. The LLM is not asked to plan this — we
-        # simply inspect the live world state and run the minimum sequence.
-        self._execute_grasper_cleanup(trace)
+    def _observe_live_ap(self, name: str) -> bool:
+        return self._property_verifier.observe_ap(name, self._env.snapshot())
 
-        final_message = finish_response
-        if response_text != finish_response:
-            final_message = self._format_reply(response_text, finish_response)
-        trace['status'] = 'finished'
-        trace['final_message'] = final_message
-        trace['planning_tree']['tree_summary'] = self._build_tree_summary(trace['planning_tree'])
-        result_path = self._write_result(trace, result_path)
-        return final_message
+    def _execute_shared_step(self, step: Dict[str, object]) -> str:
+        action = _shared_action_to_simulator(step)
+        try:
+            return self._env.execute_action(action)
+        except Exception as exc:
+            return 'ERROR: %s' % exc
 
-    def _search_plan(
+    def _request_shared_plan(
         self,
         *,
-        request: str,
-        current_state: Dict[str, object],
-        init_world_state: Dict[str, object],
-        preceding_ap_trace: List[Dict[str, bool]],
+        goal: str,
+        current_state: Dict[str, bool],
         accepted_trace: List[Dict[str, object]],
+        failed_attempts: List[Dict[str, object]],
+        banned_first_actions: List[str],
         depth: int,
-        planning_tree: Dict[str, object],
-        action_help: str,
-        parent_node_id: Optional[int],
-        inherited_failures: List[Dict[str, object]],
-        hint_plan: Optional[List[Dict[str, object]]],
-        trace: Dict[str, object],
-        result_path: Optional[str],
+        model: str,
+        config: AgentConfig,
     ) -> Dict[str, object]:
-        """Search for a feasible plan from the current state.
-
-        Each call corresponds to exactly one node in the planning tree, which
-        represents the choice of *one action* at the current state.  The node
-        may try up to ``max_branch_retries`` different actions (children).  For
-        each candidate action the node:
-
-          1. Reuses ``hint_plan`` from the parent's verified suffix tail when
-             batch planning is enabled; otherwise asks the LLM for a plan from
-             this state.
-          2. Verifies only the *first* action of that suffix via AP prediction
-             + TLC.
-          3. If the first action passes, recurses into a child node passing the
-             remaining suffix as ``hint_plan``.
-          4. If the child subtree dies the node tries a new action (next child
-             slot) — true backtracking.
-          5. If all ``max_branch_retries`` actions fail the node is dead and
-             propagates failure to its parent.
-
-        This ensures one node per action in the tree, so backtracking walks
-        back exactly one action at a time.
-        """
-        if len(planning_tree['nodes']) >= self._max_steps:
-            return {
-                'success': False,
-                'failure': {
-                    'type': 'max_tries',
-                    'depth': depth,
-                    'nodes_created': len(planning_tree['nodes']),
-                    'message': 'Planning exceeded the max node budget of %d.' % self._max_steps,
-                },
-                'finish_response': 'No feasible property-satisfying plan found.',
-            }
-
-        node_id = len(planning_tree['nodes'])
-        node = make_planning_node(
-            node_id=node_id,
-            parent_node_id=parent_node_id,
-            depth=depth,
-            state_before=copy.deepcopy(current_state),
-            state_path=self._zip_accepted_steps(accepted_trace, preceding_ap_trace),
+        del depth, model, config
+        accepted_actions = _shared_trace_to_simulator(accepted_trace)
+        banned_actions = [
+            {'name': label, 'args': {}}
+            for label in banned_first_actions
+        ]
+        plan_prompt = self._build_plan_prompt(
+            request=goal,
+            action_help=self._shared_action_help,
+            current_state=current_state,
+            init_world_state=self._shared_initial_world_state,
+            accepted_trace=accepted_actions,
+            failed_attempts=failed_attempts,
+            banned_first_actions=banned_actions,
         )
-        append_node(planning_tree, node, link_parent=True)
-        self._checkpoint_result(trace, result_path)
-
-        failed_attempts = list(inherited_failures)
-        banned_first_actions: List[Dict[str, object]] = []
-        current_hint = list(hint_plan) if hint_plan and self._planning_granularity == PLANNING_BATCH else []
-
-        for child_index in range(self._max_branch_retries):
-            if current_hint:
-                plan_prompt = None
-                content = ''
-                plan_bundle = {
-                    'response': 'Reusing previously planned suffix tail.',
-                    'plan': copy.deepcopy(current_hint),
-                    'finish_response': 'Done.',
-                }
-                attempts = [{
-                    'attempt_index': 0,
-                    'reuse_hint_plan': True,
-                    'hint_plan_length': len(current_hint),
-                }]
-                current_hint = []
-            else:
-                plan_prompt = self._build_plan_prompt(
-                    request=request,
-                    action_help=action_help,
-                    current_state=current_state,
-                    init_world_state=init_world_state,
-                    accepted_trace=accepted_trace,
-                    failed_attempts=failed_attempts,
-                    banned_first_actions=banned_first_actions,
-                )
-                history = [
-                    {'role': 'system', 'content': self._planning_system_prompt()},
-                    {'role': 'user', 'content': plan_prompt},
-                ]
-                try:
-                    content, plan_bundle, attempts = self._request_plan(history)
-                except Exception as exc:
-                    failure = {
-                        'type': 'planning_error',
-                        'depth': depth,
-                        'child_index': child_index,
-                        'message': str(exc),
-                    }
-                    node['attempts'].append({
-                        'child_index': child_index,
-                        'planner_prompt': plan_prompt,
-                        'error': str(exc),
-                    })
-                    self._checkpoint_result(trace, result_path)
-                    failed_attempts.append(failure)
-                    current_hint = []
-                    continue
-
-            response_text = self._normalize_response_text(
-                plan_bundle.get('response', ''),
-                is_finish=not plan_bundle['plan'],
-            )
-            finish_response = self._normalize_response_text(
-                plan_bundle.get('finish_response', 'Done.'),
-                is_finish=True,
-            )
-            attempt_trace = {
-                'child_index': child_index,
-                'planner_prompt': plan_prompt,
-                'planner_attempts': attempts,
-                'planner_response': content,
-                'planner_decision': plan_bundle,
-            }
-            if plan_prompt is None:
-                attempt_trace['plan_source'] = 'hint_plan'
-
-            if self._planning_granularity == PLANNING_STEP and len(plan_bundle['plan']) > 1:
-                attempt_trace['truncated_to_single_step'] = True
-                plan_bundle = dict(plan_bundle)
-                plan_bundle['plan'] = plan_bundle['plan'][:1]
-
-            if not plan_bundle['plan']:
-                attempt_trace['accepted'] = True
-                attempt_trace['finish'] = True
-                node['attempts'].append(attempt_trace)
-                set_node_outcome(node, result='finish', finish_response=finish_response)
-                self._checkpoint_result(trace, result_path)
-                return {
-                    'success': True,
-                    'plan': [],
-                    'planning_response': response_text,
-                    'finish_response': finish_response,
-                    'node_id': node_id,
-                }
-
-            action = plan_bundle['plan'][0]
-            tail = plan_bundle['plan'][1:] if self._planning_granularity == PLANNING_BATCH else []
-
-            step_verification = self._verify_single_step(
-                action=action,
-                current_state=current_state,
-                init_world_state=init_world_state,
-                preceding_ap_trace=preceding_ap_trace,
-                accepted_trace=accepted_trace,
-                is_last_step=(not tail and self._planning_granularity == PLANNING_BATCH),
-            )
-            attempt_trace['action'] = action
-            attempt_trace['step_verification'] = step_verification
-
-            if not step_verification['passed']:
-                failure = step_verification['failure']
-                can_continue = (
-                    self._violation_policy in NONBLOCKING_VIOLATION_POLICIES
-                    and isinstance(failure, dict)
-                    and failure.get('type') == 'tla_property_violation'
-                    and step_verification.get('predicted_ap_state') is not None
-                )
-                if can_continue:
-                    attempt_trace['ignored_property_violation'] = failure
-                    step_verification['ignored_by_policy'] = True
-                else:
-                    attempt_trace['accepted'] = False
-                    attempt_trace['failure_feedback'] = failure
-                    node['attempts'].append(attempt_trace)
-                    self._checkpoint_result(trace, result_path)
-                    failed_attempts.append(failure)
-                    banned_first_actions.append(action)
-                    current_hint = []
-                    continue
-
-            predicted_ap_state = step_verification['predicted_ap_state']
-            new_preceding_ap_trace = preceding_ap_trace + [predicted_ap_state]
-
-            if not tail and self._planning_granularity == PLANNING_BATCH:
-                attempt_trace['accepted'] = True
-                node['attempts'].append(attempt_trace)
-                tlc = step_verification.get('prediction_detail', {}).get('tla_verification', {})
-                verif = make_verification(
-                    passed=step_verification['passed'],
-                    properties_checked=tlc.get('properties_checked', []),
-                    violations=tlc.get('tlc_result', {}).get('violations', []),
-                    skipped=bool(tlc.get('tlc_result', {}).get('skipped')),
-                )
-                node_result = (
-                    'accepted_with_ignored_violations'
-                    if step_verification.get('ignored_by_policy')
-                    else 'accepted'
-                )
-                set_node_outcome(
-                    node,
-                    result=node_result,
-                    action_label=action.get('name', 'unknown'),
-                    tool='simulator_action',
-                    args=action.get('args', {}),
-                    state_after=predicted_ap_state,
-                    verification=verif,
-                    finish_response=finish_response,
-                )
-                self._checkpoint_result(trace, result_path)
-                return {
-                    'success': True,
-                    'plan': [action],
-                    'planning_response': response_text,
-                    'finish_response': finish_response,
-                    'node_id': node_id,
-                }
-
-            child_result = self._search_plan(
-                request=request,
-                current_state=predicted_ap_state,
-                init_world_state=init_world_state,
-                preceding_ap_trace=new_preceding_ap_trace,
-                accepted_trace=accepted_trace + [action],
-                depth=depth + 1,
-                planning_tree=planning_tree,
-                action_help=action_help,
-                parent_node_id=node_id,
-                inherited_failures=[],
-                hint_plan=tail if self._planning_granularity == PLANNING_BATCH else None,
-                trace=trace,
-                result_path=result_path,
-            )
-            attempt_trace['child_node_id'] = child_result.get('node_id')
-            node['attempts'].append(attempt_trace)
-            self._checkpoint_result(trace, result_path)
-
-            if child_result.get('success'):
-                attempt_trace['accepted'] = True
-                tlc = step_verification.get('prediction_detail', {}).get('tla_verification', {})
-                verif = make_verification(
-                    passed=step_verification['passed'],
-                    properties_checked=tlc.get('properties_checked', []),
-                    violations=tlc.get('tlc_result', {}).get('violations', []),
-                    skipped=bool(tlc.get('tlc_result', {}).get('skipped')),
-                )
-                node_result = (
-                    'accepted_with_ignored_violations'
-                    if step_verification.get('ignored_by_policy')
-                    else 'accepted'
-                )
-                set_node_outcome(
-                    node,
-                    result=node_result,
-                    action_label=action.get('name', 'unknown'),
-                    tool='simulator_action',
-                    args=action.get('args', {}),
-                    state_after=predicted_ap_state,
-                    verification=verif,
-                )
-                return {
-                    'success': True,
-                    'plan': [action] + child_result.get('plan', []),
-                    'planning_response': response_text,
-                    'finish_response': child_result.get('finish_response', finish_response),
-                    'node_id': node_id,
-                }
-
-            # Child subtree dead — backtrack and try another plan from this
-            # node.  Do not ban the first action here: the first action passed
-            # local verification, and the repair may need to keep it while
-            # changing later actions (for example, moving to a covered object
-            # before clearing the blocker at the same x/y coordinate).
-            attempt_trace['accepted'] = False
-            attempt_trace['child_failure'] = child_result.get('failure')
-            failed_attempts.append(child_result.get('failure', {
-                'type': 'child_failure',
-                'depth': depth + 1,
-                'message': 'Child subtree exhausted.',
-            }))
-            current_hint = []
-            continue
-
-        exhaustion_failure = {
-            'type': 'branch_exhausted',
-            'depth': depth,
-            'node_id': node_id,
-            'failed_attempts': failed_attempts,
-            'message': 'All %d action attempts at this node were exhausted.' % self._max_branch_retries,
-        }
-        set_node_outcome(node, result='backtracked', failure=exhaustion_failure)
-        self._checkpoint_result(trace, result_path)
+        history = [
+            {'role': 'system', 'content': self._planning_system_prompt()},
+            {'role': 'user', 'content': plan_prompt},
+        ]
+        content, plan_bundle, attempts = self._request_plan(history)
+        self._last_planning_response = self._normalize_response_text(
+            plan_bundle.get('response', ''),
+            is_finish=not plan_bundle.get('plan'),
+        )
+        self._last_finish_response = self._normalize_response_text(
+            plan_bundle.get('finish_response', 'Done.'),
+            is_finish=True,
+        )
         return {
-            'success': False,
-            'failure': exhaustion_failure,
-            'finish_response': 'No feasible property-satisfying plan found.',
-            'node_id': node_id,
+            'response': plan_bundle.get('response', ''),
+            'finish_response': self._last_finish_response,
+            'plan': [
+                _simulator_action_to_shared(action)
+                for action in plan_bundle.get('plan', [])
+            ],
+            'planner_prompt': plan_prompt,
+            'planner_response': content,
+            'planner_attempts': attempts,
         }
+
+    def _verify_shared_action(
+        self,
+        *,
+        proposal: Dict[str, object],
+        s0: Dict[str, bool],
+        s_current: Dict[str, bool],
+        trace: List[Dict[str, object]],
+        model: str,
+        is_complete_trace: bool = False,
+    ) -> Dict[str, object]:
+        del model
+        action = _shared_action_to_simulator(proposal)
+        accepted_actions = _shared_trace_to_simulator(trace)
+        preceding_ap_trace = [s0] + [
+            step.get('state_after', {})
+            for step in trace
+            if isinstance(step.get('state_after'), dict)
+        ]
+        step_verification = self._verify_single_step(
+            action=action,
+            current_state=s_current,
+            init_world_state=self._shared_initial_world_state,
+            preceding_ap_trace=preceding_ap_trace,
+            accepted_trace=accepted_actions,
+            is_last_step=is_complete_trace,
+        )
+        predicted_ap_state = step_verification.get('predicted_ap_state') or dict(s_current)
+        candidate = {
+            **_simulator_action_to_shared(action),
+            'state_before': dict(s_current),
+            'state_after': predicted_ap_state,
+        }
+        tlc = step_verification.get('prediction_detail', {}).get('tla_verification', {})
+        raw_tlc = tlc.get('tlc_result', {}) if isinstance(tlc, dict) else {}
+        failure = step_verification.get('failure')
+        violations = []
+        if isinstance(failure, dict):
+            violations = failure.get('violations', []) or []
+        if not violations and isinstance(raw_tlc, dict):
+            violations = raw_tlc.get('violations', []) or []
+        verif = make_verification(
+            passed=bool(step_verification.get('passed')),
+            properties_checked=tlc.get('properties_checked', []) if isinstance(tlc, dict) else [],
+            violations=violations,
+            skipped=bool(raw_tlc.get('skipped')) if isinstance(raw_tlc, dict) else False,
+        )
+        return {
+            'candidate': candidate,
+            'state_after': predicted_ap_state,
+            'passed': bool(step_verification.get('passed')),
+            'violations_str': '; '.join(str(v) for v in violations),
+            'verification': verif,
+            'failure': failure,
+        }
+
+    def _summarize_shared_result(
+        self,
+        goal: str,
+        trace: List[Dict[str, object]],
+        exec_results: List[str],
+        model: str,
+    ) -> str:
+        del goal, trace, exec_results, model
+        response_text = self._last_planning_response or 'Verified plan ready.'
+        finish_response = self._last_finish_response or 'Done.'
+        if response_text == finish_response:
+            return finish_response
+        return self._format_reply(response_text, finish_response)
+
+    def _explain_shared_blocked(
+        self,
+        goal: str,
+        initial_state: Dict[str, bool],
+        tried_actions: List[str],
+        model: str,
+    ) -> str:
+        del goal, initial_state, model
+        suffix = ''
+        if tried_actions:
+            suffix = '\nTried actions: %s' % ', '.join(tried_actions)
+        return 'No feasible property-satisfying plan found.' + suffix
 
     def _verify_single_step(
         self,
@@ -1098,21 +826,27 @@ class _FsmShrdluAgentMixin:
                     'type': 'prediction_error',
                     'action': action,
                     'message': str(exc),
+                    'blocking': True,
                 },
                 'prediction_detail': {'error': str(exc)},
             }
 
         predicted_ap_state = self._build_initial_ap_state(predicted_world_state)
-        action_labels = [
-            str(step.get('name', 'unknown'))
-            for step in accepted_trace
-        ] + [str(action.get('name', 'unknown'))]
         states_after = preceding_ap_trace[1:] + [predicted_ap_state]
-        tlc_result = _verify_fsm_trace(
+        verification_trace = [
+            {
+                'action_label': str(step.get('name', 'unknown')),
+                'state_after': state_after,
+            }
+            for step, state_after in zip(accepted_trace + [action], states_after)
+        ]
+        _passed, _tla_spec, _summary, tlc_result = run_verification(
             preceding_ap_trace[0],
-            action_labels,
-            states_after,
-            _AP_NAMES,
+            verification_trace,
+            aps=_AP_NAMES,
+            properties=_TLA_PROPERTIES,
+            module_name='ShrdluTrace',
+            timeout=60,
             is_complete_trace=is_last_step,
         )
         passed = tlc_result['passed']
@@ -1138,6 +872,7 @@ class _FsmShrdluAgentMixin:
                     'type': 'action_precondition_failed',
                     'action': action,
                     'message': precondition_failures[-1],
+                    'blocking': True,
                 },
                 'prediction_detail': detail,
             }
@@ -1223,26 +958,6 @@ class _FsmShrdluAgentMixin:
             banned_first_actions_json=self._json_or_none(banned_first_actions) if banned_first_actions else 'None',
         )
 
-    def _build_ap_state_prediction_prompt(
-        self,
-        *,
-        current_ap_state: Dict[str, bool],
-        action: Dict[str, object],
-        init_world_state: Dict[str, object],
-        accepted_trace: List[Dict[str, object]],
-    ) -> str:
-        ap_catalog_text = '\n'.join(
-            self._ap_formula(name) for name in _AP_NAMES
-        )
-        return AP_STATE_PREDICTION_PROMPT_TEMPLATE.format(
-            init_world_state_json=self._snapshot_json(init_world_state),
-            accepted_trace_json=self._json_or_none(accepted_trace),
-            world_state_delta=self._world_state_delta_summary(init_world_state, accepted_trace),
-            current_ap_bools_json=self._snapshot_json(current_ap_state),
-            action_json=self._json_or_none(action),
-            ap_catalog_text=ap_catalog_text,
-        )
-
     def _execute_grasper_cleanup(self, trace: Dict[str, object]) -> None:
         """After plan execution, bring the grasper to a clean state (raised, open).
 
@@ -1319,34 +1034,6 @@ class _FsmShrdluAgentMixin:
             None,
         )
         return bool(support and support.get('can_support'))
-
-    @staticmethod
-    def _build_tree_summary(planning_tree: Dict[str, object]) -> List[Dict[str, object]]:
-        return build_tree_summary(planning_tree)
-
-    @staticmethod
-    def _zip_accepted_steps(
-        accepted_trace: List[Dict[str, object]],
-        preceding_ap_trace: List[Dict[str, bool]],
-    ) -> List[Dict[str, object]]:
-        """Pair each accepted action with the AP state it produced.
-
-        preceding_ap_trace[0] is the state before any accepted action.
-        preceding_ap_trace[i+1] is the state after accepted_trace[i].
-        Returns a list of {action, state_after} dicts, one per accepted action.
-        """
-        steps = []
-        for i, action in enumerate(accepted_trace):
-            ap_after = preceding_ap_trace[i + 1] if i + 1 < len(preceding_ap_trace) else None
-            steps.append(make_state_path_entry(
-                make_action(
-                    action.get('name', 'unknown'),
-                    'simulator_action',
-                    action.get('args', {}),
-                ),
-                ap_after,
-            ))
-        return steps
 
     @staticmethod
     def _ap_formula(name: str) -> str:
@@ -1551,86 +1238,6 @@ class _FsmShrdluAgentMixin:
         else:
             summary_lines.append('  resting_on: no changes from initial state.')
         return '\n'.join(summary_lines)
-
-    def _request_ap_state_prediction(
-        self,
-        history: List[Dict[str, str]],
-        current_ap_state: Dict[str, bool],
-    ):
-        content = self._chat(list(history), schema=AP_STATE_SCHEMA).strip()
-        bundle = self._parse_ap_state_prediction(content, current_ap_state)
-        attempt_log = [{'raw_content': content, 'parsed_prediction': bundle}]
-        return content, bundle, attempt_log
-
-    def _parse_ap_state_prediction(
-        self,
-        content: str,
-        current_ap_state: Dict[str, bool],
-    ) -> Dict[str, object]:
-        """Parse the predicted AP state with a guaranteed result.
-
-        Extraction order: JSON parse → regex scan → fallback to current state.
-        Any AP not recovered from the model output is copied from current_ap_state.
-        """
-        extracted: Dict[str, bool] = {}
-        response_text = ''
-
-        try:
-            json_content = OpenAICompatibleShrdluAgent._extract_json_object(content)
-            decision = json.loads(json_content)
-            if isinstance(decision, dict):
-                ap_results = decision.get('ap_results')
-                if isinstance(ap_results, dict):
-                    for name in _AP_NAMES:
-                        val = ap_results.get(name)
-                        if isinstance(val, bool):
-                            extracted[name] = val
-                response_text = str(decision.get('response', ''))
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        if len(extracted) < len(_AP_NAMES):
-            for name in _AP_NAMES:
-                if name in extracted:
-                    continue
-                pattern = r'"' + re.escape(name) + r'"\s*:\s*(true|false)'
-                m = re.search(pattern, content)
-                if m:
-                    extracted[name] = m.group(1) == 'true'
-
-        for name in _AP_NAMES:
-            if name not in extracted:
-                extracted[name] = bool(current_ap_state.get(name, False))
-
-        return {
-            'response': response_text,
-            'ap_results': {name: extracted[name] for name in _AP_NAMES},
-        }
-
-    @staticmethod
-    def _collect_violated_properties(failure: Optional[Dict[str, object]]) -> List[str]:
-        """Recursively collect all unique property IDs that were violated in a failure tree.
-
-        TLC violation entries are raw stdout lines such as:
-          'Error: Property Property_prop_foo_bar is violated.'
-        The shared parser handles both dotted ids and TLC-safe underscored ids.
-        """
-        if not failure:
-            return []
-        seen: set[str] = set()
-
-        def _walk(f):
-            if not isinstance(f, dict):
-                return
-            if f.get('type') == 'tla_property_violation':
-                seen.update(extract_property_ids_from_violations(f.get('violations', [])))
-            for v in f.get('failed_attempts', []):
-                _walk(v)
-            if f.get('child_failure'):
-                _walk(f['child_failure'])
-
-        _walk(failure)
-        return sorted(seen)
 
     @staticmethod
     def _diff_ap_states(

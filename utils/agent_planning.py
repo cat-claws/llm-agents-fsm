@@ -5,8 +5,11 @@ import copy
 import json
 import os
 from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
+
+import openai
 
 from utils.planning_modes import (
     NONBLOCKING_VIOLATION_POLICIES,
@@ -64,7 +67,7 @@ class AgentFlowSpec:
     result_dir: Path | None
     verification_module_name: str
     verification_timeout: int
-    observe_initial_state: Callable[[str], dict[str, bool]]
+    observe_ap_for_model: Callable[[str], Callable[[str], bool]]
     execute_step: Callable[[dict], str]
     summarize_result: Callable[[str, list[dict], list[str], str], str]
     explain_blocked: Callable[[str, dict[str, bool], list[str], str], str]
@@ -85,10 +88,16 @@ class AgentFlowSpec:
     ap_catalog_metadata: dict[str, Any]
     ap_evidence_field: str
     action_prediction_notes: Callable[[str, dict], str]
-    observe_execution_ap: Callable[[str], Callable[[str], bool]]
     already_satisfied_response: str = (
         "The request appears already satisfied; no action was executed."
     )
+    initial_world_state: Callable[[], dict[str, Any]] | None = None
+    action_help: Callable[[], str] | None = None
+    planning_config_extra: Callable[[], dict[str, Any]] | None = None
+    request_plan_override: Callable[..., dict | None] | None = None
+    verify_action_override: Callable[..., dict] | None = None
+    after_execute: Callable[[dict[str, Any]], None] | None = None
+    result_path_callback: Callable[[str | None], None] | None = None
 
 
 def default_config_from_env(
@@ -110,6 +119,44 @@ def default_config_from_env(
     )
 
 
+def render_template_note(template: Any, **values: object) -> str:
+    if not isinstance(template, str):
+        return ""
+    return template.format(**values)
+
+
+def set_runtime_config_in_state(state: dict[str, Any], next_config: Any) -> Any:
+    state["runtime_config"] = next_config
+    state["config"] = replace(
+        state["config"],
+        planning_granularity=next_config.planning_granularity,
+        violation_policy=next_config.violation_policy,
+        max_retries=next_config.max_retries,
+    )
+    return next_config
+
+
+def handle_agent_flow_message(
+    state: dict[str, Any],
+    spec: AgentFlowSpec,
+    user_input: str,
+) -> str:
+    try:
+        answer, _detail = run_agent_flow(
+            goal=user_input,
+            model=str(state["model"]),
+            config=state["config"],
+            spec=spec,
+        )
+    except openai.OpenAIError as exc:
+        answer = f"[openai error] {exc}"
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        answer = f"[error] {exc}"
+    return answer
+
+
 def planning_mode_name(config: AgentConfig) -> str:
     return "%s_%s" % (config.planning_granularity, config.violation_policy)
 
@@ -123,6 +170,32 @@ def planning_config_dict(config: AgentConfig) -> dict[str, Any]:
         "max_retries": config.max_retries,
         "max_branch_retries": config.max_retries,
     }
+
+
+def build_planning_config(
+    config: AgentConfig,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = planning_config_dict(config)
+    if extra:
+        result.update(extra)
+    return result
+
+
+def build_initial_state(
+    aps: list[str],
+    observe_ap: Callable[[str], bool],
+    *,
+    phase_label: str = "Observe",
+) -> dict[str, bool]:
+    """Observe every AP required by the selected property set."""
+    print(f"  \033[36m[{phase_label}] Observing {len(aps)} APs extracted from properties...\033[0m")
+    initial_state = observe_ap_values(aps, observe_ap)
+    for ap in aps:
+        val = initial_state[ap]
+        mark = "✓" if val else "✗"
+        print(f"    {mark} {ap[:70]}")
+    return initial_state
 
 
 def required_tool_choice(name: str) -> dict[str, dict[str, str] | str]:
@@ -166,6 +239,118 @@ def summarize_result_text(
         {"role": "user", "content": f"Goal: {goal}\n\nExecuted steps:\n{trace_text}"},
     ], model)
     return content.strip()
+
+
+def _format_final_trace(trace: list[dict] | None, exec_results: list[str] | None) -> str:
+    if not trace:
+        return "(none)"
+    exec_results = exec_results or []
+    lines = []
+    for i, step in enumerate(trace, 1):
+        result = exec_results[i - 1][:200] if i <= len(exec_results) else "N/A"
+        lines.append(
+            f"  {i}. {step['action_label']}: {step['tool']}({json.dumps(step['args'])})"
+            f"\n     result: {result}"
+        )
+    return "\n".join(lines)
+
+
+def _format_final_exec_results(exec_results: list[str] | None) -> str:
+    return "\n".join(
+        f"  {i}. {result[:200]}"
+        for i, result in enumerate(exec_results or [], 1)
+    ) or "(none)"
+
+
+def _format_final_state(state: dict[str, bool] | None) -> str:
+    if not state:
+        return "(not provided)"
+    return "\n".join(
+        f"  {'T' if value else 'F'}  {ap}"
+        for ap, value in state.items()
+    )
+
+
+def final_response_text(
+    *,
+    goal: str,
+    status: str,
+    model: str,
+    system_prompt: str,
+    trace: list[dict] | None = None,
+    exec_results: list[str] | None = None,
+    initial_state: dict[str, bool] | None = None,
+    tried_actions: list[str] | None = None,
+    blocking_feedback: str = "(none)",
+    fallback: str = "",
+    llm_call: Callable[..., tuple[Any, Any]],
+    client: Any,
+) -> str:
+    content, _tool_calls = llm_call(client, [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content":
+            f"Goal: {goal}\n"
+            f"Status: {status}\n\n"
+            f"Executed steps:\n{_format_final_trace(trace, exec_results)}\n\n"
+            f"Execution results:\n{_format_final_exec_results(exec_results)}\n\n"
+            f"Initial state:\n{_format_final_state(initial_state)}\n\n"
+            f"Actions tried and rejected:\n{json.dumps(tried_actions) if tried_actions is not None else '(none)'}\n\n"
+            f"Blocking feedback:\n{blocking_feedback}"},
+    ], model)
+    return content.strip() or fallback
+
+
+def make_final_response_handlers(
+    *,
+    system_prompt: str,
+    llm_call: Callable[..., tuple[Any, Any]],
+    client: Any,
+    blocking_feedback: str = (
+        "No feasible property-satisfying plan was found after the listed actions "
+        "were rejected or retries were exhausted."
+    ),
+    blocked_fallback: str = "No feasible property-satisfying plan found.",
+) -> tuple[
+    Callable[[str, list[dict], list[str], str], str],
+    Callable[[str, dict[str, bool], list[str], str], str],
+]:
+    def summarize_result(
+        goal: str,
+        trace: list[dict],
+        exec_results: list[str],
+        model: str,
+    ) -> str:
+        return final_response_text(
+            goal=goal,
+            status="success",
+            model=model,
+            system_prompt=system_prompt,
+            trace=trace,
+            exec_results=exec_results,
+            llm_call=llm_call,
+            client=client,
+        )
+
+    def explain_blocked(
+        goal: str,
+        initial_state: dict[str, bool],
+        tried_actions: list[str],
+        model: str,
+    ) -> str:
+        return final_response_text(
+            goal=goal,
+            status="blocked",
+            model=model,
+            system_prompt=system_prompt,
+            initial_state=initial_state,
+            tried_actions=tried_actions,
+            blocking_feedback=blocking_feedback,
+            fallback=blocked_fallback,
+            llm_call=llm_call,
+            client=client,
+        )
+
+    return summarize_result, explain_blocked
 
 
 BLOCKED_REQUEST_SYSTEM = """\
@@ -676,7 +861,7 @@ def execute_plan(
     observed_trace: list[dict] = []
     previous_ap_state = s0
 
-    print(f"\n\033[35m[Phase 5] Executing {len(trace)} verified step(s):\033[0m")
+    print(f"\n\033[35m[Execute] Executing {len(trace)} verified step(s):\033[0m")
     for i, step in enumerate(trace, 1):
         tool = step.get("tool", "none")
         args = step.get("args") or {}
@@ -868,6 +1053,9 @@ def search_plan(
                 accepted=False,
                 planner_decision=plan_bundle,
             )
+            for key in ("planner_prompt", "planner_response", "planner_attempts"):
+                if key in plan_bundle:
+                    attempt[key] = plan_bundle[key]
 
         plan = plan_bundle.get("plan", [])
         if not isinstance(plan, list):
@@ -928,6 +1116,10 @@ def search_plan(
             can_continue = (
                 config.violation_policy in NONBLOCKING_VIOLATION_POLICIES
                 and failure is not None
+                and not (
+                    isinstance(failure, dict)
+                    and bool(failure.get("blocking"))
+                )
             )
             if can_continue:
                 attempt["ignored_property_violation"] = failure
@@ -1036,7 +1228,7 @@ def search_plan(
     }
 
 
-def phase4_plan(
+def plan_with_verification(
     goal: str,
     s0: dict[str, bool],
     model: str,
@@ -1067,7 +1259,7 @@ def phase4_plan(
             checkpoint_result(result_record, result_path)
 
     print(
-        "\n\033[35m[Phase 4] Planning with TLC verification "
+        "\n\033[35m[Plan] Planning with TLC verification "
         f"({config.planning_granularity}, violations={config.violation_policy}, "
         f"retries={config.max_retries})...\033[0m"
     )
@@ -1202,6 +1394,12 @@ def run_agent_flow(
         planning_granularity=config.planning_granularity,
         violation_policy=config.violation_policy,
         properties=spec.properties,
+        initial_world_state=spec.initial_world_state() if spec.initial_world_state else None,
+        action_help=spec.action_help() if spec.action_help else None,
+    )
+    planning_config = build_planning_config(
+        config,
+        spec.planning_config_extra() if spec.planning_config_extra else None,
     )
     turn = make_session(
         agent=spec.agent,
@@ -1210,14 +1408,18 @@ def run_agent_flow(
         request=goal,
         work_dir=spec.work_dir,
         properties=spec.properties,
-        planning_config=planning_config_dict(config),
+        planning_config=planning_config,
     )
     turn["planning_tree"] = planning_tree
     turn["status"] = "planning"
     result_path = start_result_session(turn, spec.result_dir)
+    if spec.result_path_callback is not None:
+        spec.result_path_callback(result_path)
 
-    print(f"\n\033[35m[Phase 3] Observing initial state s0...\033[0m")
-    s0 = spec.observe_initial_state(model)
+    observe_ap = spec.observe_ap_for_model(model)
+
+    print(f"\n\033[35m[Observe] Observing initial state s0...\033[0m")
+    s0 = build_initial_state(spec.aps, observe_ap)
     planning_tree["initial_state"] = s0
     checkpoint_result(turn, result_path)
 
@@ -1274,6 +1476,8 @@ def run_agent_flow(
         )
 
     def request_plan(**kwargs: Any) -> dict | None:
+        if spec.request_plan_override is not None:
+            return spec.request_plan_override(**kwargs)
         kwargs.pop("current_state", None)
         return request_plan_bundle(
             **kwargs,
@@ -1327,13 +1531,15 @@ def run_agent_flow(
     )
 
     def verify_action(**kwargs: Any) -> dict:
+        if spec.verify_action_override is not None:
+            return spec.verify_action_override(**kwargs)
         return verify_candidate(
             **kwargs,
             predict_state=predict_state,
             run_trace_verification=run_trace_verification,
         )
 
-    trace, planning_tree, feasible = phase4_plan(
+    trace, planning_tree, feasible = plan_with_verification(
         goal=goal,
         s0=s0,
         model=model,
@@ -1363,11 +1569,13 @@ def run_agent_flow(
             execute_step=spec.execute_step,
             observe_state=execution_observer(
                 aps=spec.aps,
-                observe_ap=spec.observe_execution_ap(model),
+                observe_ap=observe_ap,
             ),
             run_trace_verification=run_trace_verification,
             diff_states=state_differ(spec.aps),
         )
+        if spec.after_execute is not None:
+            spec.after_execute(turn)
     else:
         exec_results = []
 
@@ -1386,4 +1594,6 @@ def run_agent_flow(
     planning_tree["tree_summary"] = build_tree_summary(planning_tree)
     turn["final_message"] = response
     result_path = write_result(turn, spec.result_dir, result_path)
+    if spec.result_path_callback is not None:
+        spec.result_path_callback(result_path)
     return append_result_notice(response, result_path), turn
